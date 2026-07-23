@@ -145,6 +145,86 @@ class PaperBroker(BrokerBase):
         return order
 
 
+class RipioBrokerAdapter(BrokerBase):
+    """
+    ESQUELETO de adaptador para Ripio Trade -- a diferencia de Libertex,
+    Ripio SÍ tiene una API pública, real y documentada para esto
+    (apidocs.ripio.com / apidocs.ripiotrade.co). Lo que sigue está basado
+    en su documentación pública, pero no se pudo probar en vivo desde
+    este sandbox por no tener acceso de red a su dominio.
+
+    Datos confirmados de su documentación oficial:
+      - Base URL: https://api.ripio.com/trade/... (rutas públicas y privadas)
+      - Autenticación: API Token + Secret Key, generados desde tu cuenta
+        en Ripio Trade (sección API de tu perfil) -- NUNCA hardcodear acá,
+        usar variables de entorno (ver .env.example).
+      - Las rutas privadas requieren un header "Timestamp" (milisegundos)
+        y una firma HMAC calculada con el Secret Key -- el detalle EXACTO
+        del algoritmo de firma (qué campos se concatenan, qué header lleva
+        la firma) hay que confirmarlo mirando los ejemplos de código
+        oficiales en github.com/ripio/trade antes de implementar el envío
+        real, para no adivinar mal un detalle criptográfico.
+      - Los tokens de API tienen permisos separados: Lectura, Compra/Venta,
+        Retiros de criptomonedas. Para este bot, generar un token con SOLO
+        Lectura + Compra/Venta -- NUNCA darle permiso de retiro.
+      - Endpoint público de ejemplo (sin autenticación) mencionado en su
+        documentación: GET https://api.ripio.com/trade/public/server-time
+
+    Pasos para completar esto de verdad (desde la otra PC, con internet):
+      1. Crear/usar tu cuenta de Ripio, generar el API Token + Secret Key
+         con permisos de Lectura + Compra/Venta únicamente.
+      2. Guardar esas credenciales en .env (RIPIO_API_TOKEN, RIPIO_API_SECRET).
+      3. Revisar github.com/ripio/trade para el ejemplo exacto de cómo
+         armar la firma HMAC de las requests privadas.
+      4. Implementar primero get_current_price y get_balance (son de solo
+         lectura, el lugar más seguro para probar que la autenticación
+         funciona antes de tocar place_order).
+      5. Recién después, implementar place_order -- y probarlo primero con
+         montos mínimos reales.
+    """
+
+    BASE_URL = "https://api.ripio.com/trade"
+
+    def __init__(self, api_token: str = None, api_secret: str = None):
+        import os
+        self.api_token = api_token or os.environ.get("RIPIO_API_TOKEN")
+        self.api_secret = api_secret or os.environ.get("RIPIO_API_SECRET")
+
+        if not self.api_token or not self.api_secret:
+            log.warning(
+                "RipioBrokerAdapter inicializado SIN credenciales -- "
+                "completar RIPIO_API_TOKEN y RIPIO_API_SECRET en el archivo .env."
+            )
+        else:
+            log.info("RipioBrokerAdapter inicializado con credenciales cargadas (esqueleto, sin conexión real)")
+
+    def _signed_headers(self, method: str, path: str, body: str = "") -> dict:
+        # Placeholder del esquema de firma -- CONFIRMAR el algoritmo exacto
+        # contra github.com/ripio/trade antes de usar esto contra la API real.
+        # El patrón típico de este tipo de APIs es HMAC-SHA256 sobre una
+        # concatenación de timestamp + method + path + body, usando el
+        # Secret Key, convertido a hexadecimal.
+        raise NotImplementedError(
+            "Confirmar el esquema exacto de firma HMAC en github.com/ripio/trade "
+            "antes de implementar esto -- no adivinar el detalle criptográfico."
+        )
+
+    def get_current_price(self, symbol: str) -> float:
+        # Endpoint público, no requiere firma: GET {BASE_URL}/public/ticker/{symbol} (confirmar ruta exacta en la doc)
+        raise NotImplementedError("Implementar el GET real al endpoint público de ticker de Ripio Trade.")
+
+    def get_balance(self) -> float:
+        # Endpoint privado, requiere token + firma
+        raise NotImplementedError("Implementar el GET real al endpoint de balance, firmado con el Secret Key.")
+
+    def place_order(self, symbol: str, side: str, units: float) -> dict:
+        # Endpoint privado, requiere token con permiso de Compra/Venta + firma
+        raise NotImplementedError("Implementar el POST real al endpoint de órdenes de Ripio Trade.")
+
+    def get_open_positions(self) -> dict:
+        raise NotImplementedError("Implementar el GET real al endpoint de balances/posiciones de Ripio Trade.")
+
+
 class LibertexBrokerAdapter(BrokerBase):
     """
     ESQUELETO de adaptador real -- NO está conectado a la API de Libertex.

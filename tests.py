@@ -321,6 +321,28 @@ def test_live_runner_smoke_test():
     print("OK: el live_runner corre de punta a punta sin errores (test de humo)")
 
 
+def test_broker_adapters_dont_leak_into_each_other():
+    """
+    Test específico para el tipo de bug que apareció durante el desarrollo:
+    una edición de texto puede borrar accidentalmente la línea 'class X:'
+    de una clase, dejando su __init__ huérfano DENTRO de la clase anterior
+    (Python lo interpreta como un segundo método con el mismo nombre, que
+    pisa al primero). Esto verifica que cada adaptador de bróker tiene
+    sus propios atributos y no los de otro.
+    """
+    from broker import RipioBrokerAdapter, LibertexBrokerAdapter
+    ripio = RipioBrokerAdapter()
+    libertex = LibertexBrokerAdapter()
+
+    assert hasattr(ripio, "api_token"), "RipioBrokerAdapter debería tener su propio atributo api_token"
+    assert not hasattr(ripio, "api_key"), (
+        "RipioBrokerAdapter NO debería tener api_key -- si lo tiene, "
+        "significa que el __init__ de otra clase se coló en esta"
+    )
+    assert hasattr(libertex, "api_key"), "LibertexBrokerAdapter debería tener su propio atributo api_key"
+    print("OK: los adaptadores de bróker no se pisan entre sí (cada clase mantiene sus propios atributos)")
+
+
 if __name__ == "__main__":
     tests = [
         test_risk_never_exceeds_profile,
@@ -345,6 +367,7 @@ if __name__ == "__main__":
         test_telegram_channel_fails_gracefully_without_network,
         test_multi_timeframe_no_lookahead,
         test_live_runner_smoke_test,
+        test_broker_adapters_dont_leak_into_each_other,
     ]
     failed = 0
     for t in tests:

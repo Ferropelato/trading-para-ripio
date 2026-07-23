@@ -367,6 +367,40 @@ Las 5 mejoras pendientes de la ronda anterior, ya implementadas y probadas
    el adaptador real en `live_runner.py` y correrlo primero con montos
    mínimos.
 
+## Quinta ronda: broker real identificado (Ripio)
+
+A diferencia de Libertex, **Ripio sí tiene una API pública, real y
+documentada** para exactamente esto (`apidocs.ripio.com` /
+`apidocs.ripiotrade.co`):
+
+- Cubre wallet + exchange: acceso a balances, órdenes de compra/venta,
+  orderbooks, datos de mercado en tiempo real e historial de transacciones.
+- Autenticación con API Token + Secret Key que generás vos mismo desde tu
+  cuenta -- sin necesidad de partnership ni aprobación previa.
+- **Permisos granulares por token**: Lectura, Compra/Venta, y Retiros de
+  criptomonedas son permisos independientes. Para este motor, generar un
+  token con Lectura + Compra/Venta únicamente -- **nunca** darle permiso
+  de retiro a las credenciales que usa el bot.
+- Ejemplos de código oficiales en `github.com/ripio/trade`.
+
+Se agregó `RipioBrokerAdapter` en `broker.py` con esta información, como
+esqueleto documentado -- no se pudo probar en vivo desde este sandbox
+(sin acceso de red a su dominio), y el esquema exacto de firma HMAC de
+las requests privadas queda marcado explícitamente como "confirmar contra
+los ejemplos oficiales antes de implementar" en vez de adivinarlo.
+
+**Otro bug real encontrado y corregido en el proceso**: al insertar
+`RipioBrokerAdapter` antes de `LibertexBrokerAdapter`, la edición borró la
+línea `class LibertexBrokerAdapter(BrokerBase):`, dejando su `__init__`
+huérfano dentro de la clase anterior -- Python lo interpretó como un
+segundo constructor de `RipioBrokerAdapter` que pisaba al primero. Se
+agregó un test específico (`test_broker_adapters_dont_leak_into_each_other`)
+que hubiera atrapado esto automáticamente. Este es ya el tercer bug de este
+mismo patrón encontrado durante el desarrollo -- la lección se repite: las
+inserciones de texto justo antes de una declaración `class`/`def`
+existente son el punto más frágil de cualquier edición, y merecen doble
+chequeo o un test dedicado.
+
 ## Próximos pasos sugeridos (no implementados todavía)
 
 - **Capa de broker abstracta**: una interfaz común (clase base) para que
