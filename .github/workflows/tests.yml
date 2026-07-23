@@ -1,0 +1,42 @@
+name: Tests del motor de estrategias
+
+# Corre automáticamente en cada push y en cada pull request, para no
+# depender de que alguien se acuerde de correr los tests a mano. El bug
+# de load_csv encontrado durante el desarrollo de este proyecto (quedó
+# documentado en el README) es el ejemplo concreto de por qué hace falta
+# esto: un cambio rompió una función silenciosamente y nada lo detectó
+# hasta que se la volvió a ejercitar manualmente.
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+    branches: ["main", "master"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Correr los tests de sanidad
+        run: python3 tests.py
+
+      - name: Verificar que el backtest corre de punta a punta (datos sintéticos)
+        run: python3 run_backtest.py --strategy momentum --profile moderado --out /tmp/ci_check.png
+
+      - name: Verificar que el backtest corre con datos reales
+        run: python3 run_backtest.py --strategy tendencia --profile conservador --csv real_data/btc_daily.csv --out /tmp/ci_check_real.png

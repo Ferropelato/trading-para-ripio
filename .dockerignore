@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.git/
+.github/
+*.png
+reporte.html
+experiments.csv
+.KILL_SWITCH

@@ -1,0 +1,17 @@
+# Configuración de ejemplo para run_backtest.py
+# Uso: python3 run_backtest.py --config config_ejemplo.yaml
+#
+# Cualquier flag de línea de comandos que pases ADEMÁS del --config
+# sobreescribe lo que diga acá (los argumentos explícitos mandan).
+
+strategy: momentum
+profile: agresivo
+capital: 1000.0
+csv: real_data/btc_daily.csv
+out: reporte.png
+max_drawdown: 15.0
+max_daily_loss: 5.0
+walk_forward: true
+html_report: reporte.html
+log_experiment: true
+notas: "Corrida vía archivo de configuración"
