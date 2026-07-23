@@ -320,6 +320,53 @@ Las 5 mejoras pendientes de la ronda anterior, ya implementadas y probadas
    momentum/agresivo pasó de +59%/-16% de drawdown a **+77%/-9.4%** de
    drawdown.
 
+## Cuarta ronda: preparado para continuar desde otra PC (con git/API real)
+
+- **`live_runner.py`**: junta todas las piezas (estrategia, gestor de
+  riesgo, bróker, alertas, kill-switch, heartbeat) en un solo loop
+  operable. Corre hoy contra `PaperBroker`, reproduciendo datos
+  históricos como si llegaran en vivo. El día que se conecte un bróker
+  real, el cambio es una sola línea (qué clase de bróker se instancia) —
+  el resto del loop no cambia. Probado de punta a punta con datos reales.
+  **Nota**: el balance que da `live_runner` difiere un poco del
+  backtester (`$1856` vs `$1590` con los mismos parámetros) porque
+  todavía no tiene integrado el circuit breaker ni los filtros de
+  régimen/multi-timeframe — es la lógica de entrada/salida "base".
+- **`.env.example`**: plantilla de variables de entorno para credenciales
+  (bróker, Telegram, email). Copiar a `.env`, completar ahí, nunca subir
+  ese archivo a git (ya está en `.gitignore`).
+- **`LibertexBrokerAdapter` actualizado**: ahora lee las credenciales
+  desde variables de entorno (`BROKER_API_KEY`, `BROKER_API_SECRET`) en
+  vez de solo aceptarlas como parámetro. Si no las encuentra, avisa por
+  log en vez de fallar silenciosamente.
+- **Repositorio git inicializado** con un commit inicial limpio de todo
+  el proyecto -- en la otra PC alcanza con descomprimir y ya tenés
+  historial para seguir trabajando (`git log`, branches, etc.).
+
+### Pasos concretos para cuando estés en la otra PC
+
+1. Descomprimir `trading_engine_completo.zip` — ya viene con `git init`
+   hecho y el primer commit cargado.
+2. `pip install -r requirements.txt` (o `pip install -r requirements.txt
+   --break-system-packages` según tu entorno).
+3. Correr `python3 tests.py` primero — confirmá que las 22 pruebas pasan
+   en tu máquina antes de tocar nada (si tu Python es una versión
+   distinta a 3.11/3.12, puede haber alguna diferencia menor a revisar).
+4. Copiar `.env.example` a `.env` y completar lo que tengas: credenciales
+   de la API del bróker que consigas (revisar primero si el bróker en
+   cuestión ofrece una API pública para desarrolladores — no todos los
+   brokers minoristas la tienen), y opcionalmente el bot de Telegram.
+5. En `broker.py`, completar los métodos de `LibertexBrokerAdapter` (o
+   como se llame el adaptador del bróker que uses) reemplazando cada
+   `raise NotImplementedError` por la llamada HTTP real, siguiendo la
+   documentación de API de ese bróker específico.
+6. Probar el adaptador nuevo de forma aislada primero (ej. solo
+   `get_current_price` y `get_balance`, que son de solo lectura) antes de
+   probar `place_order` con plata real.
+7. Cuando tengas confianza en el adaptador, reemplazar `PaperBroker` por
+   el adaptador real en `live_runner.py` y correrlo primero con montos
+   mínimos.
+
 ## Próximos pasos sugeridos (no implementados todavía)
 
 - **Capa de broker abstracta**: una interfaz común (clase base) para que
