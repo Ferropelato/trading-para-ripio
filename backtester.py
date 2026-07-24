@@ -33,7 +33,7 @@ class Backtester:
                  max_daily_loss_pct: float = 5.0, validate: bool = True,
                  min_commission: float = 0.0, min_trade_value: float = 0.0,
                  lot_step: float = None, regime_filter: bool = False,
-                 multi_timeframe_filter: bool = False):
+                 multi_timeframe_filter: bool = False, custom_signal=None):
         self.df = df.copy()
         self.strategy_fn = get_strategy(strategy_name)
         self.profile = get_profile(profile_name)
@@ -45,6 +45,7 @@ class Backtester:
         self.lot_step = lot_step
         self.regime_filter = regime_filter
         self.multi_timeframe_filter = multi_timeframe_filter
+        self.custom_signal = custom_signal
         self.strategy_name = strategy_name
         self.profile_name = profile_name
         self.circuit_breaker = CircuitBreaker(max_drawdown_pct, max_daily_loss_pct)
@@ -61,7 +62,7 @@ class Backtester:
 
     def run(self) -> dict:
         df = self.df
-        signal = self.strategy_fn(df)
+        signal = self.custom_signal if self.custom_signal is not None else self.strategy_fn(df)
         if self.regime_filter:
             from strategies import STRATEGY_TYPE
             strategy_type = STRATEGY_TYPE.get(self.strategy_name, "tendencia")

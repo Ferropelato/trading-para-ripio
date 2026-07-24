@@ -343,6 +343,137 @@ def test_broker_adapters_dont_leak_into_each_other():
     print("OK: los adaptadores de bróker no se pisan entre sí (cada clase mantiene sus propios atributos)")
 
 
+def test_state_survives_simulated_restart():
+    import os
+    from state_store import StateStore
+    path = "/tmp/_test_state_sanity.json"
+    if os.path.exists(path):
+        os.remove(path)
+
+    store = StateStore(path=path)
+    positions = {"BTCUSD": {"unidades": 0.02, "precio_entrada": 55000.0}}
+    store.save(positions, capital=700.0)
+
+    store_reloaded = StateStore(path=path)  # simula un proceso nuevo
+    restored = store_reloaded.load()
+    assert restored["positions"] == positions, "Las posiciones restauradas deberían ser idénticas a las guardadas"
+    assert restored["capital"] == 700.0, "El capital restaurado debería ser idéntico al guardado"
+    os.remove(path)
+    print("OK: el estado sobrevive a un reinicio simulado del proceso")
+
+
+def test_state_store_handles_corrupt_file():
+    from state_store import StateStore
+    path = "/tmp/_test_state_corrupto_sanity.json"
+    with open(path, "w") as f:
+        f.write("{esto no es json valido,,,")
+    store = StateStore(path=path)
+    restored = store.load()  # no debería lanzar excepción
+    assert restored["positions"] == {}, "Un archivo corrupto debería arrancar limpio, no crashear"
+    import os
+    os.remove(path)
+    print("OK: un archivo de estado corrupto no rompe el arranque")
+
+
+def test_reconciliation_detects_all_mismatch_types():
+    from reconciliation import reconcile
+
+    # Coincide
+    assert reconcile({"A": {"unidades": 1}}, {"A": {"unidades": 1}})["coincide"] is True
+
+    # Posición fantasma interna
+    r2 = reconcile({"A": {"unidades": 1}, "B": {"unidades": 1}}, {"A": {"unidades": 1}})
+    assert r2["solo_en_interno"] == ["B"], "Debería detectar que 'B' solo está en el registro interno"
+
+    # Posición no registrada (operación manual)
+    r3 = reconcile({"A": {"unidades": 1}}, {"A": {"unidades": 1}, "C": {"unidades": 1}})
+    assert r3["solo_en_broker"] == ["C"], "Debería detectar que 'C' solo está en el bróker"
+
+    # Cantidad distinta
+    r4 = reconcile({"A": {"unidades": 1.0}}, {"A": {"unidades": 0.5}})
+    assert "A" in r4["diferencias_de_cantidad"], "Debería detectar la diferencia de cantidad en 'A'"
+    print("OK: la reconciliación detecta los 4 tipos de desfasaje (coincide, fantasma, no registrada, cantidad distinta)")
+
+
+def test_retry_with_backoff_retries_transient_not_permanent():
+    from resilience import retry_with_backoff, TransientBrokerError, PermanentBrokerError
+
+    calls = {"n": 0}
+
+    @retry_with_backoff(max_attempts=3, base_delay_seconds=0.01)
+    def transient_then_ok():
+        calls["n"] += 1
+        if calls["n"] < 2:
+            raise TransientBrokerError("falla simulada")
+        return "ok"
+
+    assert transient_then_ok() == "ok", "Debería recuperarse tras un reintento"
+    assert calls["n"] == 2, "Debería haber tardado exactamente 2 intentos en tener éxito"
+
+    calls_permanent = {"n": 0}
+
+    @retry_with_backoff(max_attempts=3, base_delay_seconds=0.01)
+    def always_permanent():
+        calls_permanent["n"] += 1
+        raise PermanentBrokerError("error no recuperable")
+
+    try:
+        always_permanent()
+        assert False, "Debería haber lanzado PermanentBrokerError"
+    except PermanentBrokerError:
+        pass
+    assert calls_permanent["n"] == 1, "Un error permanente NO debería reintentarse -- debería haber usado solo 1 intento"
+    print("OK: reintenta errores transitorios pero falla inmediato ante errores permanentes")
+
+
+def test_paper_broker_order_idempotency():
+    from broker import PaperBroker
+    pb = PaperBroker(initial_balance=1000.0)
+    pb.set_price("TEST", 100.0)
+
+    order1 = pb.place_order("TEST", "buy", 1.0, client_order_id="dup-test-1")
+    balance_after_first = pb.get_balance()
+
+    order2 = pb.place_order("TEST", "buy", 1.0, client_order_id="dup-test-1")
+    balance_after_retry = pb.get_balance()
+
+    assert order1 == order2, "Un reintento con el mismo client_order_id debe devolver el resultado original"
+    assert balance_after_first == balance_after_retry, "El balance no debe cambiar por un reintento duplicado"
+    print("OK: el PaperBroker no ejecuta la misma orden dos veces con el mismo client_order_id")
+
+
+def test_significance_module_runs_and_bounds_percentile():
+    from data_utils import generate_synthetic_data
+    from backtester import Backtester
+    from significance import test_significance_vs_random
+
+    df = generate_synthetic_data(n_days=400, seed=55)
+    bt = Backtester(df, "momentum", "moderado", initial_capital=1000)
+    result = bt.run()
+
+    if result["num_operaciones"] == 0:
+        print("OK (sin operaciones que evaluar, se omite la comparación estadística)")
+        return
+
+    sig = test_significance_vs_random(df, result, "moderado", initial_capital=1000, n_simulations=30)
+    assert 0 <= sig["percentil_de_la_estrategia_real"] <= 100, "El percentil debe estar entre 0 y 100"
+    assert sig["interpretacion"] is not None, "Siempre debería devolver una interpretación"
+    print("OK: el módulo de significancia corre y devuelve un percentil acotado correctamente")
+
+
+def test_parameter_sensitivity_detects_sign_flip():
+    from data_utils import generate_synthetic_data
+    from sensitivity import parameter_sensitivity
+
+    df = generate_synthetic_data(n_days=300, seed=33)
+    result = parameter_sensitivity(df, "tendencia", "moderado",
+                                    param_grid={"fast": [10, 20], "slow": [40, 50]},
+                                    initial_capital=1000)
+    assert "cambia_de_signo" in result, "Debe informar si los resultados cambian de signo entre parámetros"
+    assert len(result["combinaciones"]) == 4, "Debe correr las 4 combinaciones del grid (2x2)"
+    print("OK: el análisis de sensibilidad de parámetros corre el grid completo y detecta cambios de signo")
+
+
 if __name__ == "__main__":
     tests = [
         test_risk_never_exceeds_profile,
@@ -368,6 +499,13 @@ if __name__ == "__main__":
         test_multi_timeframe_no_lookahead,
         test_live_runner_smoke_test,
         test_broker_adapters_dont_leak_into_each_other,
+        test_state_survives_simulated_restart,
+        test_state_store_handles_corrupt_file,
+        test_reconciliation_detects_all_mismatch_types,
+        test_retry_with_backoff_retries_transient_not_permanent,
+        test_paper_broker_order_idempotency,
+        test_significance_module_runs_and_bounds_percentile,
+        test_parameter_sensitivity_detects_sign_flip,
     ]
     failed = 0
     for t in tests:

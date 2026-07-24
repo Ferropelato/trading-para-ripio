@@ -67,6 +67,7 @@ class PaperBroker(BrokerBase):
         self.positions = {}  # symbol -> {"unidades": float, "precio_entrada": float}
         self._current_prices = {}  # symbol -> último precio conocido (se setea con set_price)
         self.order_history = []
+        self._processed_client_order_ids = {}  # client_order_id -> resultado ya devuelto
 
     def set_price(self, symbol: str, price: float) -> None:
         """Actualiza el precio 'de mercado' conocido para un símbolo (simula el feed de datos)."""
@@ -83,7 +84,29 @@ class PaperBroker(BrokerBase):
     def get_open_positions(self) -> dict:
         return dict(self.positions)
 
-    def place_order(self, symbol: str, side: str, units: float) -> dict:
+    def place_order(self, symbol: str, side: str, units: float, client_order_id: str = None) -> dict:
+        """
+        client_order_id: identificador que genera EL LLAMADOR (no el
+        bróker), único por intento lógico de orden. Si se pasa y ya fue
+        procesado antes, devuelve el resultado original en vez de
+        ejecutar la orden de nuevo -- esto es lo que evita que un
+        reintento de red (la orden se ejecutó pero la respuesta se
+        perdió, y el código de arriba reintenta) dispare la misma compra
+        o venta dos veces.
+        """
+        if client_order_id and client_order_id in self._processed_client_order_ids:
+            log.info("client_order_id '%s' ya procesado antes -- devolviendo resultado "
+                      "original, no se ejecuta de nuevo", client_order_id)
+            return self._processed_client_order_ids[client_order_id]
+
+        result = self._place_order_impl(symbol, side, units)
+
+        if client_order_id:
+            self._processed_client_order_ids[client_order_id] = result
+
+        return result
+
+    def _place_order_impl(self, symbol: str, side: str, units: float) -> dict:
         if side not in ("buy", "sell"):
             raise ValueError("side debe ser 'buy' o 'sell'")
         if units <= 0:

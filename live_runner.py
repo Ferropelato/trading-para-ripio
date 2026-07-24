@@ -13,6 +13,7 @@ Uso:
 """
 
 import argparse
+import signal as system_signal
 import time
 
 from data_utils import load_csv
@@ -23,6 +24,8 @@ from broker import PaperBroker
 from alerts import ConsoleAlertChannel, format_signal_alert
 from safety import ManualKillSwitch
 from health import Heartbeat
+from state_store import StateStore
+from reconciliation import reconcile
 from app_logger import setup_logging, get_logger
 
 
@@ -36,7 +39,8 @@ def _atr(df, period=14):
 
 def run_live(csv_path: str, strategy_name: str, profile_name: str,
              symbol: str = "ASSET", initial_balance: float = 1000.0,
-             replay_delay_seconds: float = 0.0, max_ticks: int = None):
+             replay_delay_seconds: float = 0.0, max_ticks: int = None,
+             state_path: str = "engine_state.json", reconcile_every: int = 10):
     log = get_logger("live_runner")
     log.info("Iniciando runner en vivo (modo paper trading) — %s / %s sobre %s",
               strategy_name, profile_name, symbol)
@@ -51,14 +55,33 @@ def run_live(csv_path: str, strategy_name: str, profile_name: str,
     alert_channel = ConsoleAlertChannel()
     kill_switch = ManualKillSwitch()
     heartbeat = Heartbeat(max_staleness_seconds=3600)  # en un loop real, ajustar según frecuencia del feed
+    state_store = StateStore(path=state_path)
 
-    in_position = False
-    stop_loss = None
-    take_profit = None
+    # Restaurar estado previo si existe (stop_loss/take_profit no los sabe
+    # el bróker -- viven en nuestro propio registro, por eso hace falta
+    # guardarlos y restaurarlos nosotros mismos).
+    saved_state = state_store.load()
+    stop_loss = saved_state["extra"].get("stop_loss") if saved_state["saved_at"] else None
+    take_profit = saved_state["extra"].get("take_profit") if saved_state["saved_at"] else None
+    internal_positions = saved_state["positions"] if saved_state["saved_at"] else {}
 
     ticks_processed = 0
+    shutdown_requested = {"flag": False}
+
+    def _handle_shutdown_signal(signum, frame):
+        log.warning("Señal de apagado recibida (%s) -- terminando de forma ordenada tras este tick", signum)
+        shutdown_requested["flag"] = True
+
+    system_signal.signal(system_signal.SIGINT, _handle_shutdown_signal)
+    system_signal.signal(system_signal.SIGTERM, _handle_shutdown_signal)
+
     for date in df.index:
         if max_ticks and ticks_processed >= max_ticks:
+            break
+        if shutdown_requested["flag"]:
+            log.info("Apagado ordenado: guardando estado final antes de salir")
+            state_store.save(internal_positions, capital=broker.get_balance(),
+                              extra={"stop_loss": stop_loss, "take_profit": take_profit})
             break
         ticks_processed += 1
 
@@ -77,21 +100,23 @@ def run_live(csv_path: str, strategy_name: str, profile_name: str,
         # 3) Actualizar el precio "de mercado" que ve el bróker
         broker.set_price(symbol, price)
 
-        positions = broker.get_open_positions()
-        in_position = symbol in positions
+        broker_positions = broker.get_open_positions()
+        in_position = symbol in broker_positions
 
         # 4) Lógica de salida (si hay posición abierta)
         if in_position:
-            pos = positions[symbol]
+            pos = broker_positions[symbol]
             hit_stop = stop_loss is not None and price <= stop_loss
             hit_target = take_profit is not None and price >= take_profit
             strategy_exit = sig == 0
 
             if hit_stop or hit_target or strategy_exit:
-                order = broker.place_order(symbol, "sell", pos["unidades"])
+                client_order_id = f"{symbol}-sell-{date}"
+                order = broker.place_order(symbol, "sell", pos["unidades"], client_order_id=client_order_id)
                 motivo = "stop_loss" if hit_stop else ("take_profit" if hit_target else "señal_estrategia")
                 log.info("Cierre de posición (%s): %s", motivo, order)
                 stop_loss, take_profit = None, None
+                internal_positions.pop(symbol, None)
 
         # 5) Lógica de entrada (si no hay posición abierta)
         else:
@@ -99,14 +124,25 @@ def run_live(csv_path: str, strategy_name: str, profile_name: str,
             if sig == 1 and not pd.isna(current_atr) and current_atr > 0:
                 sizing = position_size(broker.get_balance(), price, current_atr, profile)
                 if sizing["unidades"] > 0 and sizing["viable"] is not False:
-                    order = broker.place_order(symbol, "buy", sizing["unidades"])
+                    client_order_id = f"{symbol}-buy-{date}"
+                    order = broker.place_order(symbol, "buy", sizing["unidades"], client_order_id=client_order_id)
                     if order["status"] == "filled":
                         stop_loss = sizing["stop_loss"]
                         take_profit = sizing["take_profit"]
+                        internal_positions[symbol] = {"unidades": sizing["unidades"], "precio_entrada": order["price"]}
                         alert_msg = format_signal_alert(
                             symbol, strategy_name, profile_name, date, price, sizing
                         )
                         alert_channel.send(alert_msg)
+
+        # 6) Persistir estado y reconciliar cada N ticks (y siempre al final)
+        is_last_tick = max_ticks and ticks_processed >= max_ticks
+        if ticks_processed % reconcile_every == 0 or is_last_tick:
+            state_store.save(internal_positions, capital=broker.get_balance(),
+                              extra={"stop_loss": stop_loss, "take_profit": take_profit})
+            report = reconcile(internal_positions, broker.get_open_positions())
+            if not report["coincide"]:
+                log.error("Desfasaje detectado entre el estado interno y el bróker: %s", report)
 
         if replay_delay_seconds > 0:
             time.sleep(replay_delay_seconds)
@@ -127,12 +163,14 @@ def main():
                          help="Limitar a los primeros N días, útil para pruebas rápidas")
     parser.add_argument("--delay", type=float, default=0.0,
                          help="Segundos de pausa entre cada 'vela' simulada (0 = lo más rápido posible)")
+    parser.add_argument("--state-path", type=str, default="engine_state.json",
+                         help="Ruta del archivo de estado persistente (posiciones, stop/take profit)")
     args = parser.parse_args()
 
     setup_logging(level="INFO")
     run_live(args.csv, args.strategy, args.profile, symbol=args.symbol,
               initial_balance=args.capital, replay_delay_seconds=args.delay,
-              max_ticks=args.max_ticks)
+              max_ticks=args.max_ticks, state_path=args.state_path)
 
 
 if __name__ == "__main__":

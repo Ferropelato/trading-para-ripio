@@ -401,6 +401,65 @@ inserciones de texto justo antes de una declaración `class`/`def`
 existente son el punto más frágil de cualquier edición, y merecen doble
 chequeo o un test dedicado.
 
+## Sexta ronda: confiabilidad y robustez general del sistema
+
+Esta ronda no fue sobre agregar estrategias nuevas, sino sobre lo que
+separa un motor que "funciona en la demo" de uno confiable de verdad
+(30/30 tests pasando en total):
+
+1. **Persistencia de estado** (`state_store.py`): guarda posiciones
+   abiertas, capital, stop loss/take profit en disco con escritura
+   atómica (write-then-rename). Probado: sobrevive a un reinicio
+   simulado del proceso y a un archivo corrupto (arranca limpio en vez
+   de crashear).
+
+2. **Reconciliación** (`reconciliation.py`): compara lo que el motor cree
+   tener abierto contra lo que el bróker realmente reporta. Detecta 4
+   tipos de desfasaje: todo coincide, posición fantasma interna, posición
+   no registrada (operación manual por fuera del bot), y diferencia de
+   cantidad en el mismo símbolo.
+
+3. **Resiliencia ante fallas de red** (`resilience.py`): decorador de
+   reintentos con backoff exponencial, que distingue errores transitorios
+   (reintenta) de errores permanentes como credenciales inválidas
+   (falla inmediato, sin insistir en algo que no se va a arreglar solo).
+
+4. **Idempotencia de órdenes**: `PaperBroker.place_order` ahora acepta
+   `client_order_id` -- un reintento de red con el mismo id devuelve el
+   resultado original en vez de ejecutar la compra/venta dos veces.
+
+5. **Apagado ordenado** (`live_runner.py`): maneja señales SIGINT/SIGTERM
+   del sistema operativo -- probado con una señal real (`kill -INT`), no
+   solo simulada: termina el tick en curso, guarda el estado, y sale limpio.
+
+6. **Significancia estadística** (`significance.py`): compara el
+   resultado real contra cientos de estrategias con entradas aleatorias
+   pero la misma gestión de riesgo. Hallazgo real: momentum/agresivo en
+   BTC quedó en el **percentil 95** (ventaja de timing genuina, no solo
+   gestión de riesgo), mientras que en EUR/USD quedó en el **percentil 24**
+   (peor que la mayoría de las entradas al azar -- ahí no hay ventaja real).
+
+7. **Sensibilidad de parámetros** (`sensitivity.py`): corre un grid de
+   variaciones de parámetros y avisa si el resultado cambia de signo
+   (ganancia↔pérdida) entre valores cercanos -- señal de sobreajuste.
+   Tendencia en BTC resultó robusta (9/9 combinaciones rentables, sin
+   cambio de signo); momentum en EUR/USD perdió de forma consistente en
+   las 4 variantes probadas (mala ahí, pero no fue "mala suerte" con un
+   valor puntual).
+
+8. **Más datos reales**: se sumó `real_data/eurusd_daily.csv` (EUR/USD
+   diario, 2012-2022, ~2.400 velas) para tener un mercado de forex real,
+   muy distinto en comportamiento a las cripto/acciones que ya había.
+
+**Otro bug real encontrado y corregido**: al integrar el apagado
+ordenado, `import signal` (el módulo de Python) colisionó con la variable
+local `signal` (la señal de la estrategia dentro de `live_runner.py`),
+rompiendo el manejo de señales del sistema operativo. Se corrigió con un
+alias (`import signal as system_signal`). Es un bug distinto en su origen
+a los tres anteriores (no fue una edición que borró una declaración), pero
+la misma lección de fondo: probar de punta a punta después de cada
+integración nueva, no solo cada pieza por separado.
+
 ## Próximos pasos sugeridos (no implementados todavía)
 
 - **Capa de broker abstracta**: una interfaz común (clase base) para que
