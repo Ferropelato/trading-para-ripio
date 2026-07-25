@@ -562,6 +562,51 @@ que usa un feed de precios de prueba sin red para quedar determinista).
    paso a paso).
 
 
+## Octava ronda: módulo de noticias de alto impacto (`news_monitor.py`)
+
+Motivación: el mercado cripto opera 24hs cruzando husos horarios, así que
+una noticia de alto impacto (hackeo, quiebra de un exchange, un
+regulador anunciando una restricción) puede aparecer en cualquier
+momento, no solo en "horario de mercado". Se agregó un monitor híbrido:
+
+- **Fuentes**: feeds RSS públicos de CoinDesk y Cointelegraph -- sin API
+  key, sin registro.
+- **Clasificación**: coincidencia de palabras clave de alto impacto
+  (hackeo, quiebra, regulación, delisting, etc.) en el título.
+  Deliberadamente simple y auditable en vez de un modelo de sentimiento
+  con IA -- se puede ver exactamente qué palabra disparó cada alerta.
+- **Modo híbrido** (`NewsAutomationSchedule` + `NewsGuard`): por defecto
+  todo es **manual** -- el motor alerta por el mismo canal de alertas que
+  ya existía (`alerts.py`) y el humano decide si frenar con el
+  kill-switch. Se pueden configurar ventanas horarias UTC (ej. de
+  madrugada, cuando es menos probable estar mirando el teléfono) donde,
+  además de alertar, el sistema **pausa automáticamente la apertura de
+  posiciones nuevas** por un tiempo configurable (`cooldown_minutes`).
+  Nunca coloca ni cierra una orden por sí solo bajo ningún modo -- mismo
+  principio conservador que el circuit breaker y el kill-switch manual.
+
+Uso:
+```bash
+python live_runner.py --csv real_data/btc_daily.csv --live-prices \
+    --symbol BTC_USDC --strategy momentum --profile moderado \
+    --news-alerts --news-auto-window 22-6 --news-cooldown-minutes 60
+```
+Sin `--news-auto-window`, el modo es siempre manual (solo alerta, nunca
+pausa solo). Se puede repetir `--news-auto-window` para varias ventanas.
+
+**Bug real encontrado y corregido en el proceso**: `NewsMonitor` usaba
+`feeds or DEFAULT_FEEDS`, y en Python una lista vacía `[]` es "falsy" --
+eso hacía que pasar `feeds=[]` (un valor válido, "sin feeds") cayera
+igual a los feeds reales por defecto. Un test que pretendía no tocar la
+red terminaba llamando a CoinDesk/Cointelegraph de verdad. Corregido a
+comparar contra `None` explícitamente, con un test de regresión dedicado.
+
+42/42 tests pasando. Probado también manualmente contra los feeds RSS
+reales: detectó correctamente noticias reales de alto impacto vigentes
+al momento de la prueba (quiebra de un pool de minería, una cuenta de X
+hackeada, un arresto por hackeo bancario).
+
+
 ## Notas importantes (leer antes de avanzar)
 
 1. **Este backtest usa datos sintéticos por defecto.** Los resultados que
