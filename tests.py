@@ -489,6 +489,84 @@ def test_parameter_sensitivity_detects_sign_flip():
     print("OK: el análisis de sensibilidad de parámetros corre el grid completo y detecta cambios de signo")
 
 
+def test_ripio_signature_matches_official_scheme():
+    """
+    Vector fijo alineado con los ejemplos oficiales de Ripio
+    (Timestamp + METHOD + pathSinQuery + body → HMAC-SHA256 → Base64).
+    """
+    from broker import RipioBrokerAdapter
+
+    sig = RipioBrokerAdapter.build_signature(
+        secret="test-secret",
+        timestamp="1700000000000",
+        method="GET",
+        path="/trade/user/balances",
+        body="",
+    )
+    import hmac, hashlib, base64
+    message = "1700000000000GET/trade/user/balances"
+    expected = base64.b64encode(
+        hmac.new(b"test-secret", message.encode(), hashlib.sha256).digest()
+    ).decode()
+    assert sig == expected, "La firma HMAC no coincide con el esquema oficial de Ripio"
+
+    sig_q = RipioBrokerAdapter.build_signature(
+        secret="test-secret",
+        timestamp="1700000000000",
+        method="GET",
+        path="/trade/orders?pair=BTC_USDC&status=open",
+        body="",
+    )
+    message_q = "1700000000000GET/trade/orders"
+    expected_q = base64.b64encode(
+        hmac.new(b"test-secret", message_q.encode(), hashlib.sha256).digest()
+    ).decode()
+    assert sig_q == expected_q, "La firma debe usar el path sin query params"
+    print("OK: la firma HMAC de Ripio coincide con el esquema oficial")
+
+
+def test_ripio_normalize_pair():
+    from broker import RipioBrokerAdapter
+    assert RipioBrokerAdapter.normalize_pair("btc-usdc") == "BTC_USDC"
+    assert RipioBrokerAdapter.normalize_pair("BTC/USDC") == "BTC_USDC"
+    assert RipioBrokerAdapter.normalize_pair("BTC_USDC") == "BTC_USDC"
+    assert RipioBrokerAdapter.normalize_pair("BTCUSDC") == "BTC_USDC"
+    print("OK: normalización de pares Ripio")
+
+
+def test_ripio_place_order_blocked_without_allow_trading():
+    from broker import RipioBrokerAdapter
+    broker = RipioBrokerAdapter(api_token="fake", api_secret="fake", allow_trading=False)
+    result = broker.place_order("BTC_USDC", "buy", 0.001)
+    assert result["status"] == "rejected", "Sin allow_trading no debería enviar la orden"
+    assert "allow_trading" in result["motivo"]
+    print("OK: place_order de Ripio queda bloqueado en modo lectura")
+
+
+def test_ripio_private_requires_credentials():
+    from broker import RipioBrokerAdapter
+    from resilience import PermanentBrokerError
+
+    broker = RipioBrokerAdapter(api_token=None, api_secret=None, allow_trading=False)
+    broker.api_token = None
+    broker.api_secret = None
+    try:
+        broker.get_balance()
+        assert False, "Debería fallar sin credenciales"
+    except PermanentBrokerError:
+        pass
+    print("OK: endpoints privados de Ripio exigen credenciales")
+
+
+def test_ripio_public_ticker_live():
+    """Humo real contra el ticker público (sin credenciales)."""
+    from broker import RipioBrokerAdapter
+    broker = RipioBrokerAdapter(allow_trading=False)
+    price = broker.get_current_price("BTC_USDC")
+    assert price > 0, f"El precio de BTC_USDC debería ser > 0, llegó {price}"
+    print(f"OK: ticker público Ripio BTC_USDC = {price}")
+
+
 if __name__ == "__main__":
     tests = [
         test_risk_never_exceeds_profile,
@@ -521,6 +599,11 @@ if __name__ == "__main__":
         test_paper_broker_order_idempotency,
         test_significance_module_runs_and_bounds_percentile,
         test_parameter_sensitivity_detects_sign_flip,
+        test_ripio_signature_matches_official_scheme,
+        test_ripio_normalize_pair,
+        test_ripio_place_order_blocked_without_allow_trading,
+        test_ripio_private_requires_credentials,
+        test_ripio_public_ticker_live,
     ]
     failed = 0
     for t in tests:

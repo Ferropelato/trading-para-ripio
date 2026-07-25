@@ -1,18 +1,15 @@
 """
 Capa de abstracción de bróker: una interfaz común para que conectar a
-Libertex, Binance, o cualquier otro bróker/exchange sea cuestión de
-escribir un adaptador nuevo (una clase que implemente BrokerBase), sin
+Ripio, Libertex, Binance, o cualquier otro bróker/exchange sea cuestión
+de escribir un adaptador nuevo (una clase que implemente BrokerBase), sin
 tocar el motor de estrategias ni el backtester.
 
 Incluye:
 - BrokerBase: la interfaz (contrato) que cualquier bróker debe cumplir.
-- PaperBroker: una implementación funcional para simular operaciones
-  sobre datos históricos o en memoria, sin plata real -- útil para
-  probar el motor "como si" estuviera operando en vivo, pero sin riesgo.
-- LibertexBrokerAdapter: un ESQUELETO documentado de cómo se vería un
-  adaptador real. No está conectado a la API real de Libertex (acá no
-  hay credenciales ni acceso de red a ese dominio) -- marca claramente
-  dónde iría cada llamada real.
+- PaperBroker: simulación en memoria para paper trading / tests.
+- RipioBrokerAdapter: adaptador real contra la API de Ripio Trade
+  (lectura + órdenes protegidas por allow_trading).
+- LibertexBrokerAdapter: esqueleto documentado (sin API pública confirmada).
 """
 
 from abc import ABC, abstractmethod
@@ -170,82 +167,319 @@ class PaperBroker(BrokerBase):
 
 class RipioBrokerAdapter(BrokerBase):
     """
-    ESQUELETO de adaptador para Ripio Trade -- a diferencia de Libertex,
-    Ripio SÍ tiene una API pública, real y documentada para esto
-    (apidocs.ripio.com / apidocs.ripiotrade.co). Lo que sigue está basado
-    en su documentación pública, pero no se pudo probar en vivo desde
-    este sandbox por no tener acceso de red a su dominio.
+    Adaptador real para Ripio Trade (API v4 / gateway retail).
 
-    Datos confirmados de su documentación oficial:
-      - Base URL: https://api.ripio.com/trade/... (rutas públicas y privadas)
-      - Autenticación: API Token + Secret Key, generados desde tu cuenta
-        en Ripio Trade (sección API de tu perfil) -- NUNCA hardcodear acá,
-        usar variables de entorno (ver .env.example).
-      - Las rutas privadas requieren un header "Timestamp" (milisegundos)
-        y una firma HMAC calculada con el Secret Key -- el detalle EXACTO
-        del algoritmo de firma (qué campos se concatenan, qué header lleva
-        la firma) hay que confirmarlo mirando los ejemplos de código
-        oficiales en github.com/ripio/trade antes de implementar el envío
-        real, para no adivinar mal un detalle criptográfico.
-      - Los tokens de API tienen permisos separados: Lectura, Compra/Venta,
-        Retiros de criptomonedas. Para este bot, generar un token con SOLO
-        Lectura + Compra/Venta -- NUNCA darle permiso de retiro.
-      - Endpoint público de ejemplo (sin autenticación) mencionado en su
-        documentación: GET https://api.ripio.com/trade/public/server-time
+    Autenticación (oficial: github.com/ripio/api/authentication/python):
+      message = Timestamp + HTTP_METHOD + PathSinQuery + JSONBody
+      Signature = Base64(HMAC-SHA256(secret, message))
 
-    Pasos para completar esto de verdad (desde la otra PC, con internet):
-      1. Crear/usar tu cuenta de Ripio, generar el API Token + Secret Key
-         con permisos de Lectura + Compra/Venta únicamente.
-      2. Guardar esas credenciales en .env (RIPIO_API_TOKEN, RIPIO_API_SECRET).
-      3. Revisar github.com/ripio/trade para el ejemplo exacto de cómo
-         armar la firma HMAC de las requests privadas.
-      4. Implementar primero get_current_price y get_balance (son de solo
-         lectura, el lugar más seguro para probar que la autenticación
-         funciona antes de tocar place_order).
-      5. Recién después, implementar place_order -- y probarlo primero con
-         montos mínimos reales.
+    Endpoints usados (gateway retail, mismos datos que api.ripiotrade.co/v4):
+      GET  /trade/public/tickers/{pair}   -- público
+      GET  /trade/user/balances          -- privado (lectura)
+      GET  /trade/orders?pair=...&status=open
+      POST /trade/orders                 -- privado (compra/venta)
+
+    Seguridad:
+      - Generar el token en https://trade.ripio.com/market/api/token con
+        SOLO Lectura (+ Compra/Venta si vas a operar). Nunca permiso de retiro.
+      - place_order exige allow_trading=True (por defecto False) para no
+        disparar órdenes reales por accidente mientras se prueba lectura.
+      - Credenciales SOLO por env / .env (RIPIO_API_TOKEN, RIPIO_API_SECRET).
+
+    Pares típicos AR: BTC_USDC, ETH_USDC, USDC_ARS, USDT_ARS.
     """
 
-    BASE_URL = "https://api.ripio.com/trade"
+    BASE_URL = "https://api.ripio.com"
+    DEFAULT_TIMEOUT = 15
 
-    def __init__(self, api_token: str = None, api_secret: str = None):
+    def __init__(self, api_token: str = None, api_secret: str = None,
+                 quote_currency: str = "USDC", allow_trading: bool = False,
+                 timeout: float = None):
         import os
-        self.api_token = api_token or os.environ.get("RIPIO_API_TOKEN")
-        self.api_secret = api_secret or os.environ.get("RIPIO_API_SECRET")
+        try:
+            from dotenv import load_dotenv
+            load_dotenv()
+        except ImportError:
+            pass
+
+        self.api_token = api_token or os.environ.get("RIPIO_API_TOKEN") or os.environ.get("API_KEY")
+        self.api_secret = api_secret or os.environ.get("RIPIO_API_SECRET") or os.environ.get("SECRET_KEY")
+        self.quote_currency = quote_currency.upper()
+        self.allow_trading = allow_trading
+        self.timeout = timeout if timeout is not None else self.DEFAULT_TIMEOUT
+        self._processed_client_order_ids = {}
+        self._server_time_offset_ms = None  # server_ms - local_ms
 
         if not self.api_token or not self.api_secret:
             log.warning(
                 "RipioBrokerAdapter inicializado SIN credenciales -- "
-                "completar RIPIO_API_TOKEN y RIPIO_API_SECRET en el archivo .env."
+                "completar RIPIO_API_TOKEN y RIPIO_API_SECRET en el archivo .env. "
+                "Los endpoints públicos (precio) igual funcionan."
             )
         else:
-            log.info("RipioBrokerAdapter inicializado con credenciales cargadas (esqueleto, sin conexión real)")
+            log.info(
+                "RipioBrokerAdapter listo (quote=%s, allow_trading=%s)",
+                self.quote_currency, self.allow_trading,
+            )
 
-    def _signed_headers(self, method: str, path: str, body: str = "") -> dict:
-        # Placeholder del esquema de firma -- CONFIRMAR el algoritmo exacto
-        # contra github.com/ripio/trade antes de usar esto contra la API real.
-        # El patrón típico de este tipo de APIs es HMAC-SHA256 sobre una
-        # concatenación de timestamp + method + path + body, usando el
-        # Secret Key, convertido a hexadecimal.
-        raise NotImplementedError(
-            "Confirmar el esquema exacto de firma HMAC en github.com/ripio/trade "
-            "antes de implementar esto -- no adivinar el detalle criptográfico."
+    # --- firma / HTTP -----------------------------------------------------
+
+    @staticmethod
+    def normalize_pair(symbol: str) -> str:
+        """Acepta BTC_USDC, BTC-USDC, btc/usdc y lo normaliza a BTC_USDC."""
+        s = symbol.strip().upper().replace("-", "_").replace("/", "_")
+        if "_" in s:
+            return s
+        # Heurística corta para pares comunes sin guion bajo
+        for quote in ("USDC", "USDT", "BRL", "ARS", "COP"):
+            if s.endswith(quote) and len(s) > len(quote):
+                return f"{s[:-len(quote)]}_{quote}"
+        raise ValueError(
+            f"No pude interpretar el par '{symbol}'. Usá el formato Ripio, ej. BTC_USDC."
         )
 
+    @staticmethod
+    def build_signature(secret: str, timestamp: str, method: str, path: str, body: str = "") -> str:
+        """Firma HMAC-SHA256 en Base64, igual que los ejemplos oficiales de Ripio."""
+        import hmac
+        import hashlib
+        import base64
+        from urllib.parse import urlparse
+
+        pathname = urlparse(path).path  # descarta ?query=...
+        message = f"{timestamp}{method.upper()}{pathname}{body}"
+        digest = hmac.new(secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).digest()
+        return base64.b64encode(digest).decode("utf-8")
+
+    def _require_credentials(self):
+        from resilience import PermanentBrokerError
+        if not self.api_token or not self.api_secret:
+            raise PermanentBrokerError(
+                "Faltan RIPIO_API_TOKEN / RIPIO_API_SECRET -- no se puede llamar a endpoints privados."
+            )
+
+    def _sync_server_time(self, force: bool = False) -> None:
+        """
+        Ripio rechaza requests si el Timestamp local se desvía >5s del servidor
+        (default Timestamp-tolerance). Muchas PCs Windows están desfasadas;
+        calibramos contra GET /trade/public/server-time.
+        """
+        import time
+        import requests
+        if self._server_time_offset_ms is not None and not force:
+            return
+        try:
+            response = requests.get(
+                f"{self.BASE_URL}/trade/public/server-time", timeout=self.timeout,
+            )
+            response.raise_for_status()
+            server_ms = int(response.json()["data"]["timestamp"])
+            local_ms = int(time.time() * 1000)
+            self._server_time_offset_ms = server_ms - local_ms
+            if abs(self._server_time_offset_ms) > 2000:
+                log.info(
+                    "Reloj local desfasado %d ms vs Ripio -- usando hora del servidor para firmar",
+                    self._server_time_offset_ms,
+                )
+        except Exception as e:
+            log.warning("No pude sincronizar hora con Ripio (%s) -- uso reloj local", e)
+            self._server_time_offset_ms = 0
+
+    def _timestamp_ms(self) -> str:
+        import time
+        self._sync_server_time()
+        offset = self._server_time_offset_ms or 0
+        return str(int(time.time() * 1000) + offset)
+
+    def _signed_headers(self, method: str, path: str, body: str = "") -> dict:
+        self._require_credentials()
+        timestamp = self._timestamp_ms()
+        signature = self.build_signature(self.api_secret, timestamp, method, path, body)
+        return {
+            "Content-Type": "application/json",
+            "Authorization": self.api_token,
+            "Timestamp": timestamp,
+            # Holgura extra por si el offset se desvía un poco entre requests
+            "Timestamp-tolerance": "30000",
+            "Signature": signature,
+        }
+
+    def _request(self, method: str, path: str, body_obj: dict = None, signed: bool = True) -> dict:
+        """
+        path debe empezar con /trade/... (como en los ejemplos oficiales).
+        body_obj se serializa con separators compactos para que el body firmado
+        coincida byte-a-byte con el enviado.
+        """
+        import json
+        import requests
+        from resilience import TransientBrokerError, PermanentBrokerError
+
+        body = ""
+        if body_obj is not None:
+            body = json.dumps(body_obj, separators=(",", ":"))
+
+        url = f"{self.BASE_URL}{path}"
+        headers = {"Content-Type": "application/json"}
+        if signed:
+            headers = self._signed_headers(method, path, body)
+
+        try:
+            response = requests.request(
+                method.upper(), url, headers=headers,
+                data=body if body else None, timeout=self.timeout,
+            )
+        except requests.Timeout as e:
+            raise TransientBrokerError(f"Timeout hablando con Ripio: {e}") from e
+        except requests.ConnectionError as e:
+            raise TransientBrokerError(f"Error de conexión con Ripio: {e}") from e
+
+        if response.status_code >= 500:
+            raise TransientBrokerError(
+                f"Ripio respondió {response.status_code}: {response.text[:200]}"
+            )
+        if response.status_code in (401, 403):
+            raise PermanentBrokerError(
+                f"Auth Ripio falló ({response.status_code}): {response.text[:300]}"
+            )
+        if response.status_code >= 400:
+            raise PermanentBrokerError(
+                f"Ripio rechazó la request ({response.status_code}): {response.text[:300]}"
+            )
+
+        try:
+            payload = response.json()
+        except ValueError as e:
+            raise TransientBrokerError(f"Respuesta no-JSON de Ripio: {e}") from e
+
+        if payload.get("error_code") not in (None, 0):
+            raise PermanentBrokerError(
+                f"Ripio error_code={payload.get('error_code')}: {payload.get('message')}"
+            )
+        return payload
+
+    # --- BrokerBase -------------------------------------------------------
+
     def get_current_price(self, symbol: str) -> float:
-        # Endpoint público, no requiere firma: GET {BASE_URL}/public/ticker/{symbol} (confirmar ruta exacta en la doc)
-        raise NotImplementedError("Implementar el GET real al endpoint público de ticker de Ripio Trade.")
+        """Ticker público (no requiere credenciales)."""
+        pair = self.normalize_pair(symbol)
+        payload = self._request("GET", f"/trade/public/tickers/{pair}", signed=False)
+        data = payload.get("data") or {}
+        last = data.get("last")
+        if last is None:
+            from resilience import PermanentBrokerError
+            raise PermanentBrokerError(f"Ticker de {pair} sin campo 'last': {payload}")
+        return float(last)
+
+    def get_balances(self) -> list:
+        """Lista cruda de balances de la cuenta (privado)."""
+        payload = self._request("GET", "/trade/user/balances", signed=True)
+        data = payload.get("data") or []
+        # La doc a veces muestra data como lista anidada [[{...}]]; aplanar.
+        if data and isinstance(data[0], list):
+            data = data[0]
+        return data
 
     def get_balance(self) -> float:
-        # Endpoint privado, requiere token + firma
-        raise NotImplementedError("Implementar el GET real al endpoint de balance, firmado con el Secret Key.")
-
-    def place_order(self, symbol: str, side: str, units: float) -> dict:
-        # Endpoint privado, requiere token con permiso de Compra/Venta + firma
-        raise NotImplementedError("Implementar el POST real al endpoint de órdenes de Ripio Trade.")
+        """Capital disponible en la moneda quote (USDC por defecto)."""
+        balances = self.get_balances()
+        for row in balances:
+            code = (row.get("currency_code") or row.get("currency") or "").upper()
+            if code == self.quote_currency:
+                return float(row.get("available_amount") or 0.0)
+        return 0.0
 
     def get_open_positions(self) -> dict:
-        raise NotImplementedError("Implementar el GET real al endpoint de balances/posiciones de Ripio Trade.")
+        """
+        En un exchange spot no hay 'posiciones' apalancadas: tratamos como
+        posición abierta cualquier balance > 0 de un activo que no sea la
+        moneda quote.
+        """
+        balances = self.get_balances()
+        positions = {}
+        for row in balances:
+            code = (row.get("currency_code") or row.get("currency") or "").upper()
+            available = float(row.get("available_amount") or 0.0)
+            if code and code != self.quote_currency and available > 0:
+                positions[code] = {"unidades": available, "precio_entrada": None}
+        return positions
+
+    def place_order(self, symbol: str, side: str, units: float,
+                    client_order_id: str = None, order_type: str = "market",
+                    price: float = None) -> dict:
+        """
+        Coloca una orden. Por defecto allow_trading=False → rechaza sin
+        enviar nada (modo seguro para probar el cableado).
+        client_order_id se mapea a external_id de Ripio (idempotencia).
+        """
+        from datetime import datetime
+
+        if side not in ("buy", "sell"):
+            raise ValueError("side debe ser 'buy' o 'sell'")
+        if units <= 0:
+            raise ValueError("units debe ser positivo")
+
+        if client_order_id and client_order_id in self._processed_client_order_ids:
+            log.info("client_order_id '%s' ya procesado -- no se reenvía a Ripio", client_order_id)
+            return self._processed_client_order_ids[client_order_id]
+
+        if not self.allow_trading:
+            order = {
+                "status": "rejected",
+                "motivo": "allow_trading=False (modo lectura). Pasá allow_trading=True para operar de verdad.",
+                "symbol": self.normalize_pair(symbol),
+                "side": side,
+                "units": units,
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+            log.warning("Orden NO enviada a Ripio: %s", order["motivo"])
+            return order
+
+        pair = self.normalize_pair(symbol)
+        body = {
+            "pair": pair,
+            "side": side,
+            "type": order_type,
+            # Strings como recomienda Ripio para evitar desajustes de firma por decimales
+            "amount": format(units, ".10f").rstrip("0").rstrip(".") or "0",
+        }
+        if order_type == "limit":
+            if price is None:
+                raise ValueError("Las órdenes limit requieren price=")
+            body["price"] = format(float(price), ".10f").rstrip("0").rstrip(".") or "0"
+        if client_order_id:
+            body["external_id"] = str(client_order_id)[:36]
+
+        payload = self._request("POST", "/trade/orders", body_obj=body, signed=True)
+        data = payload.get("data") or {}
+        status_raw = (data.get("status") or "").lower()
+        if status_raw in ("executed_completely", "executed_partially"):
+            status = "filled"
+        elif status_raw in ("open",):
+            status = "open"
+        elif status_raw in ("canceled", "cancelled"):
+            status = "canceled"
+        else:
+            status = status_raw or "submitted"
+
+        executed = data.get("executed_amount")
+        avg_price = None
+        if executed and data.get("total_value") and float(executed) > 0:
+            avg_price = float(data["total_value"]) / float(executed)
+
+        order = {
+            "status": status,
+            "symbol": pair,
+            "side": side,
+            "units": float(executed) if executed is not None else units,
+            "price": avg_price if avg_price is not None else price,
+            "broker_order_id": data.get("id"),
+            "raw": data,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+        if client_order_id:
+            self._processed_client_order_ids[client_order_id] = order
+        log.info("Orden Ripio %s: %s %s %s -> %s", order.get("broker_order_id"), side, units, pair, status)
+        return order
 
 
 class LibertexBrokerAdapter(BrokerBase):

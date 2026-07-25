@@ -369,11 +369,10 @@ documentada** para exactamente esto (`apidocs.ripio.com` /
   de retiro a las credenciales que usa el bot.
 - Ejemplos de código oficiales en `github.com/ripio/trade`.
 
-Se agregó `RipioBrokerAdapter` en `broker.py` con esta información, como
-esqueleto documentado -- no se pudo probar en vivo desde este sandbox
-(sin acceso de red a su dominio), y el esquema exacto de firma HMAC de
-las requests privadas queda marcado explícitamente como "confirmar contra
-los ejemplos oficiales antes de implementar" en vez de adivinarlo.
+Se implementó `RipioBrokerAdapter` en `broker.py` contra la API real
+(firma HMAC oficial + ticker público verificado en vivo). Los endpoints
+privados (balance/órdenes) quedan listos; `place_order` exige
+`allow_trading=True` de forma explícita.
 
 **Otro bug real encontrado y corregido en el proceso**: al insertar
 `RipioBrokerAdapter` antes de `LibertexBrokerAdapter`, la edición borró la
@@ -446,19 +445,39 @@ a los tres anteriores (no fue una edición que borró una declaración), pero
 la misma lección de fondo: probar de punta a punta después de cada
 integración nueva, no solo cada pieza por separado.
 
+## RipioBrokerAdapter (implementado)
+
+Adaptador real contra Ripio Trade (`https://api.ripio.com/trade/...`):
+
+- Firma HMAC-SHA256 + Base64 según ejemplos oficiales (`github.com/ripio/api`).
+- `get_current_price` — ticker público (sin credenciales).
+- `get_balance` / `get_open_positions` — endpoints privados firmados.
+- `place_order` — implementado, pero **bloqueado por defecto**
+  (`allow_trading=False`) para no mandar órdenes reales por accidente.
+
+```bash
+pip install -r requirements.txt
+cp .env.example .env   # completar RIPIO_API_TOKEN y RIPIO_API_SECRET
+
+# Solo lectura (público):
+python ripio_smoke.py --pair BTC_USDC
+
+# Lectura privada (requiere .env):
+python ripio_smoke.py --pair BTC_USDC --balances
+```
+
+Crear el token en https://trade.ripio.com/market/api/token con permisos
+de **Lectura** (+ Compra/Venta solo cuando vayas a operar). Nunca retiro.
+
 ## Próximos pasos reales (lo que todavía falta)
 
-Lo de infraestructura (broker abstracto, alertas, CI, Docker,
-multi-timeframe, requirements, logging, YAML) ya está hecho. Lo que
-queda para acercarse a capital real:
-
-1. **Implementar `RipioBrokerAdapter` de verdad** (hoy es esqueleto con
-   `NotImplementedError`) contra la API documentada de Ripio Trade.
+1. **Probar lectura privada con tu `.env`** (`python ripio_smoke.py --balances`).
 2. **Paper trading con datos en vivo** varias semanas (no solo replay
    histórico) antes de pensar en capital real.
-3. **Más datasets / más regímenes** para no confiar en un solo activo.
-4. **Optimización de parámetros siempre con walk-forward** (nunca sobre
-   el 100% de los datos).
+3. **Activar `allow_trading=True` solo con montos mínimos** cuando la
+   lectura ya esté verificada.
+4. **Más datasets / más regímenes** para no confiar en un solo activo.
+5. **Optimización de parámetros siempre con walk-forward**.
 
 
 ## Notas importantes (leer antes de avanzar)
