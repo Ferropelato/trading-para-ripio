@@ -40,3 +40,19 @@ jobs:
 
       - name: Verificar que el backtest corre con datos reales
         run: python3 run_backtest.py --strategy tendencia --profile conservador --csv real_data/btc_daily.csv --out /tmp/ci_check_real.png
+
+  docker-build:
+    # Nunca se pudo compilar el Dockerfile en un entorno de desarrollo local
+    # (sin Docker instalado). Los runners de GitHub Actions sí lo tienen, así
+    # que esto valida de punta a punta -- por primera vez de verdad, no solo
+    # revisando el Dockerfile a mano -- que la imagen compila y corre.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@v4
+
+      - name: Construir la imagen (el Dockerfile corre los tests como parte del build)
+        run: docker build -t motor-trading:ci .
+
+      - name: Correr el backtest de ejemplo dentro del container
+        run: docker run --rm motor-trading:ci

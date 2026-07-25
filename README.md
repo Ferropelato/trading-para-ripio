@@ -712,6 +712,31 @@ dedicada a este caso.
 49/49 tests pasando.
 
 
+## Doceava ronda: build de Docker verificado de punta a punta (CI)
+
+El Dockerfile nunca se había podido compilar en ningún entorno de
+desarrollo de este proyecto (sin Docker instalado localmente) -- solo se
+había revisado línea por línea a mano. Se agregó un job `docker-build` al
+workflow de GitHub Actions (`.github/workflows/tests.yml`) que:
+
+1. Construye la imagen (`docker build`) -- el propio Dockerfile corre los
+   49 tests como parte del build, así que si algo está roto la imagen ni
+   se termina de construir.
+2. Corre el backtest de ejemplo dentro del container ya construido.
+
+Los runners de `ubuntu-latest` de GitHub Actions ya traen Docker
+instalado, así que esto valida de punta a punta -- por primera vez de
+verdad -- que la imagen compila y corre, sin necesitar Docker en ninguna
+máquina de desarrollo. YAML validado localmente antes de pushear.
+
+Limitación conocida (preexistente, no introducida en esta ronda): el
+Dockerfile corre `tests.py` durante el build, y uno de esos tests
+(`test_ripio_public_ticker_live`) hace una llamada de red real al ticker
+público de Ripio. Si esa llamada falla por un problema transitorio de red
+justo durante el build, la imagen no compila -- un candidato a mejora
+futura sería aislar ese test específico del build de Docker.
+
+
 ## Notas importantes (leer antes de avanzar)
 
 1. **Este backtest usa datos sintéticos por defecto.** Los resultados que
