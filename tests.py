@@ -901,7 +901,6 @@ def test_user_sessions_are_fully_isolated():
     import tempfile
     from wallet_integration import SimulatedWalletBalanceProvider
     from multi_user import UserSessionManager
-    from safety import ManualKillSwitch
 
     fd, db_path = tempfile.mkstemp(suffix="_multiuser.db")
     os.close(fd)
