@@ -86,6 +86,7 @@ class ManualKillSwitch:
         log.info("Kill-switch manual desactivado")
 
     def reason(self) -> str:
+        """Devuelve el motivo guardado al activar el kill-switch (None si no está activo)."""
         if not self.is_active():
             return None
         with open(self.control_file) as f:

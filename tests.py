@@ -1800,6 +1800,183 @@ def test_load_many_simultaneous_circuit_breakers_stay_isolated_and_detected():
             os.remove(db_path)
 
 
+def test_manual_kill_switch_reason_returns_saved_message():
+    import os
+    from safety import ManualKillSwitch
+
+    control_file = ".KILL_SWITCH_test_reason"
+    ks = ManualKillSwitch(control_file=control_file)
+    try:
+        assert ks.reason() is None, "Sin activar, el motivo debe ser None"
+        ks.activate("Mercado muy volátil, prefiero pausar manualmente")
+        assert ks.reason() == "Mercado muy volátil, prefiero pausar manualmente"
+    finally:
+        if os.path.exists(control_file):
+            os.remove(control_file)
+    print("OK: ManualKillSwitch.reason() devuelve el motivo guardado al activar")
+
+
+def test_live_engine_process_tick_with_active_kill_switch_does_not_crash():
+    """
+    Smoke test: process_tick() con el kill-switch ya activo debe manejar
+    ese caso sin romperse (registra el motivo en el log y no abre
+    posiciones nuevas este tick).
+    """
+    import os
+    import tempfile
+    from datetime import datetime, timezone
+    from live_runner import _LiveEngine
+    from broker import PaperBroker
+    from risk_profiles import get_profile
+    from safety import CircuitBreaker, ManualKillSwitch
+    from health import Heartbeat
+    from state_store import StateStore
+    from alerts import ConsoleAlertChannel
+    from app_logger import get_logger
+
+    fd, state_path = tempfile.mkstemp(suffix="_live_engine_killswitch.json")
+    os.close(fd)
+    os.remove(state_path)
+    kill_switch_path = ".KILL_SWITCH_test_live_engine_active"
+
+    try:
+        broker = PaperBroker(initial_balance=1000.0)
+        kill_switch = ManualKillSwitch(control_file=kill_switch_path)
+        kill_switch.activate("prueba de que no crashea")
+        engine = _LiveEngine(
+            broker, "TEST_SYM", get_profile("moderado"), "momentum", "moderado",
+            ConsoleAlertChannel(), kill_switch,
+            CircuitBreaker(), Heartbeat(max_staleness_seconds=99999),
+            StateStore(path=state_path), reconcile_every=1000, log=get_logger("test_live_engine_killswitch"),
+        )
+        broker.set_price("TEST_SYM", 100.0)
+        engine.process_tick(datetime.now(timezone.utc), 100.0, current_atr=2.0, sig=1)  # no debe tirar AttributeError
+    finally:
+        if os.path.exists(state_path):
+            os.remove(state_path)
+        if os.path.exists(kill_switch_path):
+            os.remove(kill_switch_path)
+    print("OK: process_tick con el kill-switch ya activo no crashea")
+
+
+def test_support_snapshot_reports_healthy_session_with_no_warnings():
+    import os
+    import tempfile
+    from wallet_integration import SimulatedWalletBalanceProvider
+    from multi_user import UserSessionManager
+    from support_tools import generate_user_support_snapshot
+
+    fd, db_path = tempfile.mkstemp(suffix="_support.db")
+    os.close(fd)
+    os.remove(db_path)
+    kill_switch_path = ".KILL_SWITCH_test_support_healthy"
+
+    try:
+        wallet = SimulatedWalletBalanceProvider()
+        wallet.deposit("user-support-1", "USDC", 1000.0)
+        manager = UserSessionManager(wallet, db_path=db_path)
+        session = manager.start_session("user-support-1", "USDC", 400.0)
+
+        snapshot = generate_user_support_snapshot("user-support-1", session, wallet=wallet, currency="USDC")
+
+        assert snapshot.user_id == "user-support-1"
+        assert snapshot.saldo_disponible_billetera == 600.0
+        assert snapshot.asignado_a_trading == 400.0
+        assert snapshot.balance_broker == 400.0
+        assert snapshot.circuit_breaker_activo is False
+        assert snapshot.kill_switch_activo is False
+        assert snapshot.reconciliacion["coincide"] is True
+        assert snapshot.advertencias == []
+        assert "user-support-1" in snapshot.to_text()
+        assert "Circuit breaker: inactivo" in snapshot.to_text()
+
+        manager.stop_session("user-support-1")
+    finally:
+        if os.path.exists(kill_switch_path):
+            os.remove(kill_switch_path)
+        if os.path.exists(db_path):
+            os.remove(db_path)
+    print("OK: el snapshot de soporte reporta una sesión sana sin advertencias")
+
+
+def test_support_snapshot_flags_tripped_circuit_breaker_and_active_kill_switch():
+    import os
+    import tempfile
+    from wallet_integration import SimulatedWalletBalanceProvider
+    from multi_user import UserSessionManager
+    from support_tools import generate_user_support_snapshot
+
+    fd, db_path = tempfile.mkstemp(suffix="_support.db")
+    os.close(fd)
+    os.remove(db_path)
+    kill_switch_path = ".KILL_SWITCH_user-support-2"
+
+    try:
+        wallet = SimulatedWalletBalanceProvider()
+        wallet.deposit("user-support-2", "USDC", 1000.0)
+        manager = UserSessionManager(wallet, db_path=db_path)
+        session = manager.start_session("user-support-2", "USDC", 500.0)
+
+        session.circuit_breaker.tripped = True
+        session.circuit_breaker.trip_reason = "Drawdown máximo alcanzado: 18.0%"
+        session.kill_switch.activate("El usuario pidió pausar por teléfono")
+
+        snapshot = generate_user_support_snapshot("user-support-2", session, wallet=wallet, currency="USDC")
+
+        assert snapshot.circuit_breaker_activo is True
+        assert "18.0%" in snapshot.circuit_breaker_motivo
+        assert snapshot.kill_switch_activo is True
+        assert "pidió pausar" in snapshot.kill_switch_motivo
+        assert len(snapshot.advertencias) == 2  # circuit breaker + kill switch
+        text = snapshot.to_text()
+        assert "ACTIVO" in text
+        assert "ADVERTENCIAS PARA EL AGENTE" in text
+
+        manager.stop_session("user-support-2")
+    finally:
+        if os.path.exists(kill_switch_path):
+            os.remove(kill_switch_path)
+        if os.path.exists(db_path):
+            os.remove(db_path)
+    print("OK: el snapshot de soporte marca claramente circuit breaker y kill-switch activos, con advertencias para el agente")
+
+
+def test_support_snapshot_flags_reconciliation_mismatch():
+    import os
+    import tempfile
+    from wallet_integration import SimulatedWalletBalanceProvider
+    from multi_user import UserSessionManager
+    from support_tools import generate_user_support_snapshot
+
+    fd, db_path = tempfile.mkstemp(suffix="_support.db")
+    os.close(fd)
+    os.remove(db_path)
+    kill_switch_path = ".KILL_SWITCH_user-support-3"
+
+    try:
+        wallet = SimulatedWalletBalanceProvider()
+        wallet.deposit("user-support-3", "USDC", 1000.0)
+        manager = UserSessionManager(wallet, db_path=db_path)
+        session = manager.start_session("user-support-3", "USDC", 500.0)
+
+        # El estado guardado dice que hay una posición en BTC_USDC que el bróker no tiene.
+        session.state_store.save({"BTC_USDC": {"unidades": 1.0, "precio_entrada": 100.0}}, capital=400.0)
+
+        snapshot = generate_user_support_snapshot("user-support-3", session, wallet=wallet, currency="USDC")
+
+        assert snapshot.reconciliacion["coincide"] is False
+        assert "BTC_USDC" in snapshot.reconciliacion["solo_en_interno"]
+        assert any("desfasaje" in w.lower() for w in snapshot.advertencias)
+
+        manager.stop_session("user-support-3")
+    finally:
+        if os.path.exists(kill_switch_path):
+            os.remove(kill_switch_path)
+        if os.path.exists(db_path):
+            os.remove(db_path)
+    print("OK: el snapshot de soporte detecta un desfasaje de reconciliación y advierte al agente antes de confirmar nada")
+
+
 if __name__ == "__main__":
     tests = [
         test_risk_never_exceeds_profile,
@@ -1878,6 +2055,11 @@ if __name__ == "__main__":
         test_live_engine_open_buy_order_resolves_without_double_ordering,
         test_live_engine_partial_buy_fill_registers_position_with_actual_units,
         test_load_many_simultaneous_circuit_breakers_stay_isolated_and_detected,
+        test_manual_kill_switch_reason_returns_saved_message,
+        test_live_engine_process_tick_with_active_kill_switch_does_not_crash,
+        test_support_snapshot_reports_healthy_session_with_no_warnings,
+        test_support_snapshot_flags_tripped_circuit_breaker_and_active_kill_switch,
+        test_support_snapshot_flags_reconciliation_mismatch,
     ]
     failed = 0
     for t in tests:

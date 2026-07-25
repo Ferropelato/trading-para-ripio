@@ -902,6 +902,42 @@ escenario real de un crash del activo que todos tienen). Resultado:
 76/76 tests pasando.
 
 
+## Quinceava ronda: Fase 4 -- producto (onboarding, historial/ajustes, herramienta de soporte)
+
+- **Mockup interactivo ampliado** (compartido aparte, no en el repo):
+  ahora incluye el flujo completo de onboarding (qué es esto, elegir
+  perfil con educación en lenguaje simple, consentimiento explícito de
+  riesgo con checkbox obligatorio), historial completo de operaciones con
+  resumen y filtros, pantalla de ajustes (cambiar asignación/perfil, ver
+  comisiones), y una pantalla de detalle que explica en criollo por qué
+  el motor se pausó (circuit breaker o noticia de alto impacto), con
+  demos de los 3 estados.
+
+- **`support_tools.py`** (código real, no mockup):
+  `generate_user_support_snapshot` arma un reporte consolidado para que
+  un agente de soporte no tenga que ir a buscar cada dato a un lugar
+  distinto -- saldo de billetera, balance del bróker, posiciones
+  abiertas, estado de circuit breaker/kill-switch, reconciliación, y
+  últimas operaciones. Marca advertencias explícitas para el agente
+  cuando hay algo que no debería confirmarse al usuario sin escalar
+  primero (ej. un desfasaje de reconciliación).
+
+- **Corrección propia, no un bug del proyecto**: al escribir
+  `support_tools.py` se vio que varios archivos (`live_runner.py`,
+  `backtester.py`, `kill_switch.py`) llaman a `ManualKillSwitch.reason()`,
+  y al leer `safety.py` de forma incompleta se concluyó erróneamente que
+  el método no existía. Se agregó una implementación propia sin notar
+  que ya había una al final de la clase -- Python se queda con la última
+  definición de un método duplicado, así que la nueva quedó
+  silenciosamente ignorada, y el primer test escrito falló al asumir el
+  comportamiento equivocado (`""` en vez de `None` cuando está inactivo).
+  Corregido eliminando el duplicado y ajustando el test al comportamiento
+  real ya existente. Vale la pena dejarlo documentado como recordatorio
+  de leer la clase entera antes de asumir que falta algo.
+
+81/81 tests pasando.
+
+
 ## Notas importantes (leer antes de avanzar)
 
 1. **Este backtest usa datos sintéticos por defecto.** Los resultados que
