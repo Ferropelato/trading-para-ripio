@@ -331,6 +331,50 @@ def test_live_runner_smoke_test():
     print("OK: el live_runner corre de punta a punta sin errores (test de humo)")
 
 
+def test_live_polling_runs_with_stub_price_feed():
+    """
+    Test de humo del modo de paper trading con precios EN VIVO
+    (run_live_polling): usa un price_source de prueba (no llama a la red,
+    para que el test sea determinista) que devuelve una secuencia de
+    precios, y verifica que el runner corre varios ticks sin romperse, con
+    el historial semilla real de real_data/btc_daily.csv, y que el balance
+    nunca queda en un estado imposible.
+    """
+    import os
+    import tempfile
+    from live_runner import run_live_polling
+
+    class StubPriceSource:
+        """Devuelve precios de una lista fija, uno por llamada (sin red)."""
+
+        def __init__(self, prices):
+            self._prices = list(prices)
+            self._i = 0
+
+        def get_current_price(self, symbol):
+            price = self._prices[min(self._i, len(self._prices) - 1)]
+            self._i += 1
+            return price
+
+    prices = [100 + i * 0.5 for i in range(20)]
+    price_source = StubPriceSource(prices)
+
+    fd, state_path = tempfile.mkstemp(suffix="_live_polling_state.json")
+    os.close(fd)
+    os.remove(state_path)
+    try:
+        broker = run_live_polling(
+            price_source, symbol="TEST_LIVE", strategy_name="momentum", profile_name="moderado",
+            seed_csv="real_data/btc_daily.csv", initial_balance=1000.0,
+            poll_interval_seconds=0, max_ticks=15, state_path=state_path,
+        )
+        assert broker.get_balance() >= 0, "El balance nunca debería quedar negativo"
+    finally:
+        if os.path.exists(state_path):
+            os.remove(state_path)
+    print("OK: el modo de paper trading con precios en vivo corre de punta a punta con un feed de prueba")
+
+
 def test_broker_adapters_dont_leak_into_each_other():
     """
     Test específico para el tipo de bug que apareció durante el desarrollo:
@@ -591,6 +635,7 @@ if __name__ == "__main__":
         test_telegram_channel_fails_gracefully_without_network,
         test_multi_timeframe_no_lookahead,
         test_live_runner_smoke_test,
+        test_live_polling_runs_with_stub_price_feed,
         test_broker_adapters_dont_leak_into_each_other,
         test_state_survives_simulated_restart,
         test_state_store_handles_corrupt_file,

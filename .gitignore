@@ -7,3 +7,4 @@ experiments.csv
 *.png
 reporte.html
 .DS_Store
+engine_state.json
