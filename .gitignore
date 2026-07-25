@@ -10,3 +10,5 @@ reporte.html
 .DS_Store
 engine_state.json
 engine_state_*.json
+live_state_*.json
+live_log_*.txt

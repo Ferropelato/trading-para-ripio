@@ -737,6 +737,34 @@ justo durante el build, la imagen no compila -- un candidato a mejora
 futura sería aislar ese test específico del build de Docker.
 
 
+## Treceava ronda: primera corrida real de paper trading en vivo (en curso)
+
+Arrancado `live_runner.py --live-prices` contra dos pares reales de
+Ripio, corriendo en simultáneo en background:
+
+- **BTC_USDC** / momentum / agresivo (semilla: `real_data/btc_daily.csv`)
+- **ETH_USDC** / tendencia / moderado (semilla nueva: `real_data/eth_daily.csv`,
+  histórico real de ETH/USD vía Yahoo Finance, mismo método que
+  `usdc_ars_daily.csv`)
+
+Ambos con `--news-alerts` activado en modo automático de 24hs. En el
+primer chequeo (esperable: la primera vez que se consulta un feed, TODO
+lo que ya estaba publicado se ve como "nuevo") encontraron noticias
+reales de alto impacto vigentes al momento de arrancar -- el arresto de
+una red de hackeo norcoreana, la quiebra de Poolin, una demanda a BitMEX
+-- y activaron correctamente la pausa automática de entradas nuevas en
+ambos. Comportamiento esperado, no un bug.
+
+**Limitación honesta**: esto corre en la PC de desarrollo, no en un
+servidor. "Paper trading en vivo durante semanas" (pendiente real,
+sección de próximos pasos) necesita que la máquina se mantenga prendida
+todo ese tiempo -- si se apaga o suspende, el proceso se corta. Esto es
+el arranque de esa evidencia, no la evidencia completa. El paso
+siguiente real sería migrar esto a una VPS chica y barata (o a un
+scheduled job) para que corra sin depender de que una laptop personal
+quede encendida.
+
+
 ## Notas importantes (leer antes de avanzar)
 
 1. **Este backtest usa datos sintéticos por defecto.** Los resultados que
