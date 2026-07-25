@@ -88,10 +88,14 @@ en un mercado con tendencia fuerte vs uno lateral.
 
 ## Conectar datos reales en vivo (siguiente paso)
 
-Este sandbox no tiene salida de red hacia APIs de mercado, así que el
-prototipo usa datos sintéticos para demostrar que el motor funciona de
-punta a punta. Para pasar a datos reales, reemplazá `generate_synthetic_data`
-por una función que traiga precios históricos de:
+Nota histórica: en rondas anteriores este proyecto se desarrolló en un
+entorno sin salida de red hacia APIs de mercado, así que el prototipo
+usaba datos sintéticos para demostrar que el motor funciona de punta a
+punta. Eso ya no aplica en el entorno actual (tiene acceso real a
+internet, ver sección "Séptima ronda" más abajo), pero los datos
+sintéticos se mantienen como opción por defecto para no depender de red
+en cada corrida rápida. Para pasar a datos reales, reemplazá
+`generate_synthetic_data` por una función que traiga precios históricos de:
 - Una API de datos (ej. Alpha Vantage, Twelve Data, o la que dé tu bróker).
 - Exportaciones CSV manuales (ya soportado vía `load_csv`).
 
@@ -469,15 +473,93 @@ python ripio_smoke.py --pair BTC_USDC --balances
 Crear el token en https://trade.ripio.com/market/api/token con permisos
 de **Lectura** (+ Compra/Venta solo cuando vayas a operar). Nunca retiro.
 
+## Séptima ronda: entorno con red real, fixes de fecha/hora, y paper trading en vivo
+
+Esta ronda se hizo ya en una máquina con acceso real a internet (a
+diferencia de rondas anteriores). Eso permitió *verificar* cosas que
+antes solo se podían dejar documentadas como "próximo paso", y encontró
+tres bugs reales en el proceso:
+
+1. **Bug de fin de semana en los datos sintéticos** (`data_utils.py`):
+   `pd.bdate_range(end=hoy, periods=n)` devuelve un elemento menos que
+   `n` cuando `hoy` cae sábado o domingo (comportamiento observado en
+   pandas 3.0.2). Esto rompía `tests.py` y hasta la demo por defecto de
+   `run_backtest.py` **cualquier fin de semana** — se reprodujo en vivo
+   (era sábado) y se corrigió pidiendo un rango más largo y recortando al
+   final para garantizar siempre exactamente `n` fechas.
+
+2. **Ticker público de Ripio confirmado con precio real en vivo**
+   (`ripio_smoke.py`, sin credenciales) — la nota de "sandbox sin salida
+   de red" de secciones anteriores de este README ya no aplica al entorno
+   actual.
+
+3. **Lectura privada (`--balances`) sigue sin funcionar** — no es un bug
+   de firma (se comparó byte a byte contra el ejemplo oficial de
+   `github.com/ripio/api/authentication/python`, coincide exacto) ni de
+   reloj (se probó con el timestamp exacto del servidor y falla igual).
+   Se encontró y corrigió de paso un problema real de sincronización de
+   hora (`broker.py`): el reloj local de esta máquina está ~16.7s
+   atrasado, y el resync automático contra `/trade/public/server-time`
+   puede devolver 429 (rate limit compartido con otros endpoints
+   públicos) justo después de llamar al ticker. Ahora se aprovecha el
+   campo `timestamp` que Ripio devuelve en TODAS sus respuestas (éxito o
+   error) para mantener el offset al día sin depender solo de ese
+   endpoint. Pero el error que queda (`401 / error_code 40105
+   "Unauthorized"`) es distinto al de un token inventado
+   (`"Invalid token"`) o un timestamp inválido (`"Invalid timestamp"`) —
+   apunta a algo del lado de la cuenta (permiso de Lectura no confirmado,
+   token no activado, o restricción de IP), no del código.
+
+4. **Paper trading con precios reales en vivo, implementado**
+   (`live_runner.py` → `run_live_polling`): hasta ahora el runner "en
+   vivo" solo podía reproducir un CSV histórico. Ahora hay un segundo modo
+   que en cada intervalo pide el precio real a un `price_source` (ej.
+   `RipioBrokerAdapter`, solo lectura del ticker público) y lo procesa
+   como un tick nuevo, mientras la ejecución sigue siendo 100% simulada
+   con `PaperBroker` — **nunca coloca una orden real**, sin importar qué
+   bróker se use como fuente de precio. Se precarga historial real
+   (`--csv`) para que las medias móviles/ADX/filtro semanal tengan
+   contexto desde el primer tick. La lógica de decisión por-tick se
+   extrajo a una sola clase compartida (`_LiveEngine`) entre el replay de
+   CSV y el polling en vivo, para no duplicarla (varios de los bugs
+   reales de rondas anteriores vinieron justo de tener la misma lógica
+   copiada en dos lugares).
+
+   Limitación a tener en cuenta: un ticker da el último precio, no un
+   candle OHLC real, así que cada tick en vivo se aproxima con
+   open=último cierre conocido y high/low=envolvente de open/close. Anda
+   bien para probar el flujo de decisión de punta a punta con precios
+   reales, pero indicadores que dependen fuerte de high/low intradía
+   (ADX) son menos precisos que con velas reales.
+
+   Uso:
+   ```bash
+   python live_runner.py --csv real_data/btc_daily.csv --live-prices \
+       --symbol BTC_USDC --strategy momentum --profile moderado --poll-interval 60
+   ```
+
+36/36 tests pasando (se agregó `test_live_polling_runs_with_stub_price_feed`,
+que usa un feed de precios de prueba sin red para quedar determinista).
+
 ## Próximos pasos reales (lo que todavía falta)
 
-1. **Probar lectura privada con tu `.env`** (`python ripio_smoke.py --balances`).
-2. **Paper trading con datos en vivo** varias semanas (no solo replay
-   histórico) antes de pensar en capital real.
+1. **Resolver el 401 de lectura privada** (`python ripio_smoke.py
+   --balances`) — revisar en el panel de Ripio que el token tenga
+   permiso de Lectura confirmado/activado. Si se regenera el token (
+   recomendado si en algún momento quedó expuesto fuera de este
+   repositorio), volver a probar.
+2. **Correr `--live-prices` varias semanas** (no solo un puñado de ticks
+   de prueba) antes de pensar en capital real, e idealmente reemplazar la
+   aproximación OHLC del ticker por un feed de velas real si Ripio lo
+   ofrece.
 3. **Activar `allow_trading=True` solo con montos mínimos** cuando la
-   lectura ya esté verificada.
+   lectura privada ya esté verificada.
 4. **Más datasets / más regímenes** para no confiar en un solo activo.
 5. **Optimización de parámetros siempre con walk-forward**.
+6. **Docker y CI nunca se probaron de punta a punta en una máquina real**
+   (Docker no está instalado en este entorno; el workflow de GitHub
+   Actions nunca corrió en GitHub de verdad, solo se validó localmente
+   paso a paso).
 
 
 ## Notas importantes (leer antes de avanzar)
