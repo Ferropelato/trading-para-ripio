@@ -5,6 +5,45 @@ de riesgo, sobre datos históricos. Sirve como base técnica para validar
 ideas ANTES de arriesgar capital real o de pensar en cualquier producto
 comercial.
 
+Este README documenta el desarrollo ronda por ronda (así quedó cada bug
+encontrado y cada decisión de diseño con su motivo, no solo el estado
+final). Para una lectura rápida: `## Estructura` de abajo tiene el mapa
+de todos los archivos, y las últimas rondas (Catorceava/Quinceava) son
+las más relevantes para evaluar qué tan listo está esto hoy.
+
+<details>
+<summary><b>Índice (click para expandir)</b></summary>
+
+- [Estructura](#estructura)
+- [Cómo correrlo](#cómo-correrlo)
+- [Datasets reales incluidos](#datasets-reales-incluidos)
+- [Funciones de seguridad agregadas](#funciones-de-seguridad-agregadas)
+- [Conectar datos reales en vivo (siguiente paso)](#conectar-datos-reales-en-vivo-siguiente-paso)
+- [Qué más agregaría antes de acercar esto a operar con capital real](#qué-más-agregaría-antes-de-acercar-esto-a-operar-con-capital-real)
+- [Benchmark contra buy & hold (agregado — hallazgo importante)](#benchmark-contra-buy-hold-agregado-hallazgo-importante)
+- [Métricas nuevas](#métricas-nuevas)
+- [Pruebas fuertes agregadas (stress testing)](#pruebas-fuertes-agregadas-stress-testing)
+- [Las 10 mejoras agregadas (segunda ronda)](#las-10-mejoras-agregadas-segunda-ronda)
+- [Tercera ronda: infraestructura y producción](#tercera-ronda-infraestructura-y-producción)
+- [Cuarta ronda: preparado para continuar desde otra PC (con git/API real)](#cuarta-ronda-preparado-para-continuar-desde-otra-pc-con-gitapi-real)
+- [Quinta ronda: broker real identificado (Ripio)](#quinta-ronda-broker-real-identificado-ripio)
+- [Sexta ronda: confiabilidad y robustez general del sistema](#sexta-ronda-confiabilidad-y-robustez-general-del-sistema)
+- [RipioBrokerAdapter (implementado)](#ripiobrokeradapter-implementado)
+- [Séptima ronda: entorno con red real, fixes de fecha/hora, y paper trading en vivo](#séptima-ronda-entorno-con-red-real-fixes-de-fechahora-y-paper-trading-en-vivo)
+- [Próximos pasos reales (lo que todavía falta)](#próximos-pasos-reales-lo-que-todavía-falta)
+- [Octava ronda: módulo de noticias de alto impacto](#octava-ronda-módulo-de-noticias-de-alto-impacto-news_monitorpy)
+- [Novena ronda: datasets y backtests sobre pares reales de Ripio Argentina (ARS)](#novena-ronda-datasets-y-backtests-sobre-pares-reales-de-ripio-argentina-ars)
+- [Décima ronda: optimización de parámetros con walk-forward obligatorio](#décima-ronda-optimización-de-parámetros-con-walk-forward-obligatorio)
+- [Onceava ronda: capa de integración con la billetera + aislamiento multi-usuario](#onceava-ronda-capa-de-integración-con-la-billetera-aislamiento-multi-usuario)
+- [Doceava ronda: build de Docker verificado de punta a punta (CI)](#doceava-ronda-build-de-docker-verificado-de-punta-a-punta-ci)
+- [Treceava ronda: primera corrida real de paper trading en vivo](#treceava-ronda-primera-corrida-real-de-paper-trading-en-vivo-en-curso)
+- [Visión: más allá de cripto](#visión-más-allá-de-cripto-prueba-de-concepto-no-una-promesa)
+- [Catorceava ronda: qué haría falta para un lanzamiento real (Fases 2 y 3)](#catorceava-ronda-qué-haría-falta-para-un-lanzamiento-real-fases-2-y-3)
+- [Quinceava ronda: Fase 4 -- producto](#quinceava-ronda-fase-4-producto-onboarding-historialajustes-herramienta-de-soporte)
+- [Notas importantes (leer antes de avanzar)](#notas-importantes-leer-antes-de-avanzar)
+
+</details>
+
 ## Estructura
 
 - `risk_profiles.py` — perfiles conservador / moderado / agresivo (% de riesgo
@@ -19,6 +58,41 @@ comercial.
 - `data_utils.py` — generador de datos sintéticos (para probar sin
   depender de una API en vivo) y cargador de CSV real.
 - `run_backtest.py` — script para correr todo desde la terminal.
+
+**Seguridad y validación**: `safety.py` (circuit breaker, kill-switch,
+validación de datos), `health.py` (heartbeat / huecos de datos),
+`resilience.py` (reintentos con backoff), `reconciliation.py` (estado
+interno vs. bróker), `state_store.py` (persistencia JSON y `SQLiteStateStore`
+compartida entre usuarios).
+
+**Análisis y validación anti-sobreajuste**: `validation.py` (walk-forward),
+`sensitivity.py` (sensibilidad de parámetros), `param_optimizer.py`
+(optimización que solo rankea por desempeño fuera de muestra),
+`monte_carlo.py` (riesgo de ruina), `stress_test.py` (crisis históricas),
+`significance.py`, `regime.py`, `multi_timeframe.py`, `portfolio.py`
+(multi-activo con correlación).
+
+**Bróker y ejecución en vivo**: `broker.py` (`BrokerBase`, `PaperBroker`
+con soporte de llenados parciales, `RipioBrokerAdapter`,
+`AlpacaBrokerAdapter`, `LibertexBrokerAdapter` esqueleto), `live_runner.py`
+(`_LiveEngine` compartido entre replay histórico y polling en vivo,
+`run_live`/`run_live_polling`), `price_feed.py` (`SharedPriceFeed`, un
+poller por símbolo compartido entre usuarios), `news_monitor.py`
+(alertas híbridas manual/automáticas por noticias de alto impacto).
+
+**Multi-usuario y operaciones**: `wallet_integration.py`
+(`WalletBalanceProvider`, el contrato de integración con una billetera
+real), `multi_user.py` (`UserSessionManager`/`UserTradingSession`,
+aislamiento completo por usuario), `ops_monitor.py`
+(`OperationsMonitor`, alertas individuales y sistémicas), `support_tools.py`
+(reporte consolidado para soporte al cliente).
+
+**Otros**: `alerts.py` (consola/Telegram/email), `app_logger.py`,
+`experiment_log.py`, `report.py` (HTML autocontenido), `tax_export.py`,
+`kill_switch.py` (CLI del freno manual), `ripio_smoke.py` (smoke test de
+solo lectura contra la API real de Ripio), `build_ars_datasets.py`
+(construye datasets reales en ARS combinando fuentes públicas),
+`tests.py` (suite completa, +80 pruebas).
 
 ## Cómo correrlo
 
