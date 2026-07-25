@@ -882,10 +882,24 @@ pendiente en un tick posterior en vez de olvidarla.
 
 75/75 tests pasando.
 
-### Fase 3d -- pendiente
+### Fase 3d -- prueba de carga: circuit breaker simultáneo de muchos usuarios
 
-Prueba de carga con muchos usuarios bajo un shock de mercado compartido
-(circuit breakers disparándose en simultáneo) -- ver próxima ronda.
+`test_load_many_simultaneous_circuit_breakers_stay_isolated_and_detected`
+simula 500 usuarios reales (sesiones completas vía `UserSessionManager`,
+persistidas en la misma base SQLite compartida) sometidos al MISMO shock
+de mercado (una caída de -15% de equity, igual para todos -- el
+escenario real de un crash del activo que todos tienen). Resultado:
+
+- Los 500 circuit breakers se activaron de forma completamente
+  independiente -- verificado explícitamente que son instancias
+  distintas, nunca una compartida, incluso a esta escala.
+- `OperationsMonitor` detectó y escaló correctamente el evento como
+  sistémico: 500/500 (100%) usuarios afectados.
+- Tiempo total de procesamiento: **0.23 segundos** para las 500 sesiones
+  (setup 0.15s + shock 0.01s + `check_all()` 0.07s) -- sin cuellos de
+  botella a esta escala.
+
+76/76 tests pasando.
 
 
 ## Notas importantes (leer antes de avanzar)

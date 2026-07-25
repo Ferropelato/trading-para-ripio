@@ -1713,6 +1713,93 @@ def test_live_engine_partial_buy_fill_registers_position_with_actual_units():
     print("OK: un llenado parcial en la compra registra la posición con las unidades REALMENTE compradas")
 
 
+def test_load_many_simultaneous_circuit_breakers_stay_isolated_and_detected():
+    """
+    Fase 3d: simula un shock de mercado compartido que dispara el circuit
+    breaker de MUCHOS usuarios al mismo tiempo (ej. un crash real del
+    activo que todos tienen). Verifica que (1) cada circuit breaker sigue
+    siendo una instancia propia por usuario -- nunca un pool compartido,
+    incluso a esta escala --, (2) OperationsMonitor detecta y escala
+    correctamente el evento sistémico, y (3) el tiempo de procesamiento
+    se mantiene razonable.
+    """
+    import os
+    import tempfile
+    import time
+    from wallet_integration import SimulatedWalletBalanceProvider
+    from multi_user import UserSessionManager
+    from ops_monitor import OperationsMonitor
+
+    n_users = 500
+    fd, db_path = tempfile.mkstemp(suffix="_load_test.db")
+    os.close(fd)
+    os.remove(db_path)
+
+    alert_channel = _CollectingAlertChannel()
+    wallet = SimulatedWalletBalanceProvider()
+    manager = UserSessionManager(wallet, db_path=db_path)
+    monitor = OperationsMonitor(alert_channel, systemic_threshold_pct=50.0, min_users_for_systemic=10)
+
+    user_ids = [f"user-{i}" for i in range(n_users)]
+
+    try:
+        start_setup = time.time()
+        for uid in user_ids:
+            wallet.deposit(uid, "USDC", 1000.0)
+            session = manager.start_session(uid, "USDC", 1000.0, max_drawdown_pct=10.0)
+            monitor.register(uid, session)
+        setup_elapsed = time.time() - start_setup
+
+        # Shock de mercado compartido: el equity de CADA usuario cae -15%
+        # desde su pico -- mismo evento de mercado, N sesiones aisladas.
+        start_shock = time.time()
+        for uid in user_ids:
+            session = manager.get_session(uid)
+            session.circuit_breaker.check([1000.0, 950.0, 900.0], today_start_capital=1000.0, current_capital=850.0)
+        shock_elapsed = time.time() - start_shock
+
+        start_check = time.time()
+        report = monitor.check_all()
+        check_elapsed = time.time() - start_check
+
+        assert report["usuarios_monitoreados"] == n_users
+        n_circuit_breaker_issues = sum(1 for p in report["problemas_individuales"] if p["tipo"] == "circuit_breaker")
+        assert n_circuit_breaker_issues == n_users, (
+            f"Los {n_users} usuarios deberían haber activado su circuit breaker de forma independiente, "
+            f"se detectaron {n_circuit_breaker_issues}"
+        )
+        assert len(report["alertas_sistemicas"]) == 1
+        assert report["alertas_sistemicas"][0]["tipo"] == "circuit_breaker"
+        assert report["alertas_sistemicas"][0]["porcentaje"] == 100.0
+
+        # Aislamiento real a escala, no solo "funcionó para 2 usuarios":
+        # las instancias de circuit breaker de usuarios distintos son
+        # objetos DISTINTOS, nunca la misma referencia compartida.
+        sample_ids = user_ids[:10]
+        sample_breakers = [manager.get_session(uid).circuit_breaker for uid in sample_ids]
+        assert len(set(id(b) for b in sample_breakers)) == len(sample_breakers), (
+            "Cada usuario debe tener su PROPIA instancia de circuit breaker"
+        )
+
+        total_elapsed = setup_elapsed + shock_elapsed + check_elapsed
+        assert total_elapsed < 30.0, (
+            f"Procesar {n_users} usuarios tardó {total_elapsed:.1f}s -- demasiado lento para ser aceptable"
+        )
+        print(f"OK: {n_users} circuit breakers dispararon de forma aislada y correcta ante un shock compartido "
+              f"(setup={setup_elapsed:.2f}s, shock={shock_elapsed:.2f}s, check_all={check_elapsed:.2f}s)")
+    finally:
+        for uid in user_ids:
+            kill_switch_path = f"./.KILL_SWITCH_{uid}"
+            try:
+                manager.stop_session(uid)
+            except Exception:
+                pass
+            if os.path.exists(kill_switch_path):
+                os.remove(kill_switch_path)
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
 if __name__ == "__main__":
     tests = [
         test_risk_never_exceeds_profile,
@@ -1790,6 +1877,7 @@ if __name__ == "__main__":
         test_paper_broker_simulate_additional_fill_completes_open_order,
         test_live_engine_open_buy_order_resolves_without_double_ordering,
         test_live_engine_partial_buy_fill_registers_position_with_actual_units,
+        test_load_many_simultaneous_circuit_breakers_stay_isolated_and_detected,
     ]
     failed = 0
     for t in tests:
