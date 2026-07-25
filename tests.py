@@ -1096,6 +1096,154 @@ def test_alpaca_private_requires_credentials():
     print("OK: AlpacaBrokerAdapter exige credenciales antes de llamar a cualquier endpoint")
 
 
+def test_shared_price_feed_dedupes_concurrent_consumers_on_same_symbol():
+    """
+    Prueba directa del problema real que motiva este módulo (ver README:
+    se observó un 429 real de Ripio con solo 2 sesiones concurrentes). 20
+    'usuarios' pidiendo el mismo símbolo al mismo tiempo NO deberían
+    generar 20 llamadas de red -- solo 1, compartida.
+    """
+    import threading
+    import time
+    from price_feed import SharedPriceFeed
+
+    call_count = {"n": 0}
+    call_lock = threading.Lock()
+
+    class SlowStubPriceSource:
+        def get_current_price(self, symbol):
+            with call_lock:
+                call_count["n"] += 1
+            time.sleep(0.05)  # simula latencia real de red
+            return 64000.0
+
+    feed = SharedPriceFeed(SlowStubPriceSource(), poll_interval_seconds=60)
+    try:
+        results = []
+        results_lock = threading.Lock()
+
+        def consumer():
+            price = feed.get_current_price("BTC_USDC")
+            with results_lock:
+                results.append(price)
+
+        threads = [threading.Thread(target=consumer) for _ in range(20)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+
+        assert len(results) == 20
+        assert all(p == 64000.0 for p in results)
+        assert call_count["n"] == 1, (
+            f"20 'usuarios' pidiendo el mismo símbolo deberían generar 1 sola llamada real, "
+            f"generaron {call_count['n']}"
+        )
+        assert feed.fetch_count() == 1
+    finally:
+        feed.stop_all()
+    print("OK: SharedPriceFeed comparte una sola llamada de red entre 20 consumidores concurrentes del mismo símbolo")
+
+
+def test_shared_price_feed_polls_symbols_independently():
+    from price_feed import SharedPriceFeed
+
+    class StubPriceSource:
+        def get_current_price(self, symbol):
+            return {"BTC_USDC": 64000.0, "ETH_USDC": 3400.0}[symbol]
+
+    feed = SharedPriceFeed(StubPriceSource(), poll_interval_seconds=60)
+    try:
+        assert feed.get_current_price("BTC_USDC") == 64000.0
+        assert feed.get_current_price("ETH_USDC") == 3400.0
+        assert feed.fetch_count() == 2
+        assert feed.active_symbols() == ["BTC_USDC", "ETH_USDC"]
+    finally:
+        feed.stop_all()
+    print("OK: SharedPriceFeed mantiene pollers independientes por símbolo")
+
+
+def test_shared_price_feed_refreshes_when_stale():
+    import time
+    from price_feed import SharedPriceFeed
+
+    prices = iter([100.0, 200.0, 300.0, 400.0, 500.0])
+
+    class IncrementingStubPriceSource:
+        def get_current_price(self, symbol):
+            return next(prices)
+
+    feed = SharedPriceFeed(IncrementingStubPriceSource(), poll_interval_seconds=60, stale_after_seconds=0.05)
+    try:
+        first = feed.get_current_price("TEST")
+        assert first == 100.0
+        time.sleep(0.1)  # supera stale_after_seconds
+        second = feed.get_current_price("TEST")
+        assert second == 200.0, "Un precio viejo debería refrescarse sincrónicamente al pedirse de nuevo"
+        assert feed.fetch_count() == 2
+    finally:
+        feed.stop_all()
+    print("OK: SharedPriceFeed refresca sincrónicamente un precio cacheado que quedó viejo")
+
+
+def test_shared_price_feed_as_drop_in_reduces_calls_for_two_sessions():
+    """
+    Compara 2 sesiones de paper trading en vivo mirando el MISMO símbolo:
+    cada una con su propio price_source directo genera su propia llamada
+    real por tick; las mismas 2 sesiones compartiendo un SharedPriceFeed
+    generan muchas menos -- la prueba concreta de la Fase 2 del roadmap
+    (evitar N pollers redundantes por usuario).
+    """
+    import os
+    import tempfile
+    from live_runner import run_live_polling
+    from price_feed import SharedPriceFeed
+
+    class CountingStubPriceSource:
+        def __init__(self):
+            self.calls = 0
+
+        def get_current_price(self, symbol):
+            self.calls += 1
+            return 64000.0 + self.calls
+
+    def _run_session(price_source, suffix):
+        fd, state_path = tempfile.mkstemp(suffix=f"_{suffix}.json")
+        os.close(fd)
+        os.remove(state_path)
+        try:
+            run_live_polling(
+                price_source, symbol="BTC_USDC", strategy_name="momentum", profile_name="moderado",
+                seed_csv="real_data/btc_daily.csv", poll_interval_seconds=0, max_ticks=5, state_path=state_path,
+            )
+        finally:
+            if os.path.exists(state_path):
+                os.remove(state_path)
+
+    # --- Sin feed compartido: cada sesión usa su propio price_source directo ---
+    direct_a, direct_b = CountingStubPriceSource(), CountingStubPriceSource()
+    _run_session(direct_a, "direct_a")
+    _run_session(direct_b, "direct_b")
+    total_direct_calls = direct_a.calls + direct_b.calls
+    assert total_direct_calls == 10, f"2 sesiones x 5 ticks sin feed compartido deberían sumar 10 llamadas reales, dio {total_direct_calls}"
+
+    # --- Con feed compartido: mismas 2 sesiones, 1 sola fuente subyacente ---
+    shared_source = CountingStubPriceSource()
+    feed = SharedPriceFeed(shared_source, poll_interval_seconds=9999)  # no refresca de fondo durante el test
+    try:
+        _run_session(feed, "shared_0")
+        _run_session(feed, "shared_1")
+        assert shared_source.calls == 1, (
+            f"Con SharedPriceFeed, 2 sesiones sobre el mismo símbolo (con la misma ventana de frescura) "
+            f"deberían generar 1 sola llamada real, dio {shared_source.calls}"
+        )
+    finally:
+        feed.stop_all()
+
+    print(f"OK: sin feed compartido 2 sesiones x 5 ticks generaron {total_direct_calls} llamadas reales; "
+          f"con SharedPriceFeed generaron {shared_source.calls}")
+
+
 if __name__ == "__main__":
     tests = [
         test_risk_never_exceeds_profile,
@@ -1154,6 +1302,10 @@ if __name__ == "__main__":
         test_alpaca_place_order_when_allowed_posts_to_orders_endpoint,
         test_live_polling_accepts_alpaca_as_price_source,
         test_alpaca_private_requires_credentials,
+        test_shared_price_feed_dedupes_concurrent_consumers_on_same_symbol,
+        test_shared_price_feed_polls_symbols_independently,
+        test_shared_price_feed_refreshes_when_stale,
+        test_shared_price_feed_as_drop_in_reduces_calls_for_two_sessions,
     ]
     failed = 0
     for t in tests:
