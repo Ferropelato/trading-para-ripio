@@ -611,6 +611,196 @@ def test_ripio_public_ticker_live():
     print(f"OK: ticker público Ripio BTC_USDC = {price}")
 
 
+_SAMPLE_RSS = """<?xml version="1.0"?>
+<rss><channel>
+  <item>
+    <title>Exchange suffers major hack, millions stolen</title>
+    <link>https://example.com/news/1</link>
+    <pubDate>Wed, 01 Jan 2026 00:00:00 GMT</pubDate>
+  </item>
+  <item>
+    <title>Bitcoin price steady amid quiet trading day</title>
+    <link>https://example.com/news/2</link>
+    <pubDate>Wed, 01 Jan 2026 01:00:00 GMT</pubDate>
+  </item>
+  <item>
+    <title>Regulator announces new crackdown on crypto exchanges</title>
+    <link>https://example.com/news/3</link>
+    <pubDate>Wed, 01 Jan 2026 02:00:00 GMT</pubDate>
+  </item>
+</channel></rss>"""
+
+
+def test_classify_impact_matches_keywords():
+    from news_monitor import classify_impact
+
+    assert classify_impact("Exchange suffers major hack, millions stolen") != []
+    assert classify_impact("Bitcoin price steady amid quiet trading day") == []
+    print("OK: la clasificación por palabras clave detecta e ignora titulares correctamente")
+
+
+def test_news_monitor_dedup_and_filters_low_impact():
+    """
+    Con un feed inyectado (sin red real): debe devolver solo los titulares
+    de alto impacto, y no repetir el mismo titular en una segunda llamada.
+    """
+    from news_monitor import NewsMonitor
+
+    def fake_http_get(url, timeout):
+        return _SAMPLE_RSS
+
+    monitor = NewsMonitor(feeds=["https://fake.feed/rss"], http_get=fake_http_get)
+
+    first = monitor.fetch_high_impact_news()
+    assert len(first) == 2, f"Esperaba 2 titulares de alto impacto, llegaron {len(first)}"
+    titles = {item.title for item in first}
+    assert "Bitcoin price steady amid quiet trading day" not in titles
+
+    second = monitor.fetch_high_impact_news()
+    assert second == [], "No debería re-alertar el mismo titular ya visto"
+    print("OK: el monitor de noticias filtra por impacto y no duplica alertas ya vistas")
+
+
+def test_news_monitor_empty_feeds_list_makes_no_requests():
+    """
+    Regresion: feeds=[] (lista vacia explicita, "sin feeds") NO debe caer
+    a los feeds reales por defecto. Bug real encontrado durante el
+    desarrollo de este mismo modulo: `feeds or DEFAULT_FEEDS` trataba []
+    como "no se paso nada" y terminaba llamando a las URLs reales.
+    """
+    from news_monitor import NewsMonitor
+
+    calls = []
+
+    def counting_http_get(url, timeout):
+        calls.append(url)
+        return ""
+
+    monitor = NewsMonitor(feeds=[], http_get=counting_http_get)
+    result = monitor.fetch_high_impact_news()
+    assert result == []
+    assert calls == [], f"feeds=[] no deberia disparar ninguna llamada, se llamo a: {calls}"
+    print("OK: feeds=[] explicito no cae a los feeds reales por defecto")
+
+
+def test_automation_window_handles_midnight_crossing():
+    from news_monitor import AutomationWindow
+    from datetime import datetime, timezone
+
+    overnight = AutomationWindow(22, 6)  # 22:00 a 06:00 UTC
+    assert overnight.contains(datetime(2026, 1, 1, 23, 0, tzinfo=timezone.utc))
+    assert overnight.contains(datetime(2026, 1, 1, 3, 0, tzinfo=timezone.utc))
+    assert not overnight.contains(datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc))
+
+    daytime = AutomationWindow(9, 17)
+    assert daytime.contains(datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc))
+    assert not daytime.contains(datetime(2026, 1, 1, 20, 0, tzinfo=timezone.utc))
+    print("OK: las ventanas horarias UTC funcionan, incluyendo las que cruzan medianoche")
+
+
+def test_news_guard_pauses_entries_only_in_automatic_window():
+    """
+    Fuera de ventana automática: alerta pero NO pausa entradas (modo manual).
+    Dentro de ventana automática: alerta Y pausa entradas por cooldown_minutes.
+    """
+    from news_monitor import NewsMonitor, NewsAutomationSchedule, AutomationWindow, NewsGuard
+    from datetime import datetime, timedelta, timezone
+
+    def fake_http_get(url, timeout):
+        return _SAMPLE_RSS
+
+    class CollectingAlertChannel:
+        def __init__(self):
+            self.sent = []
+
+        def send(self, message):
+            self.sent.append(message)
+            return True
+
+    manual_time = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)  # fuera de la ventana 22-6
+    alert_channel = CollectingAlertChannel()
+    guard = NewsGuard(
+        NewsMonitor(feeds=["https://fake.feed/rss"], http_get=fake_http_get),
+        NewsAutomationSchedule([AutomationWindow(22, 6)], cooldown_minutes=30),
+        alert_channel, min_interval_seconds=0,
+    )
+    guard.check(now=manual_time)
+    assert len(alert_channel.sent) == 2, "Debería alertar igual en modo manual"
+    assert not guard.entries_paused(now=manual_time), "En modo manual no debería pausar entradas solo"
+
+    # Nueva instancia para probar el modo automático con las mismas noticias "nuevas"
+    auto_time = datetime(2026, 1, 1, 23, 0, tzinfo=timezone.utc)  # dentro de la ventana 22-6
+    alert_channel2 = CollectingAlertChannel()
+    guard2 = NewsGuard(
+        NewsMonitor(feeds=["https://fake.feed/rss"], http_get=fake_http_get),
+        NewsAutomationSchedule([AutomationWindow(22, 6)], cooldown_minutes=30),
+        alert_channel2, min_interval_seconds=0,
+    )
+    guard2.check(now=auto_time)
+    assert len(alert_channel2.sent) == 2
+    assert guard2.entries_paused(now=auto_time), "En ventana automática debería pausar entradas"
+    assert not guard2.entries_paused(now=auto_time + timedelta(minutes=31)), "La pausa debería expirar tras el cooldown"
+    print("OK: NewsGuard solo pausa entradas automáticamente dentro de la ventana configurada, y respeta el cooldown")
+
+
+def test_live_polling_blocks_entries_during_news_pause():
+    """
+    Integración: con un NewsGuard ya pausado desde antes de arrancar, el
+    runner de precios en vivo no debería abrir NINGUNA posición nueva
+    aunque la estrategia de señal de compra, incluso con precios que
+    normalmente la dispararían.
+    """
+    import os
+    import tempfile
+    from datetime import datetime, timedelta, timezone
+
+    from live_runner import run_live_polling
+    from news_monitor import NewsMonitor, NewsAutomationSchedule, NewsGuard
+
+    class StubPriceSource:
+        def __init__(self, prices):
+            self._prices = list(prices)
+            self._i = 0
+
+        def get_current_price(self, symbol):
+            price = self._prices[min(self._i, len(self._prices) - 1)]
+            self._i += 1
+            return price
+
+    # Precio en ruptura sostenida -- normalmente dispararía una entrada de "momentum".
+    prices = [100 + i * 3 for i in range(20)]
+    price_source = StubPriceSource(prices)
+
+    class NoAlertChannel:
+        def send(self, message):
+            return True
+
+    guard = NewsGuard(
+        NewsMonitor(feeds=[], http_get=lambda url, timeout: ""),  # sin feeds -- no busca noticias nuevas
+        NewsAutomationSchedule([], cooldown_minutes=999999),
+        NoAlertChannel(), min_interval_seconds=0,
+    )
+    # Forzar la pausa manualmente, como si una noticia de alto impacto ya la hubiera activado.
+    guard._paused_until = datetime.now(timezone.utc) + timedelta(hours=1)
+
+    fd, state_path = tempfile.mkstemp(suffix="_live_polling_news_state.json")
+    os.close(fd)
+    os.remove(state_path)
+    try:
+        broker = run_live_polling(
+            price_source, symbol="TEST_NEWS", strategy_name="momentum", profile_name="moderado",
+            seed_csv="real_data/btc_daily.csv", initial_balance=1000.0,
+            poll_interval_seconds=0, max_ticks=15, state_path=state_path,
+            news_guard=guard,
+        )
+        assert broker.get_open_positions() == {}, "No debería haber abierto ninguna posición durante la pausa por noticias"
+        assert broker.get_balance() == 1000.0, "El balance no debería haberse movido si nunca se operó"
+    finally:
+        if os.path.exists(state_path):
+            os.remove(state_path)
+    print("OK: la pausa por noticias bloquea entradas nuevas de punta a punta en el runner de precios en vivo")
+
+
 if __name__ == "__main__":
     tests = [
         test_risk_never_exceeds_profile,
@@ -649,6 +839,12 @@ if __name__ == "__main__":
         test_ripio_place_order_blocked_without_allow_trading,
         test_ripio_private_requires_credentials,
         test_ripio_public_ticker_live,
+        test_classify_impact_matches_keywords,
+        test_news_monitor_dedup_and_filters_low_impact,
+        test_news_monitor_empty_feeds_list_makes_no_requests,
+        test_automation_window_handles_midnight_crossing,
+        test_news_guard_pauses_entries_only_in_automatic_window,
+        test_live_polling_blocks_entries_during_news_pause,
     ]
     failed = 0
     for t in tests:

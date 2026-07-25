@@ -61,7 +61,7 @@ class _LiveEngine:
 
     def __init__(self, broker, symbol, profile, strategy_name, profile_name,
                  alert_channel, kill_switch, circuit_breaker, heartbeat,
-                 state_store, reconcile_every, log):
+                 state_store, reconcile_every, log, news_guard=None):
         self.broker = broker
         self.symbol = symbol
         self.profile = profile
@@ -74,6 +74,9 @@ class _LiveEngine:
         self.state_store = state_store
         self.reconcile_every = reconcile_every
         self.log = log
+        # Opcional: solo tiene sentido en polling en vivo (run_live_polling),
+        # nunca en replay historico -- ver news_monitor.py.
+        self.news_guard = news_guard
 
         saved_state = state_store.load()
         self.stop_loss = saved_state["extra"].get("stop_loss") if saved_state["saved_at"] else None
@@ -104,6 +107,12 @@ class _LiveEngine:
                               self.kill_switch.reason())
             self.equity_curve.append(self._mark_to_market(price))
             return
+
+        # 2b) Noticias de alto impacto: siempre alerta; en ventana automatica
+        # ademas puede dejar `news_guard.entries_paused()` en True (chequeado
+        # mas abajo, junto al resto de condiciones para abrir una posicion).
+        if self.news_guard is not None:
+            self.news_guard.check()
 
         # 3) Actualizar el precio "de mercado" que ve el bróker
         self.broker.set_price(self.symbol, price)
@@ -136,8 +145,9 @@ class _LiveEngine:
                 self.stop_loss, self.take_profit = None, None
                 self.internal_positions.pop(self.symbol, None)
 
-        # 5) Lógica de entrada (si no hay posición abierta y el breaker no está activo)
-        elif not breaker_active:
+        # 5) Lógica de entrada (si no hay posición abierta, el breaker no está
+        # activo, y no hay una pausa automática por noticias en curso)
+        elif not breaker_active and not (self.news_guard is not None and self.news_guard.entries_paused()):
             if sig == 1 and not pd.isna(current_atr) and current_atr > 0:
                 sizing = position_size(self.broker.get_balance(), price, current_atr, self.profile)
                 if sizing["unidades"] > 0 and sizing["viable"] is not False:
@@ -238,7 +248,7 @@ def run_live_polling(price_source, symbol: str, strategy_name: str, profile_name
                       state_path: str = "engine_state.json", reconcile_every: int = 10,
                       max_drawdown_pct: float = 15.0, max_daily_loss_pct: float = 5.0,
                       regime_filter: bool = True, multi_timeframe_filter: bool = True,
-                      max_history_rows: int = 5000):
+                      max_history_rows: int = 5000, news_guard=None):
     """
     Paper trading contra un feed de precios REAL (no replay histórico): en
     cada intervalo de `poll_interval_seconds` pide el precio actual a
@@ -261,6 +271,12 @@ def run_live_polling(price_source, symbol: str, strategy_name: str, profile_name
     sesiones largas (recorta las filas más viejas, conservando siempre las
     últimas -- de sobra para cualquiera de los lookbacks que usan las
     estrategias).
+
+    `news_guard` (opcional, ver news_monitor.NewsGuard): si se pasa, en
+    cada tick chequea noticias de alto impacto y siempre alerta; en las
+    ventanas horarias configuradas como automáticas además pausa
+    temporalmente la apertura de posiciones nuevas. Nunca coloca ni cierra
+    una orden por sí solo.
     """
     log = get_logger("live_runner")
     log.info("Iniciando runner en vivo (modo paper trading, PRECIOS REALES en vivo) — %s / %s sobre %s",
@@ -277,6 +293,7 @@ def run_live_polling(price_source, symbol: str, strategy_name: str, profile_name
         CircuitBreaker(max_drawdown_pct, max_daily_loss_pct),
         Heartbeat(max_staleness_seconds=max(poll_interval_seconds * 5, 300)),
         StateStore(path=state_path), reconcile_every, log,
+        news_guard=news_guard,
     )
     shutdown_requested = _make_shutdown_flag(log)
 
@@ -354,6 +371,14 @@ def main():
                          help="En vez de reproducir el CSV, pedir el precio real en vivo (Ripio, ticker público) en cada intervalo. Nunca coloca órdenes reales, solo lee precio.")
     parser.add_argument("--poll-interval", type=float, default=60.0,
                          help="[--live-prices] Segundos entre cada consulta de precio en vivo")
+    parser.add_argument("--news-alerts", action="store_true",
+                         help="[--live-prices] Activar el monitor de noticias de alto impacto (RSS público, sin API key)")
+    parser.add_argument("--news-auto-window", action="append", default=[], metavar="HH-HH",
+                         help="Ventana horaria UTC 'HH-HH' donde, ademas de alertar, se pausan automaticamente las entradas nuevas ante una noticia de alto impacto (ej. 22-6). Repetible. Sin ninguna, el modo es siempre manual (solo alerta, nunca pausa sola).")
+    parser.add_argument("--news-cooldown-minutes", type=float, default=60.0,
+                         help="[--news-alerts] Minutos que dura la pausa automatica de entradas tras una noticia de alto impacto, en ventana automatica")
+    parser.add_argument("--news-check-interval", type=float, default=300.0,
+                         help="[--news-alerts] Segundos minimos entre consultas reales a los feeds de noticias")
     args = parser.parse_args()
 
     setup_logging(level="INFO")
@@ -361,12 +386,30 @@ def main():
     if args.live_prices:
         from broker import RipioBrokerAdapter
         price_source = RipioBrokerAdapter(allow_trading=False)
+
+        news_guard = None
+        if args.news_alerts:
+            from news_monitor import NewsMonitor, NewsAutomationSchedule, AutomationWindow, NewsGuard
+
+            windows = []
+            for spec in args.news_auto_window:
+                start_s, end_s = spec.split("-")
+                windows.append(AutomationWindow(int(start_s), int(end_s)))
+
+            news_guard = NewsGuard(
+                NewsMonitor(), NewsAutomationSchedule(windows, cooldown_minutes=args.news_cooldown_minutes),
+                ConsoleAlertChannel(), min_interval_seconds=args.news_check_interval,
+            )
+            modo = "hibrido (automatico en horario configurado)" if windows else "siempre manual (solo alerta)"
+            get_logger("live_runner").info("Monitor de noticias activado -- modo %s", modo)
+
         run_live_polling(
             price_source, args.symbol, args.strategy, args.profile, seed_csv=args.csv,
             initial_balance=args.capital, poll_interval_seconds=args.poll_interval,
             max_ticks=args.max_ticks, state_path=args.state_path,
             max_drawdown_pct=args.max_drawdown, max_daily_loss_pct=args.max_daily_loss,
             regime_filter=not args.no_regime_filter, multi_timeframe_filter=not args.no_mtf_filter,
+            news_guard=news_guard,
         )
     else:
         run_live(
