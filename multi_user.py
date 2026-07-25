@@ -8,9 +8,16 @@ de operar con capital real" -- este era uno de los puntos pendientes).
 forma completamente aislada del resto: un `PaperBroker` propio (fondeado
 desde su asignación reservada en la billetera vía `WalletBalanceProvider`,
 ver `wallet_integration.py`), su propio `CircuitBreaker`/`ManualKillSwitch`,
-y su propio archivo de estado. `UserSessionManager` mantiene estas
+y su propio estado persistido. `UserSessionManager` mantiene estas
 sesiones por `user_id` y garantiza que ningún objeto mutable se comparta
 entre dos usuarios.
+
+Fase 3a: el estado ya no se guarda en un archivo JSON por usuario --
+`UserSessionManager` usa `SQLiteStateStore` (ver `state_store.py`), donde
+TODOS los usuarios comparten un único archivo de base de datos, cada uno
+identificado por su propia key. Esto evita terminar con miles de archivos
+sueltos en disco y permite consultar el estado de todos los usuarios
+desde un solo lugar (ver `ops_monitor.py`).
 
 Simplificación deliberada: `sync_settlement_to_wallet` usa el balance en
 efectivo del bróker (`get_balance()`), no el equity marcado a mercado con
@@ -23,7 +30,7 @@ duplicar esa lógica de valuación.
 
 from broker import PaperBroker
 from safety import CircuitBreaker, ManualKillSwitch
-from state_store import StateStore
+from state_store import SQLiteStateStore
 from wallet_integration import WalletBalanceProvider
 
 
@@ -32,9 +39,16 @@ class UserTradingSession:
     objeto de acá se comparte con otro usuario."""
 
     def __init__(self, user_id: str, currency: str, wallet: WalletBalanceProvider,
-                 state_path: str, max_drawdown_pct: float = 15.0,
+                 state_store, max_drawdown_pct: float = 15.0,
                  max_daily_loss_pct: float = 5.0, commission_pct: float = 0.001,
                  slippage_pct: float = 0.0005):
+        """
+        `state_store`: cualquier objeto con .save()/.load() (típicamente
+        un `SQLiteStateStore` -- ver `state_store.py`, Fase 3a). Se recibe
+        ya construido en vez de armarlo acá adentro, para que
+        `UserSessionManager` decida el backend de persistencia sin que
+        esta clase tenga que saber nada de archivos ni de bases de datos.
+        """
         self.user_id = user_id
         self.currency = currency
         self.wallet = wallet
@@ -49,7 +63,7 @@ class UserTradingSession:
         # todos -- exactamente el bug de aislamiento que este modulo existe
         # para evitar. Cada usuario necesita su propio archivo.
         self.kill_switch = ManualKillSwitch(control_file=f".KILL_SWITCH_{user_id}")
-        self.state_store = StateStore(path=state_path)
+        self.state_store = state_store
 
     def sync_settlement_to_wallet(self) -> None:
         """Refleja en la billetera la ganancia/pérdida acumulada desde la
@@ -66,11 +80,14 @@ class UserSessionManager:
     Mantiene una `UserTradingSession` completamente aislada por usuario.
     Activar el kill-switch o disparar el circuit breaker de un usuario
     NUNCA afecta a otro -- cada uno tiene sus propias instancias.
+
+    Todos los usuarios comparten un único archivo de base de datos
+    (`db_path`) para el estado persistido -- ver `SQLiteStateStore`.
     """
 
-    def __init__(self, wallet: WalletBalanceProvider, state_dir: str = "."):
+    def __init__(self, wallet: WalletBalanceProvider, db_path: str = "engine_state.db"):
         self.wallet = wallet
-        self.state_dir = state_dir
+        self.db_path = db_path
         self._sessions = {}  # user_id -> UserTradingSession
 
     def start_session(self, user_id: str, currency: str, amount_to_reserve: float, **kwargs) -> UserTradingSession:
@@ -82,8 +99,8 @@ class UserSessionManager:
         # una sesión a medio abrir.
         self.wallet.reserve_for_trading(user_id, currency, amount_to_reserve)
 
-        state_path = f"{self.state_dir}/engine_state_{user_id}.json"
-        session = UserTradingSession(user_id, currency, self.wallet, state_path, **kwargs)
+        state_store = SQLiteStateStore(db_path=self.db_path, key=user_id)
+        session = UserTradingSession(user_id, currency, self.wallet, state_store, **kwargs)
         self._sessions[user_id] = session
         return session
 
@@ -93,11 +110,13 @@ class UserSessionManager:
         return self._sessions[user_id]
 
     def stop_session(self, user_id: str) -> None:
-        """Sincroniza el resultado final con la billetera y devuelve todo
-        lo que quede asignado al saldo disponible general del usuario."""
+        """Sincroniza el resultado final con la billetera, devuelve todo lo
+        que quede asignado al saldo disponible general del usuario, y
+        cierra la conexión a la base de estado."""
         session = self.get_session(user_id)
         session.sync_settlement_to_wallet()
         remaining = self.wallet.get_trading_allocation(user_id, session.currency)
         if remaining > 0:
             self.wallet.release_from_trading(user_id, session.currency, remaining)
+        session.state_store.close()
         del self._sessions[user_id]

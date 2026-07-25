@@ -898,14 +898,19 @@ def test_wallet_settle_trade_result_only_touches_trading_allocation():
 
 def test_user_sessions_are_fully_isolated():
     import os
+    import tempfile
     from wallet_integration import SimulatedWalletBalanceProvider
     from multi_user import UserSessionManager
     from safety import ManualKillSwitch
 
+    fd, db_path = tempfile.mkstemp(suffix="_multiuser.db")
+    os.close(fd)
+    os.remove(db_path)
+
     wallet = SimulatedWalletBalanceProvider()
     wallet.deposit("user-a", "USDC", 1000.0)
     wallet.deposit("user-b", "USDC", 250.0)
-    manager = UserSessionManager(wallet, state_dir=".")
+    manager = UserSessionManager(wallet, db_path=db_path)
 
     session_a = manager.start_session("user-a", "USDC", 800.0)
     session_b = manager.start_session("user-b", "USDC", 200.0)
@@ -916,45 +921,98 @@ def test_user_sessions_are_fully_isolated():
         assert session_a.broker is not session_b.broker
         assert session_a.circuit_breaker is not session_b.circuit_breaker
         assert session_a.kill_switch is not session_b.kill_switch
+        assert session_a.state_store is not session_b.state_store
 
         session_a.kill_switch.activate("prueba de aislamiento")
         assert session_a.kill_switch.is_active() is True
         assert session_b.kill_switch.is_active() is False, "El kill-switch de un usuario NUNCA debe afectar a otro"
     finally:
         for uid in ("user-a", "user-b"):
-            state_path = f"./engine_state_{uid}.json"
             kill_switch_path = f"./.KILL_SWITCH_{uid}"
             manager.stop_session(uid)
-            if os.path.exists(state_path):
-                os.remove(state_path)
             if os.path.exists(kill_switch_path):
                 os.remove(kill_switch_path)
+        if os.path.exists(db_path):
+            os.remove(db_path)
 
     assert wallet.get_available_balance("user-a", "USDC") == 1000.0
     assert wallet.get_available_balance("user-b", "USDC") == 250.0
-    print("OK: las sesiones de usuarios distintos están completamente aisladas (bróker, circuit breaker, kill-switch)")
+    print("OK: las sesiones de usuarios distintos están completamente aisladas (bróker, circuit breaker, kill-switch, estado)")
 
 
 def test_start_session_fails_cleanly_without_enough_wallet_balance():
+    import os
+    import tempfile
     from wallet_integration import SimulatedWalletBalanceProvider, InsufficientWalletBalanceError
     from multi_user import UserSessionManager
 
+    fd, db_path = tempfile.mkstemp(suffix="_multiuser.db")
+    os.close(fd)
+    os.remove(db_path)
+
     wallet = SimulatedWalletBalanceProvider()
     wallet.deposit("user-c", "USDC", 50.0)
-    manager = UserSessionManager(wallet, state_dir=".")
+    manager = UserSessionManager(wallet, db_path=db_path)
 
     try:
-        manager.start_session("user-c", "USDC", 500.0)
-        assert False, "Debería fallar: no hay saldo suficiente en la billetera"
-    except InsufficientWalletBalanceError:
-        pass
+        try:
+            manager.start_session("user-c", "USDC", 500.0)
+            assert False, "Debería fallar: no hay saldo suficiente en la billetera"
+        except InsufficientWalletBalanceError:
+            pass
 
-    try:
-        manager.get_session("user-c")
-        assert False, "No debería haber quedado una sesión a medio crear"
-    except KeyError:
-        pass
+        try:
+            manager.get_session("user-c")
+            assert False, "No debería haber quedado una sesión a medio crear"
+        except KeyError:
+            pass
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
     print("OK: si no alcanza el saldo de la billetera, no queda ninguna sesión a medio abrir")
+
+
+def test_user_session_manager_uses_one_shared_db_not_one_file_per_user():
+    """
+    El punto central de la Fase 3a: muchos usuarios comparten un único
+    archivo de base de datos (no un JSON por usuario), y el estado de
+    cada uno persiste correctamente ahí incluso después de cerrar sus
+    sesiones.
+    """
+    import os
+    import tempfile
+    from wallet_integration import SimulatedWalletBalanceProvider
+    from multi_user import UserSessionManager
+    from state_store import SQLiteStateStore
+
+    fd, db_path = tempfile.mkstemp(suffix="_multiuser.db")
+    os.close(fd)
+    os.remove(db_path)
+
+    wallet = SimulatedWalletBalanceProvider()
+    for uid, amount in [("user-x", 500.0), ("user-y", 700.0), ("user-z", 300.0)]:
+        wallet.deposit(uid, "USDC", amount)
+    manager = UserSessionManager(wallet, db_path=db_path)
+
+    try:
+        for uid, amount in [("user-x", 400.0), ("user-y", 600.0), ("user-z", 250.0)]:
+            session = manager.start_session(uid, "USDC", amount)
+            session.state_store.save({}, capital=amount, extra={})
+
+        assert SQLiteStateStore.all_keys(db_path) == ["user-x", "user-y", "user-z"]
+
+        for uid in ("user-x", "user-y", "user-z"):
+            manager.stop_session(uid)
+            kill_switch_path = f"./.KILL_SWITCH_{uid}"
+            if os.path.exists(kill_switch_path):
+                os.remove(kill_switch_path)
+
+        # El estado sigue en la MISMA base compartida despues de cerrar las sesiones.
+        assert SQLiteStateStore.all_keys(db_path) == ["user-x", "user-y", "user-z"]
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+    print("OK: UserSessionManager guarda el estado de todos los usuarios en un único archivo compartido, no uno por usuario")
 
 
 class _FakeAlpacaResponse:
@@ -1244,6 +1302,87 @@ def test_shared_price_feed_as_drop_in_reduces_calls_for_two_sessions():
           f"con SharedPriceFeed generaron {shared_source.calls}")
 
 
+def test_sqlite_state_store_save_and_load_round_trip():
+    import os
+    import tempfile
+    from state_store import SQLiteStateStore
+
+    fd, db_path = tempfile.mkstemp(suffix="_state.db")
+    os.close(fd)
+    os.remove(db_path)
+    try:
+        store = SQLiteStateStore(db_path=db_path, key="user-1")
+        store.save({"BTC_USDC": {"unidades": 0.5, "precio_entrada": 64000.0}}, capital=800.0,
+                   extra={"stop_loss": 60000.0})
+        loaded = store.load()
+        assert loaded["positions"] == {"BTC_USDC": {"unidades": 0.5, "precio_entrada": 64000.0}}
+        assert loaded["capital"] == 800.0
+        assert loaded["extra"] == {"stop_loss": 60000.0}
+        assert loaded["saved_at"] is not None
+        store.close()
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+    print("OK: SQLiteStateStore guarda y recupera el estado exactamente igual que se guardó")
+
+
+def test_sqlite_state_store_empty_when_no_prior_state():
+    import os
+    import tempfile
+    from state_store import SQLiteStateStore
+
+    fd, db_path = tempfile.mkstemp(suffix="_state.db")
+    os.close(fd)
+    os.remove(db_path)
+    try:
+        store = SQLiteStateStore(db_path=db_path, key="user-nuevo")
+        loaded = store.load()
+        assert loaded == {"positions": {}, "capital": None, "extra": {}, "saved_at": None}
+        store.close()
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+    print("OK: SQLiteStateStore devuelve estado vacío para una key sin historial")
+
+
+def test_sqlite_state_store_multiple_users_share_one_db_without_mixing():
+    """
+    El punto central de la Fase 3a: muchos usuarios comparten UN solo
+    archivo de base de datos (no un JSON por usuario), pero sus estados
+    nunca se mezclan entre sí.
+    """
+    import os
+    import tempfile
+    from state_store import SQLiteStateStore
+
+    fd, db_path = tempfile.mkstemp(suffix="_state.db")
+    os.close(fd)
+    os.remove(db_path)
+    try:
+        store_a = SQLiteStateStore(db_path=db_path, key="user-a")
+        store_b = SQLiteStateStore(db_path=db_path, key="user-b")
+
+        store_a.save({"BTC_USDC": {"unidades": 1.0, "precio_entrada": 100.0}}, capital=500.0)
+        store_b.save({"ETH_USDC": {"unidades": 2.0, "precio_entrada": 50.0}}, capital=300.0)
+
+        loaded_a = store_a.load()
+        loaded_b = store_b.load()
+        assert loaded_a["positions"] == {"BTC_USDC": {"unidades": 1.0, "precio_entrada": 100.0}}
+        assert loaded_a["capital"] == 500.0
+        assert loaded_b["positions"] == {"ETH_USDC": {"unidades": 2.0, "precio_entrada": 50.0}}
+        assert loaded_b["capital"] == 300.0
+
+        assert SQLiteStateStore.all_keys(db_path) == ["user-a", "user-b"]
+        assert os.path.exists(db_path), "Debe ser un único archivo de base de datos, no uno por usuario"
+
+        store_a.close()
+        store_b.close()
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+    print("OK: muchos usuarios comparten un solo archivo SQLite sin que sus estados se mezclen")
+
+
 if __name__ == "__main__":
     tests = [
         test_risk_never_exceeds_profile,
@@ -1295,6 +1434,7 @@ if __name__ == "__main__":
         test_wallet_settle_trade_result_only_touches_trading_allocation,
         test_user_sessions_are_fully_isolated,
         test_start_session_fails_cleanly_without_enough_wallet_balance,
+        test_user_session_manager_uses_one_shared_db_not_one_file_per_user,
         test_alpaca_get_current_price_parses_latest_trade,
         test_alpaca_get_balance_reads_cash_from_account,
         test_alpaca_get_open_positions_maps_fields,
@@ -1306,6 +1446,9 @@ if __name__ == "__main__":
         test_shared_price_feed_polls_symbols_independently,
         test_shared_price_feed_refreshes_when_stale,
         test_shared_price_feed_as_drop_in_reduces_calls_for_two_sessions,
+        test_sqlite_state_store_save_and_load_round_trip,
+        test_sqlite_state_store_empty_when_no_prior_state,
+        test_sqlite_state_store_multiple_users_share_one_db_without_mixing,
     ]
     failed = 0
     for t in tests:
