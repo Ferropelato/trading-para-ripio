@@ -323,15 +323,12 @@ Las 5 mejoras pendientes de la ronda anterior, ya implementadas y probadas
 ## Cuarta ronda: preparado para continuar desde otra PC (con git/API real)
 
 - **`live_runner.py`**: junta todas las piezas (estrategia, gestor de
-  riesgo, bróker, alertas, kill-switch, heartbeat) en un solo loop
-  operable. Corre hoy contra `PaperBroker`, reproduciendo datos
-  históricos como si llegaran en vivo. El día que se conecte un bróker
-  real, el cambio es una sola línea (qué clase de bróker se instancia) —
-  el resto del loop no cambia. Probado de punta a punta con datos reales.
-  **Nota**: el balance que da `live_runner` difiere un poco del
-  backtester (`$1856` vs `$1590` con los mismos parámetros) porque
-  todavía no tiene integrado el circuit breaker ni los filtros de
-  régimen/multi-timeframe — es la lógica de entrada/salida "base".
+  riesgo, bróker, alertas, kill-switch, heartbeat, **circuit breaker**,
+  **filtro de régimen** y **multi-timeframe**) en un solo loop operable.
+  Corre hoy contra `PaperBroker`, reproduciendo datos históricos como si
+  llegaran en vivo. El día que se conecte un bróker real, el cambio es
+  una sola línea (qué clase de bróker se instancia) — el resto del loop
+  no cambia. Probado de punta a punta con datos reales.
 - **`.env.example`**: plantilla de variables de entorno para credenciales
   (bróker, Telegram, email). Copiar a `.env`, completar ahí, nunca subir
   ese archivo a git (ya está en `.gitignore`).
@@ -339,33 +336,22 @@ Las 5 mejoras pendientes de la ronda anterior, ya implementadas y probadas
   desde variables de entorno (`BROKER_API_KEY`, `BROKER_API_SECRET`) en
   vez de solo aceptarlas como parámetro. Si no las encuentra, avisa por
   log en vez de fallar silenciosamente.
-- **Repositorio git inicializado** con un commit inicial limpio de todo
-  el proyecto -- en la otra PC alcanza con descomprimir y ya tenés
-  historial para seguir trabajando (`git log`, branches, etc.).
+- **Repositorio git inicializado** con historial de las 6 rondas.
 
-### Pasos concretos para cuando estés en la otra PC
+### Pasos concretos para conectar un bróker real
 
-1. Descomprimir `trading_engine_completo.zip` — ya viene con `git init`
-   hecho y el primer commit cargado.
-2. `pip install -r requirements.txt` (o `pip install -r requirements.txt
-   --break-system-packages` según tu entorno).
-3. Correr `python3 tests.py` primero — confirmá que las 22 pruebas pasan
-   en tu máquina antes de tocar nada (si tu Python es una versión
-   distinta a 3.11/3.12, puede haber alguna diferencia menor a revisar).
-4. Copiar `.env.example` a `.env` y completar lo que tengas: credenciales
-   de la API del bróker que consigas (revisar primero si el bróker en
-   cuestión ofrece una API pública para desarrolladores — no todos los
-   brokers minoristas la tienen), y opcionalmente el bot de Telegram.
-5. En `broker.py`, completar los métodos de `LibertexBrokerAdapter` (o
-   como se llame el adaptador del bróker que uses) reemplazando cada
-   `raise NotImplementedError` por la llamada HTTP real, siguiendo la
-   documentación de API de ese bróker específico.
-6. Probar el adaptador nuevo de forma aislada primero (ej. solo
-   `get_current_price` y `get_balance`, que son de solo lectura) antes de
-   probar `place_order` con plata real.
-7. Cuando tengas confianza en el adaptador, reemplazar `PaperBroker` por
-   el adaptador real en `live_runner.py` y correrlo primero con montos
-   mínimos.
+1. `pip install -r requirements.txt`
+2. Correr `python tests.py` — confirmar que las 30 pruebas pasan.
+3. Copiar `.env.example` a `.env` y completar credenciales (Ripio:
+   `RIPIO_API_TOKEN` + `RIPIO_API_SECRET`; opcionalmente Telegram).
+4. En `broker.py`, completar los métodos de `RipioBrokerAdapter`
+   reemplazando cada `raise NotImplementedError` por la llamada HTTP
+   real, siguiendo la documentación oficial (`apidocs.ripiotrade.co`).
+5. Probar el adaptador de forma aislada primero (solo lectura:
+   `get_current_price` y `get_balance`) antes de `place_order`.
+6. Cuando haya confianza, reemplazar `PaperBroker` por el adaptador real
+   en `live_runner.py` y correrlo primero con montos mínimos.
+
 
 ## Quinta ronda: broker real identificado (Ripio)
 
@@ -460,25 +446,20 @@ a los tres anteriores (no fue una edición que borró una declaración), pero
 la misma lección de fondo: probar de punta a punta después de cada
 integración nueva, no solo cada pieza por separado.
 
-## Próximos pasos sugeridos (no implementados todavía)
+## Próximos pasos reales (lo que todavía falta)
 
-- **Capa de broker abstracta**: una interfaz común (clase base) para que
-  conectar a Libertex, Binance, o cualquier otro bróker/exchange sea
-  cuestión de escribir un adaptador nuevo, no de reescribir el motor.
-- **Bot de alertas (Telegram/email)**: pasar de "correr el script a mano"
-  a "avisa solo cuando hay una señal nueva", sin todavía autorizar
-  ejecución automática -- el paso intermedio antes de cualquier autonomía.
-- **CI (integración continua)**: que `tests.py` corra automáticamente en
-  cada cambio de código (ej. GitHub Actions). El bug de `load_csv`
-  encontrado durante este mismo proceso (ver sección de stress testing
-  arriba) es la prueba concreta de por qué hace falta esto.
-- **Dockerización**: empaquetar el entorno completo (versiones exactas de
-  Python y librerías) para que corra idéntico en cualquier máquina.
-- **Análisis multi-timeframe**: confirmar la señal en un timeframe mayor
-  (ej. semanal) antes de operar en el diario.
-- **`requirements.txt` con versiones fijas**, logging real (módulo
-  `logging` en vez de `print`), y archivo de configuración (YAML/JSON)
-  en vez de solo argumentos de línea de comandos.
+Lo de infraestructura (broker abstracto, alertas, CI, Docker,
+multi-timeframe, requirements, logging, YAML) ya está hecho. Lo que
+queda para acercarse a capital real:
+
+1. **Implementar `RipioBrokerAdapter` de verdad** (hoy es esqueleto con
+   `NotImplementedError`) contra la API documentada de Ripio Trade.
+2. **Paper trading con datos en vivo** varias semanas (no solo replay
+   histórico) antes de pensar en capital real.
+3. **Más datasets / más regímenes** para no confiar en un solo activo.
+4. **Optimización de parámetros siempre con walk-forward** (nunca sobre
+   el 100% de los datos).
+
 
 ## Notas importantes (leer antes de avanzar)
 

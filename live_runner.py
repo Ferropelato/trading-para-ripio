@@ -1,12 +1,14 @@
 """
 Runner "en vivo": junta todas las piezas del motor (estrategia, gestor de
-riesgo, bróker, alertas, kill-switch, heartbeat) en un solo loop operable.
+riesgo, bróker, alertas, kill-switch, heartbeat, circuit breaker, filtros
+de régimen y multi-timeframe) en un solo loop operable.
 
 Corre HOY contra el PaperBroker, "reproduciendo" datos históricos como si
 llegaran en vivo, vela por vela -- así se puede probar el flujo completo
 de punta a punta sin arriesgar nada. El día que se conecte un bróker real
-(ver broker.py -> LibertexBrokerAdapter), el cambio es reemplazar UNA
-línea (qué clase de bróker se instancia); el resto del loop no cambia.
+(ver broker.py -> RipioBrokerAdapter / LibertexBrokerAdapter), el cambio
+es reemplazar UNA línea (qué clase de bróker se instancia); el resto del
+loop no cambia.
 
 Uso:
     python3 live_runner.py --csv real_data/btc_daily.csv --strategy momentum --profile agresivo
@@ -16,31 +18,45 @@ import argparse
 import signal as system_signal
 import time
 
+import pandas as pd
+
 from data_utils import load_csv
-from strategies import get_strategy
+from strategies import get_strategy, STRATEGY_TYPE
 from risk_manager import position_size
 from risk_profiles import get_profile
 from broker import PaperBroker
 from alerts import ConsoleAlertChannel, format_signal_alert
-from safety import ManualKillSwitch
+from safety import ManualKillSwitch, CircuitBreaker
 from health import Heartbeat
 from state_store import StateStore
 from reconciliation import reconcile
+from regime import apply_regime_filter
+from multi_timeframe import apply_multi_timeframe_filter
 from app_logger import setup_logging, get_logger
 
 
 def _atr(df, period=14):
     high, low, close = df["high"], df["low"], df["close"]
     prev_close = close.shift(1)
-    import pandas as pd
     tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
     return tr.rolling(period).mean()
+
+
+def _mark_to_market(broker, symbol, price):
+    """Capital total = cash + valor de mercado de posiciones abiertas."""
+    cash = broker.get_balance()
+    positions = broker.get_open_positions()
+    if symbol in positions:
+        return cash + positions[symbol]["unidades"] * price
+    return cash
 
 
 def run_live(csv_path: str, strategy_name: str, profile_name: str,
              symbol: str = "ASSET", initial_balance: float = 1000.0,
              replay_delay_seconds: float = 0.0, max_ticks: int = None,
-             state_path: str = "engine_state.json", reconcile_every: int = 10):
+             state_path: str = "engine_state.json", reconcile_every: int = 10,
+             max_drawdown_pct: float = 15.0, max_daily_loss_pct: float = 5.0,
+             regime_filter: bool = True, multi_timeframe_filter: bool = True):
     log = get_logger("live_runner")
     log.info("Iniciando runner en vivo (modo paper trading) — %s / %s sobre %s",
               strategy_name, profile_name, symbol)
@@ -49,11 +65,21 @@ def run_live(csv_path: str, strategy_name: str, profile_name: str,
     strategy_fn = get_strategy(strategy_name)
     profile = get_profile(profile_name)
     signal = strategy_fn(df)
+
+    if regime_filter:
+        strategy_type = STRATEGY_TYPE.get(strategy_name, "tendencia")
+        signal = apply_regime_filter(signal, df, strategy_type=strategy_type)
+        log.info("Filtro de régimen aplicado (tipo=%s)", strategy_type)
+    if multi_timeframe_filter:
+        signal = apply_multi_timeframe_filter(signal, df)
+        log.info("Filtro multi-timeframe aplicado")
+
     atr = _atr(df)
 
     broker = PaperBroker(initial_balance=initial_balance)
     alert_channel = ConsoleAlertChannel()
     kill_switch = ManualKillSwitch()
+    circuit_breaker = CircuitBreaker(max_drawdown_pct, max_daily_loss_pct)
     heartbeat = Heartbeat(max_staleness_seconds=3600)  # en un loop real, ajustar según frecuencia del feed
     state_store = StateStore(path=state_path)
 
@@ -67,6 +93,9 @@ def run_live(csv_path: str, strategy_name: str, profile_name: str,
 
     ticks_processed = 0
     shutdown_requested = {"flag": False}
+    equity_curve = []
+    day_start_equity = initial_balance
+    current_day = None
 
     def _handle_shutdown_signal(signum, frame):
         log.warning("Señal de apagado recibida (%s) -- terminando de forma ordenada tras este tick", signum)
@@ -95,10 +124,21 @@ def run_live(csv_path: str, strategy_name: str, profile_name: str,
         # 2) Chequeo de kill-switch manual antes de cualquier decisión
         if kill_switch.is_active():
             log.warning("Kill-switch activo (%s) -- no se abren posiciones nuevas este tick", kill_switch.reason())
+            equity_curve.append(_mark_to_market(broker, symbol, price))
             continue
 
         # 3) Actualizar el precio "de mercado" que ve el bróker
         broker.set_price(symbol, price)
+        equity = _mark_to_market(broker, symbol, price)
+
+        # Reinicia el equity de referencia diario para el chequeo de pérdida diaria
+        day_key = date.date() if hasattr(date, "date") else date
+        if day_key != current_day:
+            current_day = day_key
+            day_start_equity = equity
+
+        breaker_active = circuit_breaker.check(equity_curve, day_start_equity, equity)
+        equity_curve.append(equity)
 
         broker_positions = broker.get_open_positions()
         in_position = symbol in broker_positions
@@ -118,9 +158,8 @@ def run_live(csv_path: str, strategy_name: str, profile_name: str,
                 stop_loss, take_profit = None, None
                 internal_positions.pop(symbol, None)
 
-        # 5) Lógica de entrada (si no hay posición abierta)
-        else:
-            import pandas as pd
+        # 5) Lógica de entrada (si no hay posición abierta y el breaker no está activo)
+        elif not breaker_active:
             if sig == 1 and not pd.isna(current_atr) and current_atr > 0:
                 sizing = position_size(broker.get_balance(), price, current_atr, profile)
                 if sizing["unidades"] > 0 and sizing["viable"] is not False:
@@ -165,12 +204,23 @@ def main():
                          help="Segundos de pausa entre cada 'vela' simulada (0 = lo más rápido posible)")
     parser.add_argument("--state-path", type=str, default="engine_state.json",
                          help="Ruta del archivo de estado persistente (posiciones, stop/take profit)")
+    parser.add_argument("--max-drawdown", type=float, default=15.0)
+    parser.add_argument("--max-daily-loss", type=float, default=5.0)
+    parser.add_argument("--no-regime-filter", action="store_true",
+                         help="Desactiva el filtro de régimen de mercado")
+    parser.add_argument("--no-mtf-filter", action="store_true",
+                         help="Desactiva el filtro multi-timeframe")
     args = parser.parse_args()
 
     setup_logging(level="INFO")
-    run_live(args.csv, args.strategy, args.profile, symbol=args.symbol,
-              initial_balance=args.capital, replay_delay_seconds=args.delay,
-              max_ticks=args.max_ticks, state_path=args.state_path)
+    run_live(
+        args.csv, args.strategy, args.profile, symbol=args.symbol,
+        initial_balance=args.capital, replay_delay_seconds=args.delay,
+        max_ticks=args.max_ticks, state_path=args.state_path,
+        max_drawdown_pct=args.max_drawdown, max_daily_loss_pct=args.max_daily_loss,
+        regime_filter=not args.no_regime_filter,
+        multi_timeframe_filter=not args.no_mtf_filter,
+    )
 
 
 if __name__ == "__main__":

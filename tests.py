@@ -311,13 +311,23 @@ def test_live_runner_smoke_test():
     el flujo completo -- estrategia + bróker + alertas + kill-switch +
     heartbeat -- se ejecuta sin romperse.
     """
+    import os
+    import tempfile
     from live_runner import run_live
-    broker = run_live(
-        csv_path="real_data/btc_daily.csv", strategy_name="momentum",
-        profile_name="moderado", symbol="BTCUSD_TEST", initial_balance=1000.0,
-        max_ticks=40,
-    )
-    assert broker.get_balance() >= 0, "El balance nunca debería quedar negativo"
+
+    fd, state_path = tempfile.mkstemp(suffix="_live_smoke_state.json")
+    os.close(fd)
+    os.remove(state_path)
+    try:
+        broker = run_live(
+            csv_path="real_data/btc_daily.csv", strategy_name="momentum",
+            profile_name="moderado", symbol="BTCUSD_TEST", initial_balance=1000.0,
+            max_ticks=40, state_path=state_path,
+        )
+        assert broker.get_balance() >= 0, "El balance nunca debería quedar negativo"
+    finally:
+        if os.path.exists(state_path):
+            os.remove(state_path)
     print("OK: el live_runner corre de punta a punta sin errores (test de humo)")
 
 
@@ -345,10 +355,12 @@ def test_broker_adapters_dont_leak_into_each_other():
 
 def test_state_survives_simulated_restart():
     import os
+    import tempfile
     from state_store import StateStore
-    path = "/tmp/_test_state_sanity.json"
-    if os.path.exists(path):
-        os.remove(path)
+
+    fd, path = tempfile.mkstemp(suffix="_test_state_sanity.json")
+    os.close(fd)
+    os.remove(path)
 
     store = StateStore(path=path)
     positions = {"BTCUSD": {"unidades": 0.02, "precio_entrada": 55000.0}}
@@ -363,14 +375,17 @@ def test_state_survives_simulated_restart():
 
 
 def test_state_store_handles_corrupt_file():
+    import os
+    import tempfile
     from state_store import StateStore
-    path = "/tmp/_test_state_corrupto_sanity.json"
+
+    fd, path = tempfile.mkstemp(suffix="_test_state_corrupto_sanity.json")
+    os.close(fd)
     with open(path, "w") as f:
         f.write("{esto no es json valido,,,")
     store = StateStore(path=path)
     restored = store.load()  # no debería lanzar excepción
     assert restored["positions"] == {}, "Un archivo corrupto debería arrancar limpio, no crashear"
-    import os
     os.remove(path)
     print("OK: un archivo de estado corrupto no rompe el arranque")
 
