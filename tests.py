@@ -957,6 +957,145 @@ def test_start_session_fails_cleanly_without_enough_wallet_balance():
     print("OK: si no alcanza el saldo de la billetera, no queda ninguna sesión a medio abrir")
 
 
+class _FakeAlpacaResponse:
+    """Respuesta HTTP falsa para inyectar en AlpacaBrokerAdapter sin red real."""
+
+    def __init__(self, status_code, payload):
+        self.status_code = status_code
+        self._payload = payload
+        self.text = str(payload)
+
+    def json(self):
+        return self._payload
+
+
+def test_alpaca_get_current_price_parses_latest_trade():
+    from broker import AlpacaBrokerAdapter
+
+    calls = []
+
+    def fake_transport(method, url, headers, json_body, timeout):
+        calls.append((method, url))
+        return _FakeAlpacaResponse(200, {"trade": {"p": 231.42}})
+
+    broker = AlpacaBrokerAdapter(api_key_id="k", secret_key="s", transport=fake_transport)
+    price = broker.get_current_price("aapl")
+    assert price == 231.42
+    assert calls[0][0] == "GET"
+    assert "AAPL" in calls[0][1] and "trades/latest" in calls[0][1]
+    print("OK: AlpacaBrokerAdapter obtiene el último precio de una acción real (AAPL)")
+
+
+def test_alpaca_get_balance_reads_cash_from_account():
+    from broker import AlpacaBrokerAdapter
+
+    def fake_transport(method, url, headers, json_body, timeout):
+        return _FakeAlpacaResponse(200, {"cash": "5000.12"})
+
+    broker = AlpacaBrokerAdapter(api_key_id="k", secret_key="s", transport=fake_transport)
+    assert broker.get_balance() == 5000.12
+    print("OK: AlpacaBrokerAdapter lee el efectivo disponible de la cuenta")
+
+
+def test_alpaca_get_open_positions_maps_fields():
+    from broker import AlpacaBrokerAdapter
+
+    def fake_transport(method, url, headers, json_body, timeout):
+        return _FakeAlpacaResponse(200, [{"symbol": "KO", "qty": "3", "avg_entry_price": "62.5"}])
+
+    broker = AlpacaBrokerAdapter(api_key_id="k", secret_key="s", transport=fake_transport)
+    positions = broker.get_open_positions()
+    assert positions == {"KO": {"unidades": 3.0, "precio_entrada": 62.5}}
+    print("OK: AlpacaBrokerAdapter mapea posiciones abiertas (ej. acciones de Coca-Cola)")
+
+
+def test_alpaca_place_order_blocked_without_allow_trading():
+    from broker import AlpacaBrokerAdapter
+
+    def fail_if_called(method, url, headers, json_body, timeout):
+        raise AssertionError("No debería llamar a la red con allow_trading=False")
+
+    broker = AlpacaBrokerAdapter(api_key_id="k", secret_key="s", allow_trading=False, transport=fail_if_called)
+    result = broker.place_order("KO", "buy", 5)
+    assert result["status"] == "rejected"
+    assert "allow_trading" in result["motivo"]
+    print("OK: place_order de Alpaca queda bloqueado en modo lectura, sin llegar a llamar a la red")
+
+
+def test_alpaca_place_order_when_allowed_posts_to_orders_endpoint():
+    from broker import AlpacaBrokerAdapter
+
+    calls = []
+
+    def fake_transport(method, url, headers, json_body, timeout):
+        calls.append((method, url, json_body))
+        return _FakeAlpacaResponse(200, {
+            "id": "order-123", "symbol": "KO", "status": "filled",
+            "filled_qty": "5", "filled_avg_price": "62.75",
+        })
+
+    broker = AlpacaBrokerAdapter(api_key_id="k", secret_key="s", allow_trading=True, transport=fake_transport)
+    result = broker.place_order("KO", "buy", 5)
+    assert calls[0][0] == "POST" and calls[0][1].endswith("/v2/orders")
+    assert calls[0][2] == {"symbol": "KO", "qty": "5", "side": "buy", "type": "market", "time_in_force": "day"}
+    assert result["status"] == "filled"
+    assert result["units"] == 5.0
+    assert result["price"] == 62.75
+    print("OK: con allow_trading=True, place_order arma correctamente la orden de mercado para Alpaca")
+
+
+def test_live_polling_accepts_alpaca_as_price_source():
+    """
+    Prueba concreta de que run_live_polling (pensado originalmente para
+    Ripio/cripto) acepta CUALQUIER implementación de BrokerBase como
+    fuente de precio sin ningún cambio -- acá con AlpacaBrokerAdapter
+    (acciones de EE.UU.), demostrando en código, no solo en README, que
+    el motor generaliza más allá de cripto.
+    """
+    import os
+    import tempfile
+    from live_runner import run_live_polling
+    from broker import AlpacaBrokerAdapter
+
+    prices = iter([228.0 + i * 0.8 for i in range(20)])
+
+    def fake_transport(method, url, headers, json_body, timeout):
+        return _FakeAlpacaResponse(200, {"trade": {"p": next(prices)}})
+
+    price_source = AlpacaBrokerAdapter(api_key_id="k", secret_key="s", transport=fake_transport)
+
+    fd, state_path = tempfile.mkstemp(suffix="_live_polling_alpaca_state.json")
+    os.close(fd)
+    os.remove(state_path)
+    try:
+        broker = run_live_polling(
+            price_source, symbol="AAPL", strategy_name="momentum", profile_name="moderado",
+            seed_csv="real_data/aapl_daily.csv", initial_balance=1000.0,
+            poll_interval_seconds=0, max_ticks=15, state_path=state_path,
+        )
+        assert broker.get_balance() >= 0
+    finally:
+        if os.path.exists(state_path):
+            os.remove(state_path)
+    print("OK: run_live_polling acepta AlpacaBrokerAdapter (acciones) como fuente de precio sin cambios")
+
+
+def test_alpaca_private_requires_credentials():
+    from broker import AlpacaBrokerAdapter
+    from resilience import PermanentBrokerError
+
+    def fail_if_called(method, url, headers, json_body, timeout):
+        raise AssertionError("No debería intentar llamar a la red sin credenciales")
+
+    broker = AlpacaBrokerAdapter(api_key_id=None, secret_key=None, transport=fail_if_called)
+    try:
+        broker.get_balance()
+        assert False, "Debería fallar sin credenciales"
+    except PermanentBrokerError:
+        pass
+    print("OK: AlpacaBrokerAdapter exige credenciales antes de llamar a cualquier endpoint")
+
+
 if __name__ == "__main__":
     tests = [
         test_risk_never_exceeds_profile,
@@ -1008,6 +1147,13 @@ if __name__ == "__main__":
         test_wallet_settle_trade_result_only_touches_trading_allocation,
         test_user_sessions_are_fully_isolated,
         test_start_session_fails_cleanly_without_enough_wallet_balance,
+        test_alpaca_get_current_price_parses_latest_trade,
+        test_alpaca_get_balance_reads_cash_from_account,
+        test_alpaca_get_open_positions_maps_fields,
+        test_alpaca_place_order_blocked_without_allow_trading,
+        test_alpaca_place_order_when_allowed_posts_to_orders_endpoint,
+        test_live_polling_accepts_alpaca_as_price_source,
+        test_alpaca_private_requires_credentials,
     ]
     failed = 0
     for t in tests:

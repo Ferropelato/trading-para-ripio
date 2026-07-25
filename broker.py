@@ -575,3 +575,208 @@ class LibertexBrokerAdapter(BrokerBase):
     def get_open_positions(self) -> dict:
         # Acá iría: GET a su endpoint de posiciones abiertas
         raise NotImplementedError("Conectar al endpoint real de posiciones de Libertex.")
+
+
+class AlpacaBrokerAdapter(BrokerBase):
+    """
+    Adaptador real para Alpaca Markets (acciones de EE.UU. -- AAPL, KO,
+    etc.). Prueba de concepto de que la MISMA arquitectura de bróker de
+    este proyecto (`BrokerBase`) se extiende a otra clase de activo sin
+    tocar el motor de estrategias, el gestor de riesgo, el circuit
+    breaker, ni ningún otro módulo -- ver README.md, sección "Visión: más
+    allá de cripto".
+
+    Alpaca ofrece cuentas de "paper trading" reales y gratuitas (alta con
+    email, sin aprobación previa, sin plata real) -- mismo espíritu que
+    el modo allow_trading=False de `RipioBrokerAdapter`.
+
+    Autenticación (docs.alpaca.markets): headers `APCA-API-KEY-ID` /
+    `APCA-API-SECRET-KEY` -- mucho más simple que la firma HMAC de Ripio,
+    no hace falta firmar nada.
+
+    Endpoints usados:
+      GET  /v2/account                        -- balance/cash (privado)
+      GET  /v2/positions                       -- posiciones abiertas (privado)
+      POST /v2/orders                          -- colocar orden (privado)
+      GET  {data}/v2/stocks/{symbol}/trades/latest -- último precio (también privado en Alpaca)
+
+    IMPORTANTE -- no probado en vivo: a diferencia de `RipioBrokerAdapter`
+    (donde sí se confirmó el ticker público contra la API real), acá no
+    hay ninguna cuenta de Alpaca creada en este proyecto, así que ningún
+    endpoint pudo ejercitarse contra la red real -- ni siquiera el de
+    market data funciona sin credenciales en Alpaca (a diferencia de
+    Ripio, no tiene un endpoint verdaderamente público). El código sigue
+    la documentación oficial al pie de la letra y está cubierto por tests
+    con un transporte HTTP inyectado (ver tests.py), pero falta el mismo
+    paso de validación en vivo que se hizo con Ripio (`ripio_smoke.py`)
+    el día que exista una cuenta real.
+    """
+
+    TRADING_BASE_URL_PAPER = "https://paper-api.alpaca.markets"
+    TRADING_BASE_URL_LIVE = "https://api.alpaca.markets"
+    DATA_BASE_URL = "https://data.alpaca.markets"
+    DEFAULT_TIMEOUT = 15
+
+    def __init__(self, api_key_id: str = None, secret_key: str = None, paper: bool = True,
+                 allow_trading: bool = False, timeout: float = None, transport=None):
+        import os
+        try:
+            from dotenv import load_dotenv
+            load_dotenv()
+        except ImportError:
+            pass
+
+        self.api_key_id = api_key_id or os.environ.get("ALPACA_API_KEY_ID")
+        self.secret_key = secret_key or os.environ.get("ALPACA_SECRET_KEY")
+        self.paper = paper
+        self.trading_base_url = self.TRADING_BASE_URL_PAPER if paper else self.TRADING_BASE_URL_LIVE
+        self.allow_trading = allow_trading
+        self.timeout = timeout if timeout is not None else self.DEFAULT_TIMEOUT
+        # Inyectable para poder testear sin credenciales ni red real (Alpaca,
+        # a diferencia de Ripio, no tiene ningún endpoint público sin auth).
+        # Firma: transport(method, url, headers, json_body, timeout) -> objeto
+        # con .status_code, .text, .json().
+        self._transport = transport or self._default_transport
+        self._processed_client_order_ids = {}
+
+        if not self.api_key_id or not self.secret_key:
+            log.warning(
+                "AlpacaBrokerAdapter inicializado SIN credenciales -- completar "
+                "ALPACA_API_KEY_ID y ALPACA_SECRET_KEY en el archivo .env. A "
+                "diferencia de Ripio, en Alpaca ni el precio funciona sin credenciales."
+            )
+        else:
+            log.info("AlpacaBrokerAdapter listo (paper=%s, allow_trading=%s)", self.paper, self.allow_trading)
+
+    @staticmethod
+    def _default_transport(method: str, url: str, headers: dict, json_body, timeout: float):
+        import requests
+        return requests.request(method, url, headers=headers, json=json_body, timeout=timeout)
+
+    def _headers(self) -> dict:
+        return {
+            "APCA-API-KEY-ID": self.api_key_id,
+            "APCA-API-SECRET-KEY": self.secret_key,
+            "Content-Type": "application/json",
+        }
+
+    def _require_credentials(self):
+        from resilience import PermanentBrokerError
+        if not self.api_key_id or not self.secret_key:
+            raise PermanentBrokerError(
+                "Faltan ALPACA_API_KEY_ID / ALPACA_SECRET_KEY -- no se puede llamar a ningún endpoint de Alpaca."
+            )
+
+    def _request(self, method: str, url: str, json_body: dict = None) -> dict:
+        from resilience import TransientBrokerError, PermanentBrokerError
+
+        self._require_credentials()
+        try:
+            response = self._transport(method.upper(), url, self._headers(), json_body, self.timeout)
+        except Exception as e:
+            # requests.Timeout / requests.ConnectionError en el transporte real;
+            # con un transporte inyectado en tests, esta rama no se ejercita.
+            raise TransientBrokerError(f"Error de red hablando con Alpaca: {e}") from e
+
+        if response.status_code >= 500:
+            raise TransientBrokerError(f"Alpaca respondió {response.status_code}: {response.text[:200]}")
+        if response.status_code in (401, 403):
+            raise PermanentBrokerError(f"Auth Alpaca falló ({response.status_code}): {response.text[:300]}")
+        if response.status_code >= 400:
+            raise PermanentBrokerError(f"Alpaca rechazó la request ({response.status_code}): {response.text[:300]}")
+
+        try:
+            return response.json()
+        except ValueError as e:
+            raise TransientBrokerError(f"Respuesta no-JSON de Alpaca: {e}") from e
+
+    # --- BrokerBase -------------------------------------------------------
+
+    def get_current_price(self, symbol: str) -> float:
+        """Último trade del símbolo (market data, feed IEX -- el nivel gratuito de Alpaca)."""
+        symbol = symbol.upper()
+        data = self._request("GET", f"{self.DATA_BASE_URL}/v2/stocks/{symbol}/trades/latest?feed=iex")
+        trade = data.get("trade") or {}
+        price = trade.get("p")
+        if price is None:
+            from resilience import PermanentBrokerError
+            raise PermanentBrokerError(f"Respuesta de Alpaca sin precio para {symbol}: {data}")
+        return float(price)
+
+    def get_balance(self) -> float:
+        """Efectivo disponible (cash) -- no equity total con posiciones abiertas valoradas."""
+        account = self._request("GET", f"{self.trading_base_url}/v2/account")
+        return float(account.get("cash", 0.0))
+
+    def get_open_positions(self) -> dict:
+        positions = self._request("GET", f"{self.trading_base_url}/v2/positions")
+        return {
+            pos["symbol"]: {
+                "unidades": float(pos["qty"]),
+                "precio_entrada": float(pos["avg_entry_price"]),
+            }
+            for pos in positions
+        }
+
+    def place_order(self, symbol: str, side: str, units: float, client_order_id: str = None) -> dict:
+        """
+        Coloca una orden de mercado. Por defecto allow_trading=False →
+        rechaza sin enviar nada, igual que el resto de los adaptadores
+        reales de este proyecto.
+        """
+        from datetime import datetime
+
+        if side not in ("buy", "sell"):
+            raise ValueError("side debe ser 'buy' o 'sell'")
+        if units <= 0:
+            raise ValueError("units debe ser positivo")
+
+        if client_order_id and client_order_id in self._processed_client_order_ids:
+            log.info("client_order_id '%s' ya procesado -- no se reenvía a Alpaca", client_order_id)
+            return self._processed_client_order_ids[client_order_id]
+
+        if not self.allow_trading:
+            order = {
+                "status": "rejected",
+                "motivo": "allow_trading=False (modo lectura). Pasá allow_trading=True para operar de verdad.",
+                "symbol": symbol.upper(), "side": side, "units": units,
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+            log.warning("Orden NO enviada a Alpaca: %s", order["motivo"])
+            return order
+
+        body = {
+            "symbol": symbol.upper(), "qty": str(units), "side": side,
+            "type": "market", "time_in_force": "day",
+        }
+        if client_order_id:
+            body["client_order_id"] = str(client_order_id)[:128]
+
+        data = self._request("POST", f"{self.trading_base_url}/v2/orders", json_body=body)
+        status_raw = (data.get("status") or "").lower()
+        if status_raw == "filled":
+            status = "filled"
+        elif status_raw in ("new", "accepted", "pending_new"):
+            status = "open"
+        elif status_raw in ("canceled", "cancelled", "expired", "rejected"):
+            status = "canceled"
+        else:
+            status = status_raw or "submitted"
+
+        filled_qty = data.get("filled_qty")
+        filled_price = data.get("filled_avg_price")
+
+        order = {
+            "status": status,
+            "symbol": data.get("symbol", symbol.upper()),
+            "side": side,
+            "units": float(filled_qty) if filled_qty else units,
+            "price": float(filled_price) if filled_price else None,
+            "broker_order_id": data.get("id"),
+            "raw": data,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+        if client_order_id:
+            self._processed_client_order_ids[client_order_id] = order
+        log.info("Orden Alpaca %s: %s %s %s -> %s", order.get("broker_order_id"), side, units, symbol, status)
+        return order

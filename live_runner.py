@@ -368,7 +368,9 @@ def main():
     parser.add_argument("--no-mtf-filter", action="store_true",
                          help="Desactiva el filtro multi-timeframe")
     parser.add_argument("--live-prices", action="store_true",
-                         help="En vez de reproducir el CSV, pedir el precio real en vivo (Ripio, ticker público) en cada intervalo. Nunca coloca órdenes reales, solo lee precio.")
+                         help="En vez de reproducir el CSV, pedir el precio real en vivo en cada intervalo. Nunca coloca órdenes reales, solo lee precio.")
+    parser.add_argument("--broker", type=str, default="ripio", choices=["ripio", "alpaca"],
+                         help="[--live-prices] Fuente de precio en vivo: 'ripio' (cripto, ej. BTC_USDC) o 'alpaca' (acciones de EE.UU., ej. AAPL, KO -- prueba de concepto de que el mismo motor sirve para otra clase de activo, ver README)")
     parser.add_argument("--poll-interval", type=float, default=60.0,
                          help="[--live-prices] Segundos entre cada consulta de precio en vivo")
     parser.add_argument("--news-alerts", action="store_true",
@@ -384,8 +386,12 @@ def main():
     setup_logging(level="INFO")
 
     if args.live_prices:
-        from broker import RipioBrokerAdapter
-        price_source = RipioBrokerAdapter(allow_trading=False)
+        if args.broker == "alpaca":
+            from broker import AlpacaBrokerAdapter
+            price_source = AlpacaBrokerAdapter(allow_trading=False)
+        else:
+            from broker import RipioBrokerAdapter
+            price_source = RipioBrokerAdapter(allow_trading=False)
 
         news_guard = None
         if args.news_alerts:

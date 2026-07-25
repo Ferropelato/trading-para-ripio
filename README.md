@@ -765,6 +765,53 @@ scheduled job) para que corra sin depender de que una laptop personal
 quede encendida.
 
 
+## Visión: más allá de cripto (prueba de concepto, no una promesa)
+
+Pregunta natural al pensar en esto como producto: ¿se podría ofrecer
+también compra-venta de acciones o bonos (al estilo eToro), todo
+integrado en la misma app? Vale la pena separar dos cosas antes de
+mezclarlas en la misma propuesta:
+
+**Por qué NO es lo mismo que integrar cripto.** En Argentina, cripto y
+valores negociables (acciones, bonos) están bajo marcos regulatorios
+distintos. Ripio ya opera cripto sin ser una sociedad de bolsa; vender
+acciones de verdad requiere estar registrado como **Agente de
+Negociación ante la CNV** -- capital mínimo, compliance, auditorías, un
+trámite de meses o años, no una feature de producto. Ni eToro lo resuelve
+solo: además de ser broker-dealer registrado (FINRA/SEC), usan a **Apex
+Clearing** como socio de clearing para la liquidación real -- la parte
+más pesada (custodia, ejecución, cumplimiento) la tercerizan con alguien
+que ya tiene la licencia, no la construyen desde cero. El camino
+realista, si esto se persigue algún día, es el mismo patrón: integrarse
+vía API con un bróker ya licenciado ("brokerage-as-a-service"), no pedir
+una licencia propia.
+
+**Lo que SÍ se construyó y probó como prueba de concepto**: la
+arquitectura de bróker de este proyecto (`BrokerBase` en `broker.py`) ya
+estaba diseñada para ser agnóstica al activo. Se agregó
+`AlpacaBrokerAdapter`, un adaptador real contra Alpaca Markets (acciones
+de EE.UU., cuenta de *paper trading* gratuita con solo un email, sin
+plata real) -- y **sin cambiar una sola línea** de `strategies.py`,
+`risk_manager.py`, `safety.py`, `backtester.py` ni `live_runner.py`, el
+mismo motor ya arma señales, calcula tamaño de posición según el perfil
+de riesgo, y ejecuta (en modo simulado) sobre AAPL o KO exactamente
+igual que sobre BTC_USDC. Probado en `tests.py`
+(`test_live_polling_accepts_alpaca_as_price_source`): con un feed de
+precios de Apple inyectado, el motor abrió una posición simulada real de
+0.59 acciones a $228.11, con stop loss y take profit calculados
+correctamente. `live_runner.py --live-prices --broker alpaca --symbol
+AAPL` ya funciona en el código -- ejecutarlo en vivo de verdad requiere
+crear una cuenta gratuita en alpaca.markets, algo que no se hizo en este
+proyecto (no hay una cuenta real, así que a diferencia de Ripio esto no
+se pudo validar contra la red real).
+
+**Conclusión para la propuesta**: esto se muestra como evidencia de que
+la arquitectura escala más allá de cripto sin reescritura -- no como un
+pedido de que Ripio se convierta en agente de bolsa. Mantenerlo como una
+sección de visión separada del pedido principal (que sí está en el mismo
+terreno regulatorio que Ripio ya pisa hoy).
+
+
 ## Notas importantes (leer antes de avanzar)
 
 1. **Este backtest usa datos sintéticos por defecto.** Los resultados que
