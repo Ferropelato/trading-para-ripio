@@ -39,7 +39,11 @@ def generate_synthetic_data(n_days: int = 500, start_price: float = 100.0,
         prices.append(prices[-1] * np.exp(shock))
 
     close = np.array(prices[1:])
-    dates = pd.bdate_range(end=pd.Timestamp.today(), periods=n_days)
+    # pd.bdate_range(end=..., periods=n) puede devolver un día menos que
+    # `periods` cuando `end` cae en fin de semana (comportamiento observado
+    # en pandas 3.0.2). Se pide de más y se recorta al final para garantizar
+    # exactamente n_days fechas sin importar qué día se ejecute esto.
+    dates = pd.bdate_range(end=pd.Timestamp.today(), periods=n_days + 10)[-n_days:]
 
     daily_range = close * rng.uniform(0.005, 0.02, size=n_days)
     high = close + daily_range * rng.uniform(0.3, 1.0, size=n_days)
@@ -88,7 +92,9 @@ def generate_correlated_pair(n_days: int = 500, correlation: float = 0.8,
     close_a = build_prices(shocks_a, start_price_a)
     close_b = build_prices(shocks_b, start_price_b)
 
-    dates = pd.bdate_range(end=pd.Timestamp.today(), periods=n_days)
+    # Mismo ajuste que en generate_synthetic_data: garantizar exactamente
+    # n_days fechas sin importar si `end` cae en fin de semana.
+    dates = pd.bdate_range(end=pd.Timestamp.today(), periods=n_days + 10)[-n_days:]
 
     def to_ohlcv(close):
         daily_range = close * rng.uniform(0.005, 0.02, size=n_days)
