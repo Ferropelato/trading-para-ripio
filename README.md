@@ -647,6 +647,38 @@ vez de ocultarlo) es parte de la misma política de honestidad del resto
 del proyecto.
 
 
+## Décima ronda: optimización de parámetros con walk-forward obligatorio
+
+`param_optimizer.py` prueba una grilla de parámetros (ej. distintos
+períodos de media móvil) y **rankea cada combinación exclusivamente por
+su retorno promedio FUERA de muestra**, en varias ventanas walk-forward
+-- nunca por el resultado sobre el 100% de los datos. Esto era un
+pendiente marcado desde rondas anteriores ("la optimización de
+parámetros siempre debe validarse con walk-forward, nunca sobre el 100%
+de los datos"). Estructuralmente no existe en el módulo ninguna función
+que rankee por el dataset completo -- no se puede pedir ese atajo por
+accidente.
+
+Ejemplo real (estrategia `tendencia` sobre BTC/USD real, grilla de
+medias rápida/lenta, 5 ventanas walk-forward):
+
+```
+{'fast': 10, 'slow': 40} -> retorno_prom_oos:  0.92%, consistencia: 60.0%  <- recomendado
+{'fast': 30, 'slow': 40} -> retorno_prom_oos:  0.66%, consistencia: 40.0%
+{'fast': 30, 'slow': 60} -> retorno_prom_oos:  0.58%, consistencia: 40.0%
+...
+{'fast': 20, 'slow': 50} -> retorno_prom_oos: -0.27%, consistencia: 40.0%
+```
+
+Notar que ningún valor es espectacular -- es precisamente el punto: un
+número modesto pero validado fuera de muestra es más confiable que un
+número grande logrado optimizando sobre todo el histórico (que es
+exactamente el tipo de resultado inflado que este módulo evita mostrar
+como si fuera bueno).
+
+44/44 tests pasando.
+
+
 ## Notas importantes (leer antes de avanzar)
 
 1. **Este backtest usa datos sintéticos por defecto.** Los resultados que

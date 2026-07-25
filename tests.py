@@ -801,6 +801,55 @@ def test_live_polling_blocks_entries_during_news_pause():
     print("OK: la pausa por noticias bloquea entradas nuevas de punta a punta en el runner de precios en vivo")
 
 
+def test_param_optimizer_ranks_by_out_of_sample_only():
+    """
+    El ranking debe basarse EXCLUSIVAMENTE en el retorno promedio fuera de
+    muestra (walk-forward en varias ventanas), nunca en el resultado sobre
+    el 100% de los datos. Verifica la forma del resultado (todas las
+    combinaciones evaluadas, no solo la ganadora) y que el ranking esté
+    ordenado de forma descendente por ese campo out-of-sample.
+    """
+    from data_utils import generate_synthetic_data
+    from param_optimizer import optimize_parameters
+
+    df = generate_synthetic_data(n_days=400, seed=11)
+    result = optimize_parameters(
+        df, strategy_name="tendencia", profile_name="moderado",
+        param_grid={"fast": [10, 20], "slow": [40, 60]},
+        n_windows=3, train_pct=0.6,
+    )
+
+    assert len(result["combinaciones_evaluadas"]) == 4, "Debería evaluar las 4 combinaciones del grid (2x2)"
+    assert "ranking_out_of_sample" in result
+    returns = [c["retorno_promedio_out_sample_pct"] for c in result["ranking_out_of_sample"]]
+    assert returns == sorted(returns, reverse=True), "El ranking debe estar ordenado descendente por retorno OUT-OF-SAMPLE"
+    assert result["recomendado"] == result["ranking_out_of_sample"][0]
+    # Ninguna combinación evaluada expone o usa un retorno sobre el dataset completo (in-sample) para decidir el ranking.
+    for combo in result["combinaciones_evaluadas"]:
+        assert "retorno_total_pct" not in combo, "No debe filtrarse una metrica calculada sobre el 100% de los datos"
+    print("OK: el optimizador de parámetros rankea únicamente por desempeño fuera de muestra")
+
+
+def test_param_optimizer_rejects_too_few_windows_worth_of_data():
+    from param_optimizer import optimize_parameters
+    import pandas as pd
+    import numpy as np
+
+    tiny_df = pd.DataFrame({
+        "open": np.linspace(100, 110, 30), "high": np.linspace(101, 111, 30),
+        "low": np.linspace(99, 109, 30), "close": np.linspace(100, 110, 30),
+        "volume": np.ones(30),
+    }, index=pd.bdate_range("2024-01-01", periods=30))
+
+    result = optimize_parameters(
+        tiny_df, strategy_name="momentum", profile_name="moderado",
+        param_grid={"lookback": [5]}, n_windows=10,  # 30/10 = 3 velas por ventana, muy pocas
+    )
+    assert result["recomendado"] is None
+    assert result["advertencia"] is not None
+    print("OK: el optimizador avisa quando no hay suficientes datos para las ventanas pedidas, en vez de fallar en silencio")
+
+
 if __name__ == "__main__":
     tests = [
         test_risk_never_exceeds_profile,
@@ -845,6 +894,8 @@ if __name__ == "__main__":
         test_automation_window_handles_midnight_crossing,
         test_news_guard_pauses_entries_only_in_automatic_window,
         test_live_polling_blocks_entries_during_news_pause,
+        test_param_optimizer_ranks_by_out_of_sample_only,
+        test_param_optimizer_rejects_too_few_windows_worth_of_data,
     ]
     failed = 0
     for t in tests:
