@@ -850,6 +850,113 @@ def test_param_optimizer_rejects_too_few_windows_worth_of_data():
     print("OK: el optimizador avisa quando no hay suficientes datos para las ventanas pedidas, en vez de fallar en silencio")
 
 
+def test_wallet_reserve_and_release_round_trip():
+    from wallet_integration import SimulatedWalletBalanceProvider
+
+    wallet = SimulatedWalletBalanceProvider()
+    wallet.deposit("user-1", "USDC", 1000.0)
+
+    wallet.reserve_for_trading("user-1", "USDC", 300.0)
+    assert wallet.get_available_balance("user-1", "USDC") == 700.0
+    assert wallet.get_trading_allocation("user-1", "USDC") == 300.0
+
+    wallet.release_from_trading("user-1", "USDC", 300.0)
+    assert wallet.get_available_balance("user-1", "USDC") == 1000.0
+    assert wallet.get_trading_allocation("user-1", "USDC") == 0.0
+    print("OK: reservar y liberar saldo de la billetera es un viaje de ida y vuelta exacto")
+
+
+def test_wallet_reserve_fails_without_enough_available_balance():
+    from wallet_integration import SimulatedWalletBalanceProvider, InsufficientWalletBalanceError
+
+    wallet = SimulatedWalletBalanceProvider()
+    wallet.deposit("user-1", "USDC", 100.0)
+    try:
+        wallet.reserve_for_trading("user-1", "USDC", 500.0)
+        assert False, "Debería fallar: no hay saldo disponible suficiente"
+    except InsufficientWalletBalanceError:
+        pass
+    assert wallet.get_available_balance("user-1", "USDC") == 100.0, "El saldo no debe alterarse si la reserva falla"
+    print("OK: reservar más de lo disponible falla sin mover saldo")
+
+
+def test_wallet_settle_trade_result_only_touches_trading_allocation():
+    from wallet_integration import SimulatedWalletBalanceProvider
+
+    wallet = SimulatedWalletBalanceProvider()
+    wallet.deposit("user-1", "USDC", 1000.0)
+    wallet.reserve_for_trading("user-1", "USDC", 300.0)
+
+    wallet.settle_trade_result("user-1", "USDC", 50.0)  # ganancia
+    assert wallet.get_trading_allocation("user-1", "USDC") == 350.0
+    assert wallet.get_available_balance("user-1", "USDC") == 700.0, "El saldo disponible general no debe tocarse"
+
+    wallet.settle_trade_result("user-1", "USDC", -1000.0)  # pérdida imposible, protección de piso
+    assert wallet.get_trading_allocation("user-1", "USDC") == 0.0, "La asignación nunca debe quedar negativa"
+    print("OK: settle_trade_result solo afecta la asignación de trading, nunca el saldo disponible general")
+
+
+def test_user_sessions_are_fully_isolated():
+    import os
+    from wallet_integration import SimulatedWalletBalanceProvider
+    from multi_user import UserSessionManager
+    from safety import ManualKillSwitch
+
+    wallet = SimulatedWalletBalanceProvider()
+    wallet.deposit("user-a", "USDC", 1000.0)
+    wallet.deposit("user-b", "USDC", 250.0)
+    manager = UserSessionManager(wallet, state_dir=".")
+
+    session_a = manager.start_session("user-a", "USDC", 800.0)
+    session_b = manager.start_session("user-b", "USDC", 200.0)
+
+    try:
+        assert session_a.broker.get_balance() == 800.0
+        assert session_b.broker.get_balance() == 200.0
+        assert session_a.broker is not session_b.broker
+        assert session_a.circuit_breaker is not session_b.circuit_breaker
+        assert session_a.kill_switch is not session_b.kill_switch
+
+        session_a.kill_switch.activate("prueba de aislamiento")
+        assert session_a.kill_switch.is_active() is True
+        assert session_b.kill_switch.is_active() is False, "El kill-switch de un usuario NUNCA debe afectar a otro"
+    finally:
+        for uid in ("user-a", "user-b"):
+            state_path = f"./engine_state_{uid}.json"
+            kill_switch_path = f"./.KILL_SWITCH_{uid}"
+            manager.stop_session(uid)
+            if os.path.exists(state_path):
+                os.remove(state_path)
+            if os.path.exists(kill_switch_path):
+                os.remove(kill_switch_path)
+
+    assert wallet.get_available_balance("user-a", "USDC") == 1000.0
+    assert wallet.get_available_balance("user-b", "USDC") == 250.0
+    print("OK: las sesiones de usuarios distintos están completamente aisladas (bróker, circuit breaker, kill-switch)")
+
+
+def test_start_session_fails_cleanly_without_enough_wallet_balance():
+    from wallet_integration import SimulatedWalletBalanceProvider, InsufficientWalletBalanceError
+    from multi_user import UserSessionManager
+
+    wallet = SimulatedWalletBalanceProvider()
+    wallet.deposit("user-c", "USDC", 50.0)
+    manager = UserSessionManager(wallet, state_dir=".")
+
+    try:
+        manager.start_session("user-c", "USDC", 500.0)
+        assert False, "Debería fallar: no hay saldo suficiente en la billetera"
+    except InsufficientWalletBalanceError:
+        pass
+
+    try:
+        manager.get_session("user-c")
+        assert False, "No debería haber quedado una sesión a medio crear"
+    except KeyError:
+        pass
+    print("OK: si no alcanza el saldo de la billetera, no queda ninguna sesión a medio abrir")
+
+
 if __name__ == "__main__":
     tests = [
         test_risk_never_exceeds_profile,
@@ -896,6 +1003,11 @@ if __name__ == "__main__":
         test_live_polling_blocks_entries_during_news_pause,
         test_param_optimizer_ranks_by_out_of_sample_only,
         test_param_optimizer_rejects_too_few_windows_worth_of_data,
+        test_wallet_reserve_and_release_round_trip,
+        test_wallet_reserve_fails_without_enough_available_balance,
+        test_wallet_settle_trade_result_only_touches_trading_allocation,
+        test_user_sessions_are_fully_isolated,
+        test_start_session_fails_cleanly_without_enough_wallet_balance,
     ]
     failed = 0
     for t in tests:

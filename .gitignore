@@ -4,7 +4,9 @@ __pycache__/
 .env
 experiments.csv
 .KILL_SWITCH
+.KILL_SWITCH_*
 *.png
 reporte.html
 .DS_Store
 engine_state.json
+engine_state_*.json

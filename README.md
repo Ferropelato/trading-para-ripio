@@ -679,6 +679,39 @@ como si fuera bueno).
 44/44 tests pasando.
 
 
+## Onceava ronda: capa de integración con la billetera + aislamiento multi-usuario
+
+Pensado directamente para la propuesta de integración a Ripio (ver
+sección de negocio de este README): dos módulos que definen cómo esto se
+conectaría a una billetera real sin mover fondos fuera de la app, y cómo
+se comportaría con más de un usuario a la vez.
+
+- **`wallet_integration.py`**: `WalletBalanceProvider` es el contrato que
+  el backend de una billetera (Ripio) implementaría contra su propio
+  ledger -- `reserve_for_trading` / `release_from_trading` /
+  `settle_trade_result` son reclasificaciones contables dentro de la
+  MISMA cuenta del usuario, nunca una transferencia externa.
+  `SimulatedWalletBalanceProvider` es una implementación de referencia en
+  memoria para demos y tests.
+- **`multi_user.py`**: `UserSessionManager` + `UserTradingSession` dan a
+  cada usuario su propio bróker (fondeado desde su asignación reservada),
+  su propio circuit breaker y su propio kill-switch -- nunca un solo pool
+  de decisiones para todos.
+
+**Bug real encontrado y corregido antes de que llegara a los tests**: al
+diseñar `UserTradingSession`, instanciar `ManualKillSwitch()` sin
+parámetros usa por defecto un archivo de control COMPARTIDO
+(`.KILL_SWITCH`). Sin pasarle un `control_file` propio por usuario
+(`.KILL_SWITCH_{user_id}`), activar el kill-switch de un usuario hubiera
+activado el de todos -- exactamente el bug de aislamiento que este módulo
+existe para evitar. Se detectó leyendo el código de `safety.py` antes de
+escribir el test de integración, no después de que fallara. El test
+`test_user_sessions_are_fully_isolated` es la prueba de regresión
+dedicada a este caso.
+
+49/49 tests pasando.
+
+
 ## Notas importantes (leer antes de avanzar)
 
 1. **Este backtest usa datos sintéticos por defecto.** Los resultados que
