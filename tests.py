@@ -1015,6 +1015,135 @@ def test_user_session_manager_uses_one_shared_db_not_one_file_per_user():
     print("OK: UserSessionManager guarda el estado de todos los usuarios en un único archivo compartido, no uno por usuario")
 
 
+class _CollectingAlertChannel:
+    def __init__(self):
+        self.sent = []
+
+    def send(self, message):
+        self.sent.append(message)
+        return True
+
+
+class _FakeSession:
+    """Sesion minima para probar OperationsMonitor sin necesitar una UserTradingSession completa."""
+
+    def __init__(self, circuit_breaker=None, kill_switch=None, heartbeat=None, broker=None, state_store=None):
+        self.circuit_breaker = circuit_breaker
+        self.kill_switch = kill_switch
+        self.heartbeat = heartbeat
+        self.broker = broker
+        self.state_store = state_store
+
+
+def test_ops_monitor_detects_individual_circuit_breaker_and_kill_switch_issues():
+    from ops_monitor import OperationsMonitor
+    from safety import CircuitBreaker, ManualKillSwitch
+
+    breaker_tripped = CircuitBreaker(max_drawdown_pct=10.0)
+    breaker_tripped.tripped = True
+    breaker_tripped.trip_reason = "Drawdown máximo alcanzado: 12.0%"
+
+    kill_switch_off = ManualKillSwitch(control_file=".KILL_SWITCH_test_ops_a")
+    session_a = _FakeSession(circuit_breaker=breaker_tripped, kill_switch=kill_switch_off)
+    session_b = _FakeSession(circuit_breaker=CircuitBreaker(), kill_switch=ManualKillSwitch(control_file=".KILL_SWITCH_test_ops_b"))
+
+    alert_channel = _CollectingAlertChannel()
+    monitor = OperationsMonitor(alert_channel)
+    monitor.register("user-a", session_a)
+    monitor.register("user-b", session_b)
+
+    report = monitor.check_all()
+    assert report["usuarios_monitoreados"] == 2
+    assert len(report["problemas_individuales"]) == 1
+    assert report["problemas_individuales"][0]["user_id"] == "user-a"
+    assert report["problemas_individuales"][0]["tipo"] == "circuit_breaker"
+    assert any("user-a" in m and "circuit_breaker" in m for m in alert_channel.sent)
+    assert report["alertas_sistemicas"] == [], "Con pocos usuarios registrados no debería escalar a sistémica"
+    print("OK: OperationsMonitor detecta problemas individuales y alerta por el canal existente")
+
+
+def test_ops_monitor_escalates_to_systemic_alert_when_threshold_crossed():
+    from ops_monitor import OperationsMonitor
+    from safety import CircuitBreaker, ManualKillSwitch
+
+    alert_channel = _CollectingAlertChannel()
+    monitor = OperationsMonitor(alert_channel, systemic_threshold_pct=50.0, min_users_for_systemic=4)
+
+    for i in range(6):
+        breaker = CircuitBreaker()
+        if i < 4:  # 4 de 6 = 66% > 50% de umbral
+            breaker.tripped = True
+            breaker.trip_reason = "Drawdown máximo alcanzado: 20.0%"
+        monitor.register(f"user-{i}", _FakeSession(
+            circuit_breaker=breaker, kill_switch=ManualKillSwitch(control_file=f".KILL_SWITCH_test_ops_sys_{i}")
+        ))
+
+    report = monitor.check_all()
+    assert len(report["alertas_sistemicas"]) == 1
+    systemic = report["alertas_sistemicas"][0]
+    assert systemic["tipo"] == "circuit_breaker"
+    assert systemic["porcentaje"] > 50.0
+    assert any("ALERTA SISTEMICA" in m for m in alert_channel.sent)
+    print("OK: OperationsMonitor escala a alerta sistémica cuando muchos usuarios comparten el mismo problema")
+
+
+def test_ops_monitor_does_not_escalate_with_too_few_users():
+    from ops_monitor import OperationsMonitor
+    from safety import CircuitBreaker, ManualKillSwitch
+
+    alert_channel = _CollectingAlertChannel()
+    monitor = OperationsMonitor(alert_channel, systemic_threshold_pct=50.0, min_users_for_systemic=10)
+
+    # 2 de 2 usuarios afectados = 100%, pero por debajo del minimo de usuarios para hablar de "sistemico"
+    for i in range(2):
+        breaker = CircuitBreaker()
+        breaker.tripped = True
+        breaker.trip_reason = "test"
+        monitor.register(f"user-{i}", _FakeSession(
+            circuit_breaker=breaker, kill_switch=ManualKillSwitch(control_file=f".KILL_SWITCH_test_ops_few_{i}")
+        ))
+
+    report = monitor.check_all()
+    assert report["alertas_sistemicas"] == [], "No debería escalar a sistémica con menos usuarios que el mínimo configurado"
+    assert len(report["problemas_individuales"]) == 2
+    print("OK: OperationsMonitor no escala a sistémica por debajo del mínimo de usuarios configurado")
+
+
+def test_ops_monitor_detects_reconciliation_mismatch():
+    from ops_monitor import OperationsMonitor
+    from safety import CircuitBreaker, ManualKillSwitch
+    from state_store import SQLiteStateStore
+    import os
+    import tempfile
+
+    fd, db_path = tempfile.mkstemp(suffix="_ops_reconcile.db")
+    os.close(fd)
+    os.remove(db_path)
+
+    class FakeBroker:
+        def get_open_positions(self):
+            return {"ETH_USDC": {"unidades": 1.0, "precio_entrada": 100.0}}  # el broker reporta ETH
+
+    try:
+        state_store = SQLiteStateStore(db_path=db_path, key="user-recon")
+        state_store.save({"BTC_USDC": {"unidades": 1.0, "precio_entrada": 100.0}}, capital=500.0)  # interno cree tener BTC
+
+        alert_channel = _CollectingAlertChannel()
+        monitor = OperationsMonitor(alert_channel)
+        monitor.register("user-recon", _FakeSession(
+            circuit_breaker=CircuitBreaker(), kill_switch=ManualKillSwitch(control_file=".KILL_SWITCH_test_ops_recon"),
+            broker=FakeBroker(), state_store=state_store,
+        ))
+
+        report = monitor.check_all()
+        assert any(p["tipo"] == "reconciliacion" for p in report["problemas_individuales"])
+        state_store.close()
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+    print("OK: OperationsMonitor detecta un desfasaje de reconciliación entre el estado interno y el bróker")
+
+
 class _FakeAlpacaResponse:
     """Respuesta HTTP falsa para inyectar en AlpacaBrokerAdapter sin red real."""
 
@@ -1449,6 +1578,10 @@ if __name__ == "__main__":
         test_sqlite_state_store_save_and_load_round_trip,
         test_sqlite_state_store_empty_when_no_prior_state,
         test_sqlite_state_store_multiple_users_share_one_db_without_mixing,
+        test_ops_monitor_detects_individual_circuit_breaker_and_kill_switch_issues,
+        test_ops_monitor_escalates_to_systemic_alert_when_threshold_crossed,
+        test_ops_monitor_does_not_escalate_with_too_few_users,
+        test_ops_monitor_detects_reconciliation_mismatch,
     ]
     failed = 0
     for t in tests:
