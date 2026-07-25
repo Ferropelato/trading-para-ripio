@@ -607,6 +607,46 @@ al momento de la prueba (quiebra de un pool de minería, una cuenta de X
 hackeada, un arresto por hackeo bancario).
 
 
+## Novena ronda: datasets y backtests sobre pares reales de Ripio Argentina (ARS)
+
+Se confirmó contra la documentación oficial (`apidocs.ripiotrade.co`) que
+Ripio Trade **no publica un endpoint público de velas históricas** (solo
+ticker de 24hs, orderbook y trades recientes). Se confirmó también contra
+`/trade/public/pairs` cuáles son los pares habilitados para Argentina:
+`BTC_USDC`, `ETH_USDC`, `USDC_ARS`, `USDT_ARS`, y varios más contra USDC
+-- no hay pares directos tipo `BTC_ARS` en el book real de Ripio (el
+camino real es cripto→USDC→ARS).
+
+Para poder backtestear igual sobre lo que le importa a un usuario
+argentino, se construyeron dos datasets combinando fuentes **reales y
+públicas** (`build_ars_datasets.py`), no datos inventados:
+
+- `real_data/usdc_ars_daily.csv`: tipo de cambio USD/ARS real (Yahoo
+  Finance, ticker `ARS=X`, sin API key), usado como proxy de USDC_ARS ya
+  que USDC está pegado 1:1 al dólar. 1301 velas reales, 2021-07-25 a
+  2026-07-24 -- incluye la devaluación de diciembre de 2023.
+- `real_data/btc_ars_daily.csv`: BTC re-denominado en pesos, aplicando el
+  tipo de cambio ARS real del mismo día a la vela real de
+  `real_data/btc_daily.csv` (BTC/USD). Es una aproximación (no hay book
+  nativo BTC/ARS con ese historial) documentada explícitamente en el
+  script -- preserva la volatilidad real de BTC, solo la re-denomina.
+
+**Resultado real y honesto** (perfil moderado, comisión y slippage
+incluidos, igual que el resto de los backtests de este proyecto): en
+**ambos** pares ARS, durante 2021-2024, **comprar y mantener (dolarizarse)
+le ganó a las cuatro estrategias activas** por un margen enorme (ej.
+momentum en USDC_ARS: +485% la estrategia vs. **+1454%** de solo tener
+USDC). Tiene sentido y es una conclusión valiosa para la propuesta: en un
+escenario de devaluación sostenida del peso, cualquier tiempo que la
+estrategia pasa "afuera" de la posición dolarizada cuesta carísimo -- el
+valor real de este motor está en pares cripto-cripto genuinamente
+volátiles y de dos vías (BTC_USDC, ETH_USDC), no en el par ARS de
+entrada/salida, que para la mayoría de los usuarios ya funciona mejor
+simplemente como reserva de valor. Mostrar este resultado tal cual (en
+vez de ocultarlo) es parte de la misma política de honestidad del resto
+del proyecto.
+
+
 ## Notas importantes (leer antes de avanzar)
 
 1. **Este backtest usa datos sintéticos por defecto.** Los resultados que
