@@ -1231,6 +1231,50 @@ def test_alpaca_place_order_when_allowed_posts_to_orders_endpoint():
     print("OK: con allow_trading=True, place_order arma correctamente la orden de mercado para Alpaca")
 
 
+def test_alpaca_place_order_open_status_reports_zero_units_not_requested():
+    """
+    Regresión (Fase 3c): una orden "open" (sin llenar todavía) debe
+    reportar 0 unidades REALMENTE ejecutadas, no la cantidad pedida.
+    Bug real encontrado y corregido en el proceso: la versión anterior
+    devolvía `units` (la cantidad pedida) como fallback cuando no había
+    filled_qty, lo que hubiera hecho que el motor registrara una posición
+    que el bróker todavía no ejecutó.
+    """
+    from broker import AlpacaBrokerAdapter
+
+    def fake_transport(method, url, headers, json_body, timeout):
+        return _FakeAlpacaResponse(200, {
+            "id": "order-456", "symbol": "KO", "status": "new",  # sin filled_qty -- nada llenado todavia
+        })
+
+    broker = AlpacaBrokerAdapter(api_key_id="k", secret_key="s", allow_trading=True, transport=fake_transport)
+    result = broker.place_order("KO", "buy", 5)
+    assert result["status"] == "open"
+    assert result["units"] == 0.0, "Una orden abierta no debe reportar unidades ya llenadas"
+    print("OK: una orden Alpaca 'open' reporta 0 unidades llenadas, no la cantidad pedida")
+
+
+def test_alpaca_get_order_status_parses_response():
+    from broker import AlpacaBrokerAdapter
+
+    calls = []
+
+    def fake_transport(method, url, headers, json_body, timeout):
+        calls.append((method, url))
+        return _FakeAlpacaResponse(200, {
+            "id": "order-789", "symbol": "KO", "status": "partially_filled",
+            "filled_qty": "2", "filled_avg_price": "63.10",
+        })
+
+    broker = AlpacaBrokerAdapter(api_key_id="k", secret_key="s", transport=fake_transport)
+    status = broker.get_order_status("order-789")
+    assert calls[0][0] == "GET" and calls[0][1].endswith("/v2/orders/order-789")
+    assert status["status"] == "partially_filled"
+    assert status["units"] == 2.0
+    assert status["price"] == 63.10
+    print("OK: AlpacaBrokerAdapter.get_order_status parsea correctamente el estado de una orden ya colocada")
+
+
 def test_live_polling_accepts_alpaca_as_price_source():
     """
     Prueba concreta de que run_live_polling (pensado originalmente para
@@ -1512,6 +1556,163 @@ def test_sqlite_state_store_multiple_users_share_one_db_without_mixing():
     print("OK: muchos usuarios comparten un solo archivo SQLite sin que sus estados se mezclen")
 
 
+def test_paper_broker_partial_fill_reports_actual_units():
+    from broker import PaperBroker
+
+    broker = PaperBroker(initial_balance=1000.0, fill_ratio=0.4)
+    broker.set_price("TEST", 100.0)
+    order = broker.place_order("TEST", "buy", 10)
+
+    assert order["status"] == "partially_filled"
+    assert abs(order["units"] - 4.0) < 1e-9
+    assert order["requested_units"] == 10
+    assert abs(broker.get_open_positions()["TEST"]["unidades"] - 4.0) < 1e-9
+    print("OK: PaperBroker con fill_ratio<1 reporta un llenado parcial con las unidades reales, no las pedidas")
+
+
+def test_paper_broker_zero_fill_ratio_leaves_order_open_with_no_position():
+    from broker import PaperBroker
+
+    broker = PaperBroker(initial_balance=1000.0, fill_ratio=0.0)
+    broker.set_price("TEST", 100.0)
+    balance_before = broker.get_balance()
+    order = broker.place_order("TEST", "buy", 10)
+
+    assert order["status"] == "open"
+    assert order["units"] == 0
+    assert broker.get_open_positions() == {}, "Una orden 'open' no debe crear ninguna posición todavía"
+    assert broker.get_balance() == balance_before, "No debe descontarse saldo por una orden sin llenar"
+
+    status = broker.get_order_status(order["order_id"])
+    assert status["status"] == "open"
+    print("OK: PaperBroker con fill_ratio=0 deja la orden 'open' sin tocar balance ni posiciones")
+
+
+def test_paper_broker_simulate_additional_fill_completes_open_order():
+    from broker import PaperBroker
+
+    broker = PaperBroker(initial_balance=1000.0, fill_ratio=0.0)
+    broker.set_price("TEST", 100.0)
+    order = broker.place_order("TEST", "buy", 10)
+    assert order["status"] == "open"
+
+    updated = broker.simulate_additional_fill(order["order_id"], 10)
+    assert updated["status"] == "filled"
+    assert updated["units"] == 10
+    assert broker.get_open_positions()["TEST"]["unidades"] == 10
+    assert broker.get_balance() < 1000.0, "Debe haberse descontado el costo de la compra ya completada"
+    print("OK: simulate_additional_fill completa una orden que había quedado abierta")
+
+
+def test_live_engine_open_buy_order_resolves_without_double_ordering():
+    """
+    Integración (Fase 3c): una orden que queda "open" no debe registrar
+    ninguna posición todavía, no debe generar una segunda orden mientras
+    sigue pendiente, y debe resolverse recién cuando el bróker confirma
+    el llenado en un tick posterior.
+    """
+    import os
+    import tempfile
+    from datetime import datetime, timezone
+    from live_runner import _LiveEngine
+    from broker import PaperBroker
+    from risk_profiles import get_profile
+    from safety import CircuitBreaker, ManualKillSwitch
+    from health import Heartbeat
+    from state_store import StateStore
+    from alerts import ConsoleAlertChannel
+    from app_logger import get_logger
+
+    fd, state_path = tempfile.mkstemp(suffix="_live_engine_open.json")
+    os.close(fd)
+    os.remove(state_path)
+    kill_switch_path = ".KILL_SWITCH_test_live_engine_open"
+
+    try:
+        broker = PaperBroker(initial_balance=1000.0, fill_ratio=0.0)  # nada se llena de inmediato
+        engine = _LiveEngine(
+            broker, "TEST_SYM", get_profile("moderado"), "momentum", "moderado",
+            ConsoleAlertChannel(), ManualKillSwitch(control_file=kill_switch_path),
+            CircuitBreaker(), Heartbeat(max_staleness_seconds=99999),
+            StateStore(path=state_path), reconcile_every=1000, log=get_logger("test_live_engine_open"),
+        )
+
+        broker.set_price("TEST_SYM", 100.0)
+        now = datetime.now(timezone.utc)
+
+        # Tick 1: señal de compra -> la orden queda "open"
+        engine.process_tick(now, 100.0, current_atr=2.0, sig=1)
+        assert engine.pending_order is not None, "Debería haber quedado una orden pendiente"
+        assert "TEST_SYM" not in engine.internal_positions, "Todavía no debería haber posición (0 unidades llenadas)"
+        pending_order_id = engine.pending_order["order_id"]
+
+        # Tick 2: misma señal -- NO debe mandar una segunda orden (hay una pendiente)
+        history_len_before = len(broker.order_history)
+        engine.process_tick(now, 100.0, current_atr=2.0, sig=1)
+        assert len(broker.order_history) == history_len_before, "No debe colocar una segunda orden mientras la primera sigue pendiente"
+        assert engine.pending_order is not None  # sigue abierta
+
+        # Simula que la orden finalmente se llena del todo entre el tick 2 y el 3
+        broker.simulate_additional_fill(pending_order_id, broker.orders_by_id[pending_order_id]["requested_units"])
+
+        # Tick 3: al resolver la orden pendiente, ahora debería registrar la posición
+        engine.process_tick(now, 100.0, current_atr=2.0, sig=1)
+        assert engine.pending_order is None, "La orden ya debería estar resuelta"
+        assert "TEST_SYM" in engine.internal_positions
+        assert engine.internal_positions["TEST_SYM"]["unidades"] > 0
+    finally:
+        if os.path.exists(state_path):
+            os.remove(state_path)
+        if os.path.exists(kill_switch_path):
+            os.remove(kill_switch_path)
+    print("OK: _LiveEngine no duplica órdenes mientras una queda pendiente, y registra la posición cuando finalmente se resuelve")
+
+
+def test_live_engine_partial_buy_fill_registers_position_with_actual_units():
+    import os
+    import tempfile
+    from datetime import datetime, timezone
+    from live_runner import _LiveEngine
+    from broker import PaperBroker
+    from risk_profiles import get_profile
+    from safety import CircuitBreaker, ManualKillSwitch
+    from health import Heartbeat
+    from state_store import StateStore
+    from alerts import ConsoleAlertChannel
+    from app_logger import get_logger
+
+    fd, state_path = tempfile.mkstemp(suffix="_live_engine_partial.json")
+    os.close(fd)
+    os.remove(state_path)
+    kill_switch_path = ".KILL_SWITCH_test_live_engine_partial"
+
+    try:
+        broker = PaperBroker(initial_balance=1000.0, fill_ratio=0.5)  # llenado parcial (mitad)
+        engine = _LiveEngine(
+            broker, "TEST_SYM", get_profile("moderado"), "momentum", "moderado",
+            ConsoleAlertChannel(), ManualKillSwitch(control_file=kill_switch_path),
+            CircuitBreaker(), Heartbeat(max_staleness_seconds=99999),
+            StateStore(path=state_path), reconcile_every=1000, log=get_logger("test_live_engine_partial"),
+        )
+
+        broker.set_price("TEST_SYM", 100.0)
+        now = datetime.now(timezone.utc)
+        engine.process_tick(now, 100.0, current_atr=2.0, sig=1)
+
+        assert engine.pending_order is None, "Un llenado parcial se trata como definitivo, no queda pendiente"
+        assert "TEST_SYM" in engine.internal_positions
+        internal_units = engine.internal_positions["TEST_SYM"]["unidades"]
+        broker_units = broker.get_open_positions()["TEST_SYM"]["unidades"]
+        assert internal_units > 0
+        assert internal_units == broker_units, "La posición interna debe coincidir con lo que el bróker realmente tiene"
+    finally:
+        if os.path.exists(state_path):
+            os.remove(state_path)
+        if os.path.exists(kill_switch_path):
+            os.remove(kill_switch_path)
+    print("OK: un llenado parcial en la compra registra la posición con las unidades REALMENTE compradas")
+
+
 if __name__ == "__main__":
     tests = [
         test_risk_never_exceeds_profile,
@@ -1569,6 +1770,8 @@ if __name__ == "__main__":
         test_alpaca_get_open_positions_maps_fields,
         test_alpaca_place_order_blocked_without_allow_trading,
         test_alpaca_place_order_when_allowed_posts_to_orders_endpoint,
+        test_alpaca_place_order_open_status_reports_zero_units_not_requested,
+        test_alpaca_get_order_status_parses_response,
         test_live_polling_accepts_alpaca_as_price_source,
         test_alpaca_private_requires_credentials,
         test_shared_price_feed_dedupes_concurrent_consumers_on_same_symbol,
@@ -1582,6 +1785,11 @@ if __name__ == "__main__":
         test_ops_monitor_escalates_to_systemic_alert_when_threshold_crossed,
         test_ops_monitor_does_not_escalate_with_too_few_users,
         test_ops_monitor_detects_reconciliation_mismatch,
+        test_paper_broker_partial_fill_reports_actual_units,
+        test_paper_broker_zero_fill_ratio_leaves_order_open_with_no_position,
+        test_paper_broker_simulate_additional_fill_completes_open_order,
+        test_live_engine_open_buy_order_resolves_without_double_ordering,
+        test_live_engine_partial_buy_fill_registers_position_with_actual_units,
     ]
     failed = 0
     for t in tests:

@@ -82,6 +82,9 @@ class _LiveEngine:
         self.stop_loss = saved_state["extra"].get("stop_loss") if saved_state["saved_at"] else None
         self.take_profit = saved_state["extra"].get("take_profit") if saved_state["saved_at"] else None
         self.internal_positions = saved_state["positions"] if saved_state["saved_at"] else {}
+        # Orden colocada que quedo "open" (sin llenar, o parcialmente llena
+        # y a la espera de mas) -- ver Fase 3c / _resolve_pending_order.
+        self.pending_order = saved_state["extra"].get("pending_order") if saved_state["saved_at"] else None
 
         self.ticks_processed = 0
         self.equity_curve = []
@@ -94,6 +97,64 @@ class _LiveEngine:
         if self.symbol in positions:
             return cash + positions[self.symbol]["unidades"] * price
         return cash
+
+    def _apply_buy_fill(self, filled_units, price_filled, sizing):
+        """Registra (o suma a) la posición interna con lo EFECTIVAMENTE
+        comprado -- nunca con la cantidad pedida (ver Fase 3c)."""
+        if filled_units <= 0:
+            return
+        self.stop_loss = sizing["stop_loss"]
+        self.take_profit = sizing["take_profit"]
+        self.internal_positions[self.symbol] = {"unidades": filled_units, "precio_entrada": price_filled}
+
+    def _apply_sell_fill(self, filled_units):
+        """Reduce (o cierra del todo) la posición interna según lo
+        EFECTIVAMENTE vendido -- una venta parcial deja el resto abierto
+        con el mismo stop loss/take profit."""
+        pos = self.internal_positions.get(self.symbol)
+        if not pos or filled_units <= 0:
+            return
+        remaining = pos["unidades"] - filled_units
+        if remaining <= 1e-9:
+            self.stop_loss, self.take_profit = None, None
+            self.internal_positions.pop(self.symbol, None)
+        else:
+            pos["unidades"] = remaining
+
+    def _resolve_pending_order(self):
+        """
+        Si quedó una orden "open" de un tick anterior, la vuelve a
+        consultar. Mientras siga "open" no hace nada más (se revisa de
+        nuevo el próximo tick). Cualquier otro estado (filled,
+        partially_filled, canceled, rejected) se trata como definitivo
+        para esta orden -- este motor no persigue el resto de una orden
+        parcialmente llena indefinidamente, aplica lo que efectivamente
+        se ejecutó y sigue adelante.
+        """
+        if self.pending_order is None:
+            return
+
+        order_id = self.pending_order["order_id"]
+        try:
+            status_order = self.broker.get_order_status(order_id)
+        except Exception as e:
+            self.log.warning("No se pudo consultar la orden pendiente %s (%s) -- se reintenta el próximo tick",
+                              order_id, e)
+            return
+
+        status = status_order["status"]
+        if status == "open":
+            return
+
+        filled_units = status_order.get("units") or 0
+        side = self.pending_order["side"]
+        if side == "buy":
+            self._apply_buy_fill(filled_units, status_order.get("price"), self.pending_order["sizing"])
+        else:
+            self._apply_sell_fill(filled_units)
+
+        self.log.info("Orden pendiente %s se resolvió: %s (%s unidades)", order_id, status, filled_units)
+        self.pending_order = None
 
     def process_tick(self, date, price, current_atr, sig):
         self.ticks_processed += 1
@@ -116,6 +177,10 @@ class _LiveEngine:
 
         # 3) Actualizar el precio "de mercado" que ve el bróker
         self.broker.set_price(self.symbol, price)
+
+        # 3b) Si quedó una orden abierta/parcial del tick anterior, resolverla ANTES de decidir algo nuevo
+        self._resolve_pending_order()
+
         equity = self._mark_to_market(price)
 
         # Reinicia el equity de referencia diario para el chequeo de pérdida diaria
@@ -126,6 +191,14 @@ class _LiveEngine:
 
         breaker_active = self.circuit_breaker.check(self.equity_curve, self.day_start_equity, equity)
         self.equity_curve.append(equity)
+
+        # Mientras haya una orden todavía sin resolver, no se evalúa nada
+        # nuevo este tick -- evita mandar una segunda orden encima de una
+        # que el bróker todavía no terminó de procesar.
+        if self.pending_order is not None:
+            if self.ticks_processed % self.reconcile_every == 0:
+                self.force_persist()
+            return
 
         broker_positions = self.broker.get_open_positions()
         in_position = self.symbol in broker_positions
@@ -141,9 +214,18 @@ class _LiveEngine:
                 client_order_id = f"{self.symbol}-sell-{date}"
                 order = self.broker.place_order(self.symbol, "sell", pos["unidades"], client_order_id=client_order_id)
                 motivo = "stop_loss" if hit_stop else ("take_profit" if hit_target else "señal_estrategia")
-                self.log.info("Cierre de posición (%s): %s", motivo, order)
-                self.stop_loss, self.take_profit = None, None
-                self.internal_positions.pop(self.symbol, None)
+                status = order["status"]
+                filled_units = order.get("units") or 0
+
+                if status == "open":
+                    self.pending_order = {"order_id": order.get("broker_order_id") or order.get("order_id"), "side": "sell"}
+                    self.log.info("Orden de venta (%s) quedó abierta -- se revisará en el próximo tick", motivo)
+                else:
+                    self.log.info("Cierre de posición (%s): %s", motivo, order)
+                    self._apply_sell_fill(filled_units)
+                    if status == "partially_filled":
+                        self.log.warning("Venta parcial en %s: %s/%s unidades -- se sigue adelante con lo efectivamente vendido",
+                                          self.symbol, filled_units, pos["unidades"])
 
         # 5) Lógica de entrada (si no hay posición abierta, el breaker no está
         # activo, y no hay una pausa automática por noticias en curso)
@@ -153,14 +235,26 @@ class _LiveEngine:
                 if sizing["unidades"] > 0 and sizing["viable"] is not False:
                     client_order_id = f"{self.symbol}-buy-{date}"
                     order = self.broker.place_order(self.symbol, "buy", sizing["unidades"], client_order_id=client_order_id)
-                    if order["status"] == "filled":
-                        self.stop_loss = sizing["stop_loss"]
-                        self.take_profit = sizing["take_profit"]
-                        self.internal_positions[self.symbol] = {"unidades": sizing["unidades"], "precio_entrada": order["price"]}
-                        alert_msg = format_signal_alert(
-                            self.symbol, self.strategy_name, self.profile_name, date, price, sizing
-                        )
-                        self.alert_channel.send(alert_msg)
+                    status = order["status"]
+                    filled_units = order.get("units") or 0
+
+                    if status == "open":
+                        self.pending_order = {
+                            "order_id": order.get("broker_order_id") or order.get("order_id"),
+                            "side": "buy", "sizing": sizing,
+                        }
+                        self.log.info("Orden de compra quedó abierta (0 unidades llenadas todavía) -- "
+                                       "se revisará en el próximo tick")
+                    else:
+                        self._apply_buy_fill(filled_units, order.get("price"), sizing)
+                        if filled_units > 0:
+                            alert_msg = format_signal_alert(
+                                self.symbol, self.strategy_name, self.profile_name, date, price, sizing
+                            )
+                            self.alert_channel.send(alert_msg)
+                        if status == "partially_filled":
+                            self.log.warning("Compra parcial en %s: %s/%s unidades -- se registra la posición con lo efectivamente comprado",
+                                              self.symbol, filled_units, sizing["unidades"])
 
         # 6) Persistir estado y reconciliar cada N ticks
         if self.ticks_processed % self.reconcile_every == 0:
@@ -168,7 +262,8 @@ class _LiveEngine:
 
     def force_persist(self):
         self.state_store.save(self.internal_positions, capital=self.broker.get_balance(),
-                               extra={"stop_loss": self.stop_loss, "take_profit": self.take_profit})
+                               extra={"stop_loss": self.stop_loss, "take_profit": self.take_profit,
+                                      "pending_order": self.pending_order})
         report = reconcile(self.internal_positions, self.broker.get_open_positions())
         if not report["coincide"]:
             self.log.error("Desfasaje detectado entre el estado interno y el bróker: %s", report)

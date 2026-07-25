@@ -812,6 +812,82 @@ sección de visión separada del pedido principal (que sí está en el mismo
 terreno regulatorio que Ripio ya pisa hoy).
 
 
+## Catorceava ronda: qué haría falta para un lanzamiento real (Fases 2 y 3)
+
+Roadmap concreto de qué falta después de un "sí" de Ripio, más allá del
+motor ya validado. Fase 1 (legal/negocio) y Fase 4 (producto/UX) quedan
+fuera del alcance técnico de este repo. Acá se atacaron Fase 2 completa
+y Fase 3 completa:
+
+### Fase 2 -- feed de precios compartido (`price_feed.py`)
+
+Cada sesión de usuario pidiéndole el precio a Ripio por su cuenta no
+escala -- ya se había observado un 429 real con solo 2 sesiones
+concurrentes (ver Séptima ronda). `SharedPriceFeed` mantiene UN poller de
+fondo por símbolo (no por usuario): todos los usuarios que miran el mismo
+par comparten una sola llamada de red. Prueba concreta
+(`test_shared_price_feed_as_drop_in_reduces_calls_for_two_sessions`): 2
+sesiones x 5 ticks generan 10 llamadas reales sin esto, 1 sola con esto.
+Es un reemplazo directo de `price_source` en `run_live_polling`, sin
+tocar `live_runner.py`.
+
+**Bug de concurrencia propio, encontrado y corregido antes de escribir
+los tests**: el primer diseño hacía que el poller de fondo disparara su
+primer fetch inmediatamente al arrancar, compitiendo con el fetch
+sincrónico del llamador que lo activó -- doble llamada de red en el
+arranque de cada símbolo nuevo. Corregido con un lock por símbolo
+(double-checked locking) y haciendo que el poller espere el intervalo
+completo antes de su primer refresco.
+
+### Fase 3a -- persistencia real (`SQLiteStateStore` en `state_store.py`)
+
+Reemplaza un archivo JSON por usuario por una única base SQLite
+compartida (todos los usuarios, una key cada uno). `all_keys()` lista
+todos los usuarios con estado guardado -- la base para el monitoreo
+centralizado de 3b. `multi_user.py` se actualizó para usar esto en vez de
+archivos sueltos.
+
+### Fase 3b -- monitoreo centralizado (`ops_monitor.py`)
+
+`OperationsMonitor` agrega circuit breaker / kill-switch / heartbeat /
+reconciliación de TODAS las sesiones activas, y alerta por el mismo canal
+que ya usa el resto del sistema. Si el % de usuarios con el MISMO
+problema cruza un umbral configurable, escala a una alerta "sistémica"
+distinta de las individuales -- la diferencia real entre "a alguien le
+fue mal" y "esto le está pasando a todos, hay que revisar si es un
+movimiento de mercado real o un bug".
+
+### Fase 3c -- órdenes parciales y estados reales del libro (`broker.py`, `live_runner.py`)
+
+Hasta ahora el motor asumía que toda orden se llena entera al instante.
+`PaperBroker` ahora soporta `fill_ratio` para simular llenados parciales
+("partially_filled") y órdenes que quedan "open" (resting, sin llenar
+todavía) -- con `get_order_status()` para consultarlas más tarde.
+`_LiveEngine` se reescribió para: (1) registrar la posición con las
+unidades REALMENTE llenadas, nunca las pedidas; (2) no mandar una segunda
+orden mientras la primera sigue pendiente; (3) resolver una orden
+pendiente en un tick posterior en vez de olvidarla.
+
+**Dos bugs reales encontrados y corregidos en el proceso**:
+- `AlpacaBrokerAdapter.place_order` devolvía la cantidad PEDIDA como
+  `units` cuando no había `filled_qty` (orden "open") -- hubiera hecho
+  que el motor registrara una posición que Alpaca todavía no ejecutó.
+  Corregido a 0.0 en ese caso, con test de regresión dedicado.
+- El propio `_LiveEngine` (antes de esta ronda) ya tenía el mismo patrón
+  de bug latente: usaba la cantidad PEDIDA (`sizing["unidades"]`) para
+  registrar la posición interna en vez de la cantidad REALMENTE llenada
+  por el bróker -- invisible hasta ahora porque `PaperBroker` siempre
+  llenaba entero. Corregido al mismo tiempo que se agregó el soporte de
+  llenados parciales.
+
+75/75 tests pasando.
+
+### Fase 3d -- pendiente
+
+Prueba de carga con muchos usuarios bajo un shock de mercado compartido
+(circuit breakers disparándose en simultáneo) -- ver próxima ronda.
+
+
 ## Notas importantes (leer antes de avanzar)
 
 1. **Este backtest usa datos sintéticos por defecto.** Los resultados que

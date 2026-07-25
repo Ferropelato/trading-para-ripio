@@ -46,24 +46,55 @@ class BrokerBase(ABC):
         """Devuelve las posiciones abiertas actuales: {symbol: {unidades, precio_entrada}}."""
         raise NotImplementedError
 
+    def get_order_status(self, order_id: str) -> dict:
+        """
+        Consulta el estado actual de una orden ya colocada -- para el caso
+        real de una orden que quedó "open" (parcialmente llena o sin
+        llenar todavía) y hay que seguir su evolución en ticks
+        posteriores (ver Fase 3c / `_LiveEngine._resolve_pending_order`
+        en `live_runner.py`).
+
+        Deliberadamente NO abstracto: no todos los adaptadores ya
+        conectados lo implementan todavía (agregar esto como abstracto
+        hubiera roto la instanciación de todos los que no lo tuvieran).
+        El default explica qué falta en vez de fallar de forma confusa.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} todavía no implementa get_order_status()."
+        )
+
 
 class PaperBroker(BrokerBase):
     """
     Bróker simulado ("paper trading"): mantiene un balance y posiciones en
-    memoria, y ejecuta órdenes instantáneamente al precio que se le pasa
-    (con slippage configurable), sin ninguna conexión externa. Sirve para
-    probar el flujo completo motor -> decisión -> "ejecución" -> registro,
-    de punta a punta, antes de conectar cualquier bróker real.
+    memoria, y ejecuta órdenes al precio que se le pasa (con slippage
+    configurable), sin ninguna conexión externa. Sirve para probar el
+    flujo completo motor -> decisión -> "ejecución" -> registro, de punta
+    a punta, antes de conectar cualquier bróker real.
+
+    `fill_ratio` (Fase 3c -- manejo de órdenes parciales y estados reales
+    del libro): por defecto 1.0 (llenado instantáneo completo, como
+    siempre). Un valor menor simula que solo una fracción de la orden se
+    ejecuta de inmediato -- `0 < fill_ratio < 1` da "partially_filled",
+    `fill_ratio == 0` da "open" (nada llenado todavía, la orden queda
+    pendiente). Esto existe para poder probar que el resto del motor
+    (`_LiveEngine`) maneja estos casos correctamente en vez de asumir
+    que toda orden se llena entera al instante -- lo que sí es cierto la
+    mayoría del tiempo en un bróker real, pero no siempre.
     """
 
     def __init__(self, initial_balance: float = 1000.0, slippage_pct: float = 0.0005,
-                 commission_pct: float = 0.001):
+                 commission_pct: float = 0.001, fill_ratio: float = 1.0):
+        if not 0.0 <= fill_ratio <= 1.0:
+            raise ValueError("fill_ratio debe estar entre 0.0 y 1.0")
         self.balance = initial_balance
         self.slippage_pct = slippage_pct
         self.commission_pct = commission_pct
+        self.fill_ratio = fill_ratio
         self.positions = {}  # symbol -> {"unidades": float, "precio_entrada": float}
         self._current_prices = {}  # symbol -> último precio conocido (se setea con set_price)
         self.order_history = []
+        self.orders_by_id = {}  # order_id -> dict de la orden (misma referencia que se devuelve/actualiza)
         self._processed_client_order_ids = {}  # client_order_id -> resultado ya devuelto
 
     def set_price(self, symbol: str, price: float) -> None:
@@ -104,65 +135,146 @@ class PaperBroker(BrokerBase):
         return result
 
     def _place_order_impl(self, symbol: str, side: str, units: float) -> dict:
+        import uuid
+
         if side not in ("buy", "sell"):
             raise ValueError("side debe ser 'buy' o 'sell'")
         if units <= 0:
             raise ValueError("units debe ser positivo")
 
+        order_id = uuid.uuid4().hex
         price = self.get_current_price(symbol)
         exec_price = price * (1 + self.slippage_pct) if side == "buy" else price * (1 - self.slippage_pct)
-        trade_value = units * exec_price
+
+        # fill_ratio < 1.0 simula que solo una parte de la orden se ejecuta
+        # de inmediato (ver docstring de la clase). Redondeado para evitar
+        # polvo de punto flotante en cantidades chicas.
+        #
+        # Simplificacion deliberada: el chequeo de saldo solo considera el
+        # costo de lo efectivamente llenado (filled_units), no el de la
+        # orden completa como haria un exchange real reservando el saldo
+        # por adelantado. Alcanza para probar que el motor maneja bien
+        # llenados parciales/ordenes abiertas (el objetivo de esta clase),
+        # sin sumarle a PaperBroker un modelo completo de reserva de saldo.
+        filled_units = round(units * self.fill_ratio, 10)
+        trade_value = filled_units * exec_price
         commission = trade_value * self.commission_pct
 
         if side == "buy":
             total_cost = trade_value + commission
-            if total_cost > self.balance:
+            if filled_units > 0 and total_cost > self.balance:
                 order = {
+                    "order_id": order_id, "broker_order_id": order_id,
                     "status": "rejected", "motivo": "Saldo insuficiente",
-                    "symbol": symbol, "side": side, "units": units,
+                    "symbol": symbol, "side": side, "units": 0, "requested_units": units,
                     "timestamp": datetime.utcnow().isoformat(),
                 }
                 self.order_history.append(order)
+                self.orders_by_id[order_id] = order
                 log.warning("Orden rechazada por saldo insuficiente: %s %s %s", side, units, symbol)
                 return order
 
-            self.balance -= total_cost
-            existing = self.positions.get(symbol)
-            if existing:
-                total_units = existing["unidades"] + units
-                avg_price = (existing["unidades"] * existing["precio_entrada"] + units * exec_price) / total_units
-                self.positions[symbol] = {"unidades": total_units, "precio_entrada": avg_price}
-            else:
-                self.positions[symbol] = {"unidades": units, "precio_entrada": exec_price}
+            if filled_units > 0:
+                self.balance -= total_cost
+                existing = self.positions.get(symbol)
+                if existing:
+                    total_units = existing["unidades"] + filled_units
+                    avg_price = (existing["unidades"] * existing["precio_entrada"]
+                                 + filled_units * exec_price) / total_units
+                    self.positions[symbol] = {"unidades": total_units, "precio_entrada": avg_price}
+                else:
+                    self.positions[symbol] = {"unidades": filled_units, "precio_entrada": exec_price}
 
         else:  # sell
             existing = self.positions.get(symbol)
             if not existing or existing["unidades"] < units:
                 order = {
+                    "order_id": order_id, "broker_order_id": order_id,
                     "status": "rejected", "motivo": "No hay suficientes unidades para vender",
-                    "symbol": symbol, "side": side, "units": units,
+                    "symbol": symbol, "side": side, "units": 0, "requested_units": units,
                     "timestamp": datetime.utcnow().isoformat(),
                 }
                 self.order_history.append(order)
+                self.orders_by_id[order_id] = order
                 log.warning("Orden de venta rechazada: no hay posición suficiente en %s", symbol)
                 return order
 
-            proceeds = trade_value - commission
-            self.balance += proceeds
-            remaining = existing["unidades"] - units
+            if filled_units > 0:
+                proceeds = trade_value - commission
+                self.balance += proceeds
+                remaining = existing["unidades"] - filled_units
+                if remaining <= 1e-9:
+                    del self.positions[symbol]
+                else:
+                    self.positions[symbol]["unidades"] = remaining
+
+        if filled_units <= 0:
+            status = "open"
+        elif filled_units < units - 1e-9:
+            status = "partially_filled"
+        else:
+            status = "filled"
+
+        order = {
+            "order_id": order_id, "broker_order_id": order_id,
+            "status": status, "symbol": symbol, "side": side,
+            "units": filled_units, "requested_units": units,
+            "price": round(exec_price, 4), "commission": round(commission, 4),
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+        self.order_history.append(order)
+        self.orders_by_id[order_id] = order
+        log.info("Orden %s: %s %s/%s %s @ %.4f", status, side, filled_units, units, symbol, exec_price)
+        return order
+
+    def get_order_status(self, order_id: str) -> dict:
+        order = self.orders_by_id.get(order_id)
+        if order is None:
+            raise ValueError(f"No existe ninguna orden con order_id='{order_id}'")
+        return dict(order)
+
+    def simulate_additional_fill(self, order_id: str, additional_units: float) -> dict:
+        """
+        SOLO PARA TESTS: simula que una orden que había quedado "open" o
+        "partially_filled" recibe más llenado en un momento posterior
+        (ej. un limit order que finalmente matchea contra el libro). Un
+        bróker real no necesita este método -- ahí el llenado adicional
+        llega solo, vía la propia API/websocket del bróker.
+        """
+        order = self.orders_by_id.get(order_id)
+        if order is None:
+            raise ValueError(f"No existe ninguna orden con order_id='{order_id}'")
+        if additional_units <= 0:
+            raise ValueError("additional_units debe ser positivo")
+
+        symbol, side = order["symbol"], order["side"]
+        exec_price = order["price"]
+        trade_value = additional_units * exec_price
+        commission = trade_value * self.commission_pct
+
+        if side == "buy":
+            self.balance -= (trade_value + commission)
+            existing = self.positions.get(symbol)
+            if existing:
+                total_units = existing["unidades"] + additional_units
+                avg_price = (existing["unidades"] * existing["precio_entrada"]
+                             + additional_units * exec_price) / total_units
+                self.positions[symbol] = {"unidades": total_units, "precio_entrada": avg_price}
+            else:
+                self.positions[symbol] = {"unidades": additional_units, "precio_entrada": exec_price}
+        else:
+            self.balance += (trade_value - commission)
+            existing = self.positions[symbol]
+            remaining = existing["unidades"] - additional_units
             if remaining <= 1e-9:
                 del self.positions[symbol]
             else:
                 self.positions[symbol]["unidades"] = remaining
 
-        order = {
-            "status": "filled", "symbol": symbol, "side": side, "units": units,
-            "price": round(exec_price, 4), "commission": round(commission, 4),
-            "timestamp": datetime.utcnow().isoformat(),
-        }
-        self.order_history.append(order)
-        log.info("Orden ejecutada: %s %s %s @ %.4f", side, units, symbol, exec_price)
-        return order
+        new_units = round(order["units"] + additional_units, 10)
+        order["units"] = new_units
+        order["status"] = "filled" if new_units >= order["requested_units"] - 1e-9 else "partially_filled"
+        return dict(order)
 
 
 class RipioBrokerAdapter(BrokerBase):
@@ -770,13 +882,47 @@ class AlpacaBrokerAdapter(BrokerBase):
             "status": status,
             "symbol": data.get("symbol", symbol.upper()),
             "side": side,
-            "units": float(filled_qty) if filled_qty else units,
+            # OJO: usar 0.0 (no `units`, la cantidad PEDIDA) cuando no hay
+            # filled_qty -- una orden "open" tiene 0 unidades REALMENTE
+            # llenadas todavia. Bug real corregido en el proceso: la version
+            # anterior devolvia la cantidad pedida como si ya estuviera
+            # llena, lo que hubiera hecho que _LiveEngine registrara una
+            # posicion que en realidad el broker todavia no ejecuto.
+            "units": float(filled_qty) if filled_qty else 0.0,
+            "requested_units": units,
             "price": float(filled_price) if filled_price else None,
+            "order_id": data.get("id"),
             "broker_order_id": data.get("id"),
             "raw": data,
             "timestamp": datetime.utcnow().isoformat(),
         }
         if client_order_id:
             self._processed_client_order_ids[client_order_id] = order
-        log.info("Orden Alpaca %s: %s %s %s -> %s", order.get("broker_order_id"), side, units, symbol, status)
+        log.info("Orden Alpaca %s: %s %s/%s %s -> %s", order.get("broker_order_id"), side, order["units"], units, symbol, status)
         return order
+
+    def get_order_status(self, order_id: str) -> dict:
+        """GET /v2/orders/{order_id} -- consulta el estado actual de una orden ya colocada
+        (para el caso de una que quedo "open" y hay que seguir su evolucion)."""
+        data = self._request("GET", f"{self.trading_base_url}/v2/orders/{order_id}")
+        status_raw = (data.get("status") or "").lower()
+        if status_raw == "filled":
+            status = "filled"
+        elif status_raw == "partially_filled":
+            status = "partially_filled"
+        elif status_raw in ("new", "accepted", "pending_new", "open"):
+            status = "open"
+        elif status_raw in ("canceled", "cancelled", "expired", "rejected"):
+            status = "canceled"
+        else:
+            status = status_raw or "submitted"
+
+        filled_qty = data.get("filled_qty")
+        filled_price = data.get("filled_avg_price")
+        return {
+            "order_id": order_id, "broker_order_id": data.get("id", order_id),
+            "status": status, "symbol": data.get("symbol"), "side": data.get("side"),
+            "units": float(filled_qty) if filled_qty else 0.0,
+            "price": float(filled_price) if filled_price else None,
+            "raw": data,
+        }
