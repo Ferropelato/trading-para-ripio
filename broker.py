@@ -282,8 +282,36 @@ class RipioBrokerAdapter(BrokerBase):
                     self._server_time_offset_ms,
                 )
         except Exception as e:
-            log.warning("No pude sincronizar hora con Ripio (%s) -- uso reloj local", e)
-            self._server_time_offset_ms = 0
+            if self._server_time_offset_ms is None:
+                # Sin ningun offset previo (ni siquiera capturado oportunistamente
+                # de otra respuesta): reloj local como ultimo recurso.
+                log.warning("No pude sincronizar hora con Ripio (%s) -- uso reloj local sin ajuste", e)
+                self._server_time_offset_ms = 0
+            else:
+                # Ya teniamos un offset (por ejemplo, capturado del timestamp que
+                # trae CUALQUIER respuesta de Ripio, exitosa o de error). No lo
+                # pisamos con 0 solo porque este resync puntual fallo.
+                log.warning(
+                    "No pude re-sincronizar hora con Ripio (%s) -- sigo usando el ultimo offset conocido (%d ms)",
+                    e, self._server_time_offset_ms,
+                )
+
+    def _capture_server_time_from_payload(self, payload: dict) -> None:
+        """
+        Ripio incluye 'timestamp' (ms, hora del servidor) en TODAS las
+        respuestas, exitosas o de error. Aprovechar esto para mantener el
+        offset de reloj al dia sin depender solo de /server-time, que tiene
+        un rate limit propio: se observo que llamar al ticker publico justo
+        antes puede hacer que /server-time devuelva 429, y sin este fallback
+        el codigo asumia reloj local (aca desfasado ~16s), lo que invalidaba
+        la firma de cualquier request privada inmediatamente despues.
+        """
+        import time
+        try:
+            server_ms = int(payload.get("timestamp"))
+        except (TypeError, ValueError):
+            return
+        self._server_time_offset_ms = server_ms - int(time.time() * 1000)
 
     def _timestamp_ms(self) -> str:
         import time
@@ -333,6 +361,17 @@ class RipioBrokerAdapter(BrokerBase):
         except requests.ConnectionError as e:
             raise TransientBrokerError(f"Error de conexión con Ripio: {e}") from e
 
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = None
+
+        # Capturar la hora del servidor de CUALQUIER respuesta (exitosa o de
+        # error) antes de decidir si esta request en particular fallo -- ver
+        # _capture_server_time_from_payload.
+        if isinstance(payload, dict) and "timestamp" in payload:
+            self._capture_server_time_from_payload(payload)
+
         if response.status_code >= 500:
             raise TransientBrokerError(
                 f"Ripio respondió {response.status_code}: {response.text[:200]}"
@@ -346,10 +385,8 @@ class RipioBrokerAdapter(BrokerBase):
                 f"Ripio rechazó la request ({response.status_code}): {response.text[:300]}"
             )
 
-        try:
-            payload = response.json()
-        except ValueError as e:
-            raise TransientBrokerError(f"Respuesta no-JSON de Ripio: {e}") from e
+        if payload is None:
+            raise TransientBrokerError("Respuesta no-JSON de Ripio")
 
         if payload.get("error_code") not in (None, 0):
             raise PermanentBrokerError(
