@@ -40,6 +40,7 @@ las más relevantes para evaluar qué tan listo está esto hoy.
 - [Visión: más allá de cripto](#visión-más-allá-de-cripto-prueba-de-concepto-no-una-promesa)
 - [Catorceava ronda: qué haría falta para un lanzamiento real (Fases 2 y 3)](#catorceava-ronda-qué-haría-falta-para-un-lanzamiento-real-fases-2-y-3)
 - [Quinceava ronda: Fase 4 -- producto](#quinceava-ronda-fase-4-producto-onboarding-historialajustes-herramienta-de-soporte)
+- [Dieciseisava ronda: cerrando huecos de cobertura](#dieciseisava-ronda-cerrando-huecos-de-cobertura-de-rondas-anteriores)
 - [Notas importantes (leer antes de avanzar)](#notas-importantes-leer-antes-de-avanzar)
 
 </details>
@@ -1034,6 +1035,38 @@ escenario real de un crash del activo que todos tienen). Resultado:
   de leer la clase entera antes de asumir que falta algo.
 
 81/81 tests pasando.
+
+
+## Dieciseisava ronda: cerrando huecos de cobertura de rondas anteriores
+
+Auditoría de qué módulos no tenían NINGÚN test propio (solo se
+ejercitaban indirectamente vía otros): `strategies.py` (las 4
+estrategias en sí), `validation.py` (walk-forward -- el diferencial
+anti-sobreajuste que más se cita en este README) y `stress_test.py`
+(validación contra crisis históricas reales, otro punto fuerte del
+pitch) no tenían ningún test dedicado. Se agregaron 10 tests nuevos que
+verifican directamente: que las 4 estrategias devuelven señales binarias
+válidas, que `trend_following` coincide exactamente con el cruce de
+medias esperado, que `value_dip_in_uptrend` exige ambas condiciones (no
+alcanza con una sola), que `walk_forward_validate` detecta y advierte un
+caso de sobreajuste forzado deliberadamente (tendencia limpia in-sample +
+flash crash out-of-sample), que `rolling_walk_forward_validate` calcula
+la consistencia correctamente y rechaza pedir más ventanas de las que el
+dataset soporta, y que `run_crisis_stress_test` sigue cubriendo las 4
+crisis históricas conocidas con los datos reales de BTC ya incluidos.
+
+**Bug propio encontrado y corregido al escribir estos tests** (no del
+motor): el primer intento de probar `trend_following` construía el
+DataFrame de prueba pasando una `Series` con su propio índice (0..79) y
+forzando un índice de fechas distinto en el constructor de `pd.DataFrame`
+-- pandas realinea por ETIQUETA en esos casos, no por posición, y como
+los índices no compartían ninguna etiqueta el resultado quedó en `NaN`
+silenciosamente en toda la columna. El test lo detectó solo (comparó
+contra un cálculo hecho aparte, sobre la Series original sin ese
+problema), sin necesitar debug manual. Corregido construyendo la Series
+ya con el índice final desde el principio.
+
+91/91 tests pasando.
 
 
 ## Notas importantes (leer antes de avanzar)

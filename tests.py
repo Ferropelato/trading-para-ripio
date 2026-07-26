@@ -1976,6 +1976,193 @@ def test_support_snapshot_flags_reconciliation_mismatch():
     print("OK: el snapshot de soporte detecta un desfasaje de reconciliación y advierte al agente antes de confirmar nada")
 
 
+def test_all_strategies_return_valid_binary_signal_on_real_data():
+    """
+    strategies.py no tenía ningún test directo (solo se ejercitaba
+    indirectamente vía Backtester en otros tests) -- verifica que las 4
+    estrategias corren sobre datos reales y devuelven siempre 0/1, nunca
+    otro valor.
+    """
+    from data_utils import load_csv
+    from strategies import STRATEGIES
+
+    df = load_csv("real_data/btc_daily.csv")
+    for name, fn in STRATEGIES.items():
+        signal = fn(df)
+        assert len(signal) == len(df), f"{name}: la señal debe tener la misma longitud que los datos"
+        valid_values = set(signal.dropna().unique().tolist())
+        assert valid_values <= {0, 1}, f"{name} devolvió valores fuera de {{0,1}}: {valid_values}"
+    print("OK: las 4 estrategias devuelven una señal binaria válida sobre datos reales")
+
+
+def test_get_strategy_raises_for_unknown_name():
+    from strategies import get_strategy
+
+    try:
+        get_strategy("no_existe")
+        assert False, "Debería fallar para una estrategia inexistente"
+    except ValueError:
+        pass
+    print("OK: get_strategy rechaza nombres de estrategia inválidos")
+
+
+def test_trend_following_signal_matches_ma_crossover():
+    """Verificación directa de correctitud: la señal debe coincidir exactamente
+    con el cruce de medias móviles, no aproximadamente."""
+    import pandas as pd
+    import numpy as np
+    from strategies import trend_following
+
+    n = 80
+    idx = pd.bdate_range("2024-01-01", periods=n)
+    # OJO: construir `close` YA con el índice final antes de meterlo en el
+    # DataFrame -- si se pasa una Series con su propio índice (ej. 0..79)
+    # y se le fuerza otro índice distinto en el constructor, pandas
+    # REALINEA por etiqueta en vez de por posición, y como no comparten
+    # ninguna etiqueta el resultado queda en NaN silenciosamente (esto
+    # rompió esta prueba antes de corregirla, no era un bug de strategies.py).
+    close = pd.Series(np.linspace(100, 200, n), index=idx)
+    df = pd.DataFrame({"open": close, "high": close + 1, "low": close - 1, "close": close, "volume": 1000}, index=idx)
+    signal = trend_following(df, fast=20, slow=50)
+
+    fast_ma = close.rolling(20).mean()
+    slow_ma = close.rolling(50).mean()
+    expected = (fast_ma > slow_ma).astype(int)
+    assert (signal.fillna(0) == expected.fillna(0)).all(), "La señal debe coincidir exactamente con el cruce de medias"
+    assert signal.iloc[-1] == 1, "En una serie claramente ascendente, la media rápida debe superar a la lenta al final"
+    print("OK: trend_following genera la señal exactamente en el cruce de medias móviles esperado")
+
+
+def test_value_dip_in_uptrend_requires_both_conditions():
+    """
+    value_dip_in_uptrend combina dos condiciones (tendencia alcista de
+    largo plazo Y una caída reciente) -- verifica que hace falta AMBAS,
+    no alcanza con una sola.
+    """
+    import pandas as pd
+    import numpy as np
+    from strategies import value_dip_in_uptrend
+
+    n = 260
+    close_with_dip = np.linspace(100, 300, n)
+    close_with_dip[-10:] = close_with_dip[-11] * np.linspace(1.0, 0.93, 10)  # caída ~7% en los últimos 10 días
+    idx = pd.bdate_range("2024-01-01", periods=n)
+    df_dip = pd.DataFrame({"open": close_with_dip, "high": close_with_dip + 1, "low": close_with_dip - 1,
+                           "close": close_with_dip, "volume": 1000}, index=idx)
+    signal_dip = value_dip_in_uptrend(df_dip, trend_ma=200, dip_lookback=10)
+    assert signal_dip.iloc[-1] == 1, "Debería detectar la caída dentro de la tendencia alcista de largo plazo"
+
+    close_no_dip = np.linspace(100, 300, n)  # misma tendencia alcista, sin ninguna caída
+    df_no_dip = pd.DataFrame({"open": close_no_dip, "high": close_no_dip + 1, "low": close_no_dip - 1,
+                              "close": close_no_dip, "volume": 1000}, index=idx)
+    signal_no_dip = value_dip_in_uptrend(df_no_dip, trend_ma=200, dip_lookback=10)
+    assert signal_no_dip.iloc[-1] == 0, "Sin ninguna caída reciente, no debería haber señal aunque la tendencia sea alcista"
+    print("OK: value_dip_in_uptrend exige tendencia alcista Y una caída reciente, no alcanza con una sola condición")
+
+
+def test_walk_forward_validate_returns_expected_structure_on_real_data():
+    """validation.py (walk-forward, citado en el README como el diferencial
+    anti-sobreajuste del proyecto) no tenía ningún test propio."""
+    from data_utils import load_csv
+    from validation import walk_forward_validate
+
+    df = load_csv("real_data/btc_daily.csv")
+    result = walk_forward_validate(df, "momentum", "moderado")
+    assert "retorno_total_pct" in result["in_sample"]
+    assert "retorno_total_pct" in result["out_sample"]
+    assert "degradacion_pct" in result and "advertencia" in result
+    print("OK: walk_forward_validate corre sobre datos reales y devuelve la estructura esperada")
+
+
+def test_walk_forward_validate_warns_on_severe_out_of_sample_degradation():
+    """
+    Fuerza un escenario donde el in-sample es claramente rentable
+    (tendencia alcista limpia) y el out-of-sample es un desastre (flash
+    crash del -80%) -- debe disparar la advertencia de sobreajuste.
+    """
+    import pandas as pd
+    import numpy as np
+    from validation import walk_forward_validate
+
+    n = 200
+    uptrend = np.linspace(100, 200, n // 2)
+    crash = uptrend[-1] * np.linspace(1.0, 0.2, n // 2)
+    close = np.concatenate([uptrend, crash])
+    df = pd.DataFrame({"open": close, "high": close * 1.01, "low": close * 0.99, "close": close, "volume": 1000},
+                       index=pd.bdate_range("2024-01-01", periods=n))
+
+    result = walk_forward_validate(df, "tendencia", "moderado", split_pct=0.5)
+    assert result["in_sample"]["retorno_total_pct"] > 0, "El in-sample (tendencia alcista limpia) debería ser rentable"
+    assert result["degradacion_pct"] is not None and result["degradacion_pct"] > 60
+    assert result["advertencia"] is not None, "Debería advertir sobreajuste ante una degradación tan severa"
+    print("OK: walk_forward_validate advierte sobreajuste cuando el out-of-sample se derrumba respecto al in-sample")
+
+
+def test_rolling_walk_forward_validate_computes_consistency_correctly():
+    from data_utils import load_csv
+    from validation import rolling_walk_forward_validate
+
+    df = load_csv("real_data/btc_daily.csv")
+    result = rolling_walk_forward_validate(df, "momentum", "agresivo", n_windows=4)
+    assert result["n_ventanas"] == 4
+    assert len(result["ventanas"]) == 4
+    n_positive = sum(1 for w in result["ventanas"] if w["retorno_out_sample_pct"] > 0)
+    expected_consistency = round(n_positive / 4 * 100, 1)
+    assert result["consistencia_pct"] == expected_consistency
+    print("OK: rolling_walk_forward_validate calcula la consistencia exactamente como la fracción de ventanas rentables fuera de muestra")
+
+
+def test_rolling_walk_forward_validate_rejects_too_many_windows_for_data_size():
+    import pandas as pd
+    import numpy as np
+    from validation import rolling_walk_forward_validate
+
+    tiny_df = pd.DataFrame({
+        "open": np.linspace(100, 110, 30), "high": np.linspace(101, 111, 30),
+        "low": np.linspace(99, 109, 30), "close": np.linspace(100, 110, 30), "volume": np.ones(30),
+    }, index=pd.bdate_range("2024-01-01", periods=30))
+
+    try:
+        rolling_walk_forward_validate(tiny_df, "momentum", "moderado", n_windows=10)
+        assert False, "Debería fallar: 30 velas / 10 ventanas = 3 velas por ventana, insuficiente"
+    except ValueError:
+        pass
+    print("OK: rolling_walk_forward_validate rechaza pedir más ventanas de las que el dataset puede sostener")
+
+
+def test_run_crisis_stress_test_covers_known_periods_with_real_data():
+    """stress_test.py (citado en el README como validación contra crisis
+    históricas reales) no tenía ningún test propio."""
+    from data_utils import load_csv
+    from stress_test import run_crisis_stress_test, CRISIS_PERIODS
+
+    df = load_csv("real_data/btc_daily.csv")  # 2020-01-02 a 2024-09-17 -- cubre las 4 crisis conocidas
+    result = run_crisis_stress_test(df, "momentum", "agresivo")
+
+    assert set(result.keys()) == set(CRISIS_PERIODS.keys())
+    for name, r in result.items():
+        assert r["cubierto"] is True, f"Se esperaba que {name} estuviera cubierto por el rango de btc_daily.csv"
+        assert "retorno_pct" in r and "retorno_buy_and_hold_pct" in r
+    print("OK: run_crisis_stress_test cubre las 4 crisis históricas conocidas con datos reales de BTC")
+
+
+def test_run_crisis_stress_test_skips_periods_outside_dataset_range():
+    import pandas as pd
+    import numpy as np
+    from stress_test import run_crisis_stress_test
+
+    short_df = pd.DataFrame({
+        "open": np.linspace(100, 110, 40), "high": np.linspace(101, 111, 40),
+        "low": np.linspace(99, 109, 40), "close": np.linspace(100, 110, 40), "volume": np.ones(40),
+    }, index=pd.bdate_range("2024-01-01", periods=40))  # ninguna crisis conocida cae en este rango
+
+    result = run_crisis_stress_test(short_df, "momentum", "moderado")
+    for name, r in result.items():
+        assert r["cubierto"] is False
+        assert "motivo" in r
+    print("OK: run_crisis_stress_test informa (no crashea) los períodos que el dataset no alcanza a cubrir")
+
+
 if __name__ == "__main__":
     tests = [
         test_risk_never_exceeds_profile,
@@ -2059,6 +2246,16 @@ if __name__ == "__main__":
         test_support_snapshot_reports_healthy_session_with_no_warnings,
         test_support_snapshot_flags_tripped_circuit_breaker_and_active_kill_switch,
         test_support_snapshot_flags_reconciliation_mismatch,
+        test_all_strategies_return_valid_binary_signal_on_real_data,
+        test_get_strategy_raises_for_unknown_name,
+        test_trend_following_signal_matches_ma_crossover,
+        test_value_dip_in_uptrend_requires_both_conditions,
+        test_walk_forward_validate_returns_expected_structure_on_real_data,
+        test_walk_forward_validate_warns_on_severe_out_of_sample_degradation,
+        test_rolling_walk_forward_validate_computes_consistency_correctly,
+        test_rolling_walk_forward_validate_rejects_too_many_windows_for_data_size,
+        test_run_crisis_stress_test_covers_known_periods_with_real_data,
+        test_run_crisis_stress_test_skips_periods_outside_dataset_range,
     ]
     failed = 0
     for t in tests:
