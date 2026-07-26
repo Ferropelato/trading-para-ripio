@@ -847,6 +847,21 @@ seguridad de Binance, entre otras detectadas durante la noche). Sigue
 siendo el arranque de la evidencia de "semanas", no la evidencia
 completa, pero ya es más que un smoke test de unos minutos.
 
+**Cero operaciones en 17 horas -- por qué esto es esperable, no un
+síntoma de que algo esté roto**: revisando los logs, la pausa por
+noticias solo estuvo activa ~1 hora en total (2 eventos de 30 minutos
+cada uno) -- no explica las otras ~16 horas sin operar. La razón real es
+otra: las estrategias de este proyecto están pensadas para velas
+**diarias** (medias móviles de 20 a 50 "días"). En un solo día calendario
+real, el precio se mueve relativamente poco comparado con el historial de
+años que ya tienen esas medias incorporado -- no alcanza para generar un
+cruce nuevo o una ruptura. Hace falta que pasen días reales, no solo
+horas, para que estas estrategias en particular tengan motivo de generar
+una señal nueva. Esto confirma en la práctica la limitación ya
+documentada sobre el modo `--live-prices` (un ticker da un precio, no un
+candle diario real) -- vale la pena tenerlo listo como respuesta si en la
+demo preguntan "¿por qué no operó nada en tantas horas?".
+
 
 ## Visión: más allá de cripto (prueba de concepto, no una promesa)
 
