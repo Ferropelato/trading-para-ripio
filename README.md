@@ -1124,6 +1124,62 @@ no se rechaza.
 
 93/93 tests pasando.
 
+## Dieciochoava ronda: feedback probando el mockup a mano + roadmap de producto
+
+Se probó el mockup interactivo directamente (no solo revisión de código), lo
+que sacó a la luz dos huecos de UX que un test automatizado no detecta:
+
+- **Estética genérica en vez de la de Ripio.** Se extrajeron los colores
+  reales de ripio.com (violeta eléctrico `#7908FF`, negro puro, rosa
+  `#FF7FEB` como acento, botones tipo píldora, tipografía Geist) y se
+  reemplazó la paleta anterior. Regla aprendida: para un mockup que se va
+  a mostrar como "así se vería integrado", adivinar la estética no alcanza
+  -- hay que verificarla contra la marca real.
+- **Cambiar un monto o un perfil se aplicaba al toque, sin confirmación.**
+  Riesgoso en un producto real (un toque de más reasigna capital). Se
+  agregó un paso explícito de "Confirmar asignación" / "Confirmar cambio
+  de perfil" en el dashboard y en Ajustes -- el valor mostrado durante el
+  arrastre queda marcado como "sin confirmar" hasta que el usuario lo
+  confirma a propósito.
+- **No había evidencia visual de que el motor estuviera haciendo algo.**
+  Se agregó una lista de posiciones abiertas que se mueve sola (precio
+  simulado, P&L recalculado) cada pocos segundos, y el gráfico chico del
+  estado ahora se redibuja según ese movimiento en vez de ser una imagen
+  fija -- pausar "congela" visualmente las posiciones, reanudar las
+  vuelve a mover.
+- **El historial mostraba "23 operaciones, 14/9" pero la lista real tenía
+  10 filas sin datos para expandir.** Se cargaron las 23 operaciones
+  reales (14 ganadoras + 9 perdedoras, incluyendo detalle de precio y
+  motivo por cada una) y el resumen ahora se calcula desde esos datos en
+  vez de estar tipeado a mano -- no puede volver a desincronizarse. Las
+  pestañas de filtro (Ganancias/Pérdidas) y el detalle por operación al
+  tocarla ahora funcionan de verdad.
+- **Pausar no modificaba el saldo mostrado.** Ahora, al pausar, el saldo y
+  la asignación se actualizan con el resultado acumulado del lapso
+  (ganancia o pérdida), y la pantalla de detalle de pausa muestra un
+  resumen real (tiempo activo, posiciones vigiladas, resultado del lapso)
+  en vez de solo un texto genérico.
+
+**Pregunta de producto real que surgió probándolo**: al cambiar de perfil
+de riesgo con posiciones ya abiertas, éstas siguieron exactamente igual.
+Se confirmó que es el comportamiento correcto (no un bug): `position_size()`
+se calcula una sola vez, al momento de abrir la operación, y ese cálculo
+queda fijo para ella -- un cambio de perfil rige las operaciones
+*siguientes*, nunca modifica retroactivamente una posición ya abierta.
+
+**Tres ideas de producto quedaron documentadas como roadmap** (no
+construidas todavía, por decisión explícita de priorizar cerrar la
+propuesta antes de sumar alcance nuevo): un freno simétrico al circuit
+breaker que asegure ganancias al llegar a una meta (hoy el circuit
+breaker solo protege a la baja), un modo manual/asistido para el usuario
+que prefiere elegir sus propias operaciones usando la misma
+infraestructura de riesgo, y soporte real para que un mismo usuario opere
+varios pares a la vez bajo un único cupo de posiciones compartido (hoy
+cada sesión en vivo opera un solo par -- así corren, por separado,
+BTC_USDC y ETH_USDC ahora mismo). Detalle de las tres en
+`propuesta_ripio_trading_integrado.md`, sección "Ideas para próximas
+iteraciones".
+
 
 ## Notas importantes (leer antes de avanzar)
 
