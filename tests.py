@@ -41,6 +41,34 @@ def test_position_size_never_exceeds_capital():
     print("OK: el tamaño de posición nunca excede el capital disponible")
 
 
+def test_position_size_capped_by_capital_survives_slippage_and_commission():
+    """Bug real visto en vivo (ETH_USDC, 17-jul): cuando el tope de capital es
+    el que termina definiendo las unidades, el bróker ejecuta con slippage y
+    suma comisión encima del precio "limpio" que usó position_size(). Sin
+    margen de seguridad, esa orden queda garantizada al rechazo por saldo
+    insuficiente -- el tope pensado como red de contención terminaba
+    bloqueando la operación por completo."""
+    from broker import PaperBroker
+
+    profile = get_profile("moderado")
+    capital = 1000.0
+    entry_price = 2000.0
+    atr = 1.0  # ATR chico a propósito -> el sizing por riesgo pide de más y el tope de capital termina mandando
+
+    sizing = position_size(capital, entry_price, atr, profile)
+    assert sizing["unidades"] * entry_price < capital, (
+        "El tope de capital debe dejar margen para slippage/comisión, no usar el 100% del capital"
+    )
+
+    broker = PaperBroker(initial_balance=capital)
+    broker.set_price("ETH_USDC", entry_price)
+    order = broker.place_order("ETH_USDC", "buy", sizing["unidades"])
+    assert order["status"] != "rejected", (
+        f"La orden fue rechazada pese al margen de seguridad: {order.get('motivo')}"
+    )
+    print("OK: el tope de capital deja margen y la orden no se rechaza por slippage/comisión")
+
+
 def test_zero_atr_returns_zero_units():
     profile = get_profile("moderado")
     sizing = position_size(1000.0, 50.0, 0.0, profile)
@@ -2206,6 +2234,7 @@ if __name__ == "__main__":
     tests = [
         test_risk_never_exceeds_profile,
         test_position_size_never_exceeds_capital,
+        test_position_size_capped_by_capital_survives_slippage_and_commission,
         test_zero_atr_returns_zero_units,
         test_validation_detects_corrupt_data,
         test_validation_passes_clean_data,

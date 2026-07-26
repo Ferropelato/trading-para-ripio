@@ -1086,6 +1086,44 @@ exactamente este escenario.
 
 92/92 tests pasando.
 
+## Diecisieteava ronda: bug real detectado por la corrida en vivo, no por un test
+
+Con las sesiones de paper trading en vivo (`BTC_USDC`, `ETH_USDC`) corriendo
+sin cortes desde hacía más de 23 horas, `ETH_USDC` generó su primera señal
+de compra (`buy 0.522411 ETH_USDC`) -- y el bróker la rechazó dos veces
+seguidas por **saldo insuficiente**, pese a que la cuenta tenía capital
+disponible. Esto es exactamente el tipo de caso raro que una corrida corta
+o un backtest de escritorio difícilmente expone, y que solo aparece
+dejando el sistema corriendo contra precios reales el tiempo suficiente.
+
+**Causa real:** `risk_manager.position_size()` calcula un tope de "no
+invertir más capital del que hay disponible" (`max_units_by_capital =
+capital / entry_price`) usando el precio limpio, sin slippage ni comisión.
+Cuando ese tope es el que termina definiendo las unidades a comprar (típico
+cuando el ATR es chico y el cálculo por riesgo pediría de más), el
+`trade_value` resultante es *exactamente* igual al capital disponible. Pero
+`PaperBroker` (y cualquier bróker real) ejecuta con `exec_price = precio *
+(1 + slippage)` y suma una comisión encima -- así que el costo real
+termina siendo *mayor* que el capital, y la orden se rechaza siempre que
+este tope se activa. El tope, pensado como red de seguridad, terminaba
+bloqueando la operación por completo en vez de protegerla.
+
+Reproducido de forma aislada y confirmado (capital=$1000, precio=$2000,
+ATR=1, perfil moderado -> unidades=0.5, costo limpio=$1000.00 exacto,
+costo real con slippage+comisión=$1001.50 -> rechazado).
+
+**Corrección:** se agregó un margen de seguridad chico (0.5% por defecto,
+parámetro `capital_safety_margin_pct` en `position_size()`) al tope de
+capital, para que quede lugar para el slippage y la comisión que se suman
+en la ejecución real. No afecta el caso normal (donde el tope de capital no
+es el que decide), solo el caso límite donde antes garantizaba el rechazo.
+Test de regresión agregado (`test_position_size_capped_by_capital_survives_slippage_and_commission`)
+que reproduce el escenario exacto visto en vivo y verifica, contra un
+`PaperBroker` real con slippage y comisión configurados, que la orden ya
+no se rechaza.
+
+93/93 tests pasando.
+
 
 ## Notas importantes (leer antes de avanzar)
 

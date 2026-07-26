@@ -13,7 +13,8 @@ porque los costos fijos se comen el resultado.
 
 def position_size(capital: float, entry_price: float, atr: float,
                    profile: dict, min_trade_value: float = 0.0,
-                   lot_step: float = None) -> dict:
+                   lot_step: float = None,
+                   capital_safety_margin_pct: float = 0.005) -> dict:
     """
     Devuelve un dict con: unidades, riesgo_monetario, stop_loss, take_profit,
     y viable (False si la operación no alcanza el mínimo operable).
@@ -30,8 +31,13 @@ def position_size(capital: float, entry_price: float, atr: float,
     stop_loss = entry_price - stop_distance
     take_profit = entry_price + take_profit_distance
 
-    # No permitir invertir más capital del que hay disponible
-    max_units_by_capital = capital / entry_price
+    # No permitir invertir más capital del que hay disponible. Se deja un
+    # margen chico (0.5% por defecto) porque este cálculo usa el precio
+    # "limpio", pero el bróker ejecuta con slippage y suma comisión encima:
+    # sin margen, cuando este tope es el que termina definiendo las unidades,
+    # la orden queda garantizada al rechazo por saldo insuficiente en la
+    # ejecución real (visto en vivo con ETH_USDC).
+    max_units_by_capital = (capital * (1 - capital_safety_margin_pct)) / entry_price
     units = min(units, max_units_by_capital)
 
     # Redondear al step de lote del instrumento/bróker (ej. 0.001 BTC, 1 acción)
