@@ -1740,6 +1740,106 @@ def test_live_engine_partial_buy_fill_registers_position_with_actual_units():
     print("OK: un llenado parcial en la compra registra la posición con las unidades REALMENTE compradas")
 
 
+def test_trade_history_log_persists_across_process_restarts():
+    """
+    A diferencia del estado de posiciones (una FOTO del momento), el
+    historial de operaciones es append-only: acá se simula un "reinicio
+    del proceso" abriendo una SEGUNDA instancia de TradeHistoryLog contra
+    el mismo archivo, y debe seguir viendo todo lo escrito antes, más lo
+    nuevo -- esto es lo que permite operar de forma intermitente (parar y
+    retomar días o semanas después) sin perder el reporte acumulado.
+    """
+    import os
+    import tempfile
+    from trade_history import TradeHistoryLog
+
+    fd, path = tempfile.mkstemp(suffix="_trade_history_test.csv")
+    os.close(fd)
+    os.remove(path)
+    try:
+        log1 = TradeHistoryLog(path)
+        log1.append(symbol="BTC_USDC", side="buy", motivo="apertura", units=0.01,
+                     price=60000, pnl=None, balance_resultante=1000.0)
+
+        # "Reinicio": una instancia nueva del log contra el mismo archivo
+        log2 = TradeHistoryLog(path)
+        log2.append(symbol="BTC_USDC", side="sell", motivo="take_profit", units=0.01,
+                     price=61000, pnl=10.0, balance_resultante=1010.0)
+
+        rows = TradeHistoryLog(path).load_all()
+        assert len(rows) == 2, "Debe conservar lo escrito antes del 'reinicio' más lo nuevo"
+        assert rows[0]["side"] == "buy" and rows[1]["side"] == "sell"
+        assert rows[1]["pnl"] == "10.0"
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
+    print("OK: el historial de operaciones se acumula entre reinicios simulados del proceso")
+
+
+def test_live_engine_records_buy_and_sell_in_trade_history():
+    """
+    Verifica que abrir y cerrar una posición queda registrado en el
+    historial persistente con el motivo y el resultado correctos.
+    """
+    import os
+    import tempfile
+    from datetime import datetime, timezone
+    from live_runner import _LiveEngine
+    from broker import PaperBroker
+    from risk_profiles import get_profile
+    from safety import CircuitBreaker, ManualKillSwitch
+    from health import Heartbeat
+    from state_store import StateStore
+    from trade_history import TradeHistoryLog
+    from alerts import ConsoleAlertChannel
+    from app_logger import get_logger
+
+    fd, state_path = tempfile.mkstemp(suffix="_live_engine_history_state.json")
+    os.close(fd)
+    os.remove(state_path)
+    fd2, history_path = tempfile.mkstemp(suffix="_live_engine_history.csv")
+    os.close(fd2)
+    os.remove(history_path)
+    kill_switch_path = ".KILL_SWITCH_test_live_engine_history"
+
+    try:
+        broker = PaperBroker(initial_balance=1000.0)
+        trade_history = TradeHistoryLog(history_path)
+        engine = _LiveEngine(
+            broker, "TEST_SYM", get_profile("moderado"), "momentum", "moderado",
+            ConsoleAlertChannel(), ManualKillSwitch(control_file=kill_switch_path),
+            CircuitBreaker(), Heartbeat(max_staleness_seconds=99999),
+            StateStore(path=state_path), reconcile_every=1000, log=get_logger("test_live_engine_history"),
+            trade_history=trade_history,
+        )
+
+        now = datetime.now(timezone.utc)
+        broker.set_price("TEST_SYM", 100.0)
+        engine.process_tick(now, 100.0, current_atr=2.0, sig=1)  # abre posición
+        assert "TEST_SYM" in engine.internal_positions
+
+        # Precio entre el stop loss y el take profit calculados para esta
+        # entrada -- así la salida se dispara por la señal (sig=0), no por
+        # tocar alguno de los dos frenos de precio.
+        broker.set_price("TEST_SYM", 102.0)
+        engine.process_tick(now, 102.0, current_atr=2.0, sig=0)  # señal de salida
+        assert "TEST_SYM" not in engine.internal_positions
+
+        rows = trade_history.load_all()
+        assert len(rows) == 2, f"Esperaba 2 operaciones registradas (apertura + cierre), hubo {len(rows)}"
+        assert rows[0]["side"] == "buy" and rows[0]["motivo"] == "apertura"
+        assert rows[1]["side"] == "sell" and rows[1]["motivo"] == "señal_estrategia"
+        assert float(rows[1]["pnl"]) > 0, "Compró a 100 y vendió a 102 -- el resultado registrado debe ser positivo"
+    finally:
+        if os.path.exists(state_path):
+            os.remove(state_path)
+        if os.path.exists(history_path):
+            os.remove(history_path)
+        if os.path.exists(kill_switch_path):
+            os.remove(kill_switch_path)
+    print("OK: _LiveEngine registra apertura y cierre en el historial persistente con el resultado correcto")
+
+
 def test_load_many_simultaneous_circuit_breakers_stay_isolated_and_detected():
     """
     Fase 3d: simula un shock de mercado compartido que dispara el circuit
@@ -2308,6 +2408,8 @@ if __name__ == "__main__":
         test_paper_broker_simulate_additional_fill_completes_open_order,
         test_live_engine_open_buy_order_resolves_without_double_ordering,
         test_live_engine_partial_buy_fill_registers_position_with_actual_units,
+        test_trade_history_log_persists_across_process_restarts,
+        test_live_engine_records_buy_and_sell_in_trade_history,
         test_load_many_simultaneous_circuit_breakers_stay_isolated_and_detected,
         test_manual_kill_switch_reason_returns_saved_message,
         test_live_engine_process_tick_with_active_kill_switch_does_not_crash,
@@ -2330,7 +2432,12 @@ if __name__ == "__main__":
     for t in tests:
         try:
             t()
-        except AssertionError as e:
+        except Exception as e:
+            # No solo AssertionError: un test que depende de red (ej. el
+            # ticker público de Ripio) puede tirar un error de conexión en
+            # vez de una aserción fallida -- si eso corta el script entero,
+            # nunca nos enteramos del resultado de ningún test que venga
+            # después. Un test roto no debe esconder a los demás.
             failed += 1
-            print(f"FALLÓ: {t.__name__} -> {e}")
+            print(f"FALLÓ: {t.__name__} -> {type(e).__name__}: {e}")
     print(f"\n{len(tests) - failed}/{len(tests)} tests pasaron")

@@ -38,6 +38,7 @@ from alerts import ConsoleAlertChannel, format_signal_alert
 from safety import ManualKillSwitch, CircuitBreaker
 from health import Heartbeat
 from state_store import StateStore
+from trade_history import TradeHistoryLog
 from reconciliation import reconcile
 from regime import apply_regime_filter
 from multi_timeframe import apply_multi_timeframe_filter
@@ -61,7 +62,7 @@ class _LiveEngine:
 
     def __init__(self, broker, symbol, profile, strategy_name, profile_name,
                  alert_channel, kill_switch, circuit_breaker, heartbeat,
-                 state_store, reconcile_every, log, news_guard=None):
+                 state_store, reconcile_every, log, news_guard=None, trade_history=None):
         self.broker = broker
         self.symbol = symbol
         self.profile = profile
@@ -77,6 +78,12 @@ class _LiveEngine:
         # Opcional: solo tiene sentido en polling en vivo (run_live_polling),
         # nunca en replay historico -- ver news_monitor.py.
         self.news_guard = news_guard
+        # Opcional (ver trade_history.py): a diferencia de state_store, esto
+        # es un registro append-only que sobrevive intacto a que el proceso
+        # se pare y arranque muchas veces -- pensado para uso intermitente
+        # (activar hoy, pausar, retomar en semanas) con un reporte único de
+        # todo lo operado en el medio.
+        self.trade_history = trade_history
 
         saved_state = state_store.load()
         self.stop_loss = saved_state["extra"].get("stop_loss") if saved_state["saved_at"] else None
@@ -98,6 +105,14 @@ class _LiveEngine:
             return cash + positions[self.symbol]["unidades"] * price
         return cash
 
+    def _record_trade(self, side, motivo, units, price, pnl=None):
+        if self.trade_history is None or not units or units <= 0:
+            return
+        self.trade_history.append(
+            symbol=self.symbol, side=side, motivo=motivo, units=units,
+            price=price, pnl=pnl, balance_resultante=self.broker.get_balance(),
+        )
+
     def _apply_buy_fill(self, filled_units, price_filled, sizing):
         """Registra (o suma a) la posición interna con lo EFECTIVAMENTE
         comprado -- nunca con la cantidad pedida (ver Fase 3c)."""
@@ -106,20 +121,24 @@ class _LiveEngine:
         self.stop_loss = sizing["stop_loss"]
         self.take_profit = sizing["take_profit"]
         self.internal_positions[self.symbol] = {"unidades": filled_units, "precio_entrada": price_filled}
+        self._record_trade("buy", "apertura", filled_units, price_filled)
 
-    def _apply_sell_fill(self, filled_units):
+    def _apply_sell_fill(self, filled_units, price_filled=None, motivo=None):
         """Reduce (o cierra del todo) la posición interna según lo
         EFECTIVAMENTE vendido -- una venta parcial deja el resto abierto
         con el mismo stop loss/take profit."""
         pos = self.internal_positions.get(self.symbol)
         if not pos or filled_units <= 0:
             return
+        entry_price = pos["precio_entrada"]
         remaining = pos["unidades"] - filled_units
         if remaining <= 1e-9:
             self.stop_loss, self.take_profit = None, None
             self.internal_positions.pop(self.symbol, None)
         else:
             pos["unidades"] = remaining
+        pnl = (price_filled - entry_price) * filled_units if price_filled is not None else None
+        self._record_trade("sell", motivo, filled_units, price_filled, pnl=pnl)
 
     def _resolve_pending_order(self):
         """
@@ -151,7 +170,8 @@ class _LiveEngine:
         if side == "buy":
             self._apply_buy_fill(filled_units, status_order.get("price"), self.pending_order["sizing"])
         else:
-            self._apply_sell_fill(filled_units)
+            self._apply_sell_fill(filled_units, price_filled=status_order.get("price"),
+                                   motivo=self.pending_order.get("motivo"))
 
         self.log.info("Orden pendiente %s se resolvió: %s (%s unidades)", order_id, status, filled_units)
         self.pending_order = None
@@ -218,11 +238,12 @@ class _LiveEngine:
                 filled_units = order.get("units") or 0
 
                 if status == "open":
-                    self.pending_order = {"order_id": order.get("broker_order_id") or order.get("order_id"), "side": "sell"}
+                    self.pending_order = {"order_id": order.get("broker_order_id") or order.get("order_id"),
+                                           "side": "sell", "motivo": motivo}
                     self.log.info("Orden de venta (%s) quedó abierta -- se revisará en el próximo tick", motivo)
                 else:
                     self.log.info("Cierre de posición (%s): %s", motivo, order)
-                    self._apply_sell_fill(filled_units)
+                    self._apply_sell_fill(filled_units, price_filled=order.get("price"), motivo=motivo)
                     if status == "partially_filled":
                         self.log.warning("Venta parcial en %s: %s/%s unidades -- se sigue adelante con lo efectivamente vendido",
                                           self.symbol, filled_units, pos["unidades"])
@@ -286,7 +307,8 @@ def run_live(csv_path: str, strategy_name: str, profile_name: str,
              replay_delay_seconds: float = 0.0, max_ticks: int = None,
              state_path: str = "engine_state.json", reconcile_every: int = 10,
              max_drawdown_pct: float = 15.0, max_daily_loss_pct: float = 5.0,
-             regime_filter: bool = True, multi_timeframe_filter: bool = True):
+             regime_filter: bool = True, multi_timeframe_filter: bool = True,
+             trade_history_path: str = None):
     log = get_logger("live_runner")
     log.info("Iniciando runner en vivo (modo paper trading, replay histórico) — %s / %s sobre %s",
               strategy_name, profile_name, symbol)
@@ -307,12 +329,14 @@ def run_live(csv_path: str, strategy_name: str, profile_name: str,
     atr = _atr(df)
 
     broker = PaperBroker(initial_balance=initial_balance)
+    trade_history = TradeHistoryLog(trade_history_path) if trade_history_path else None
     engine = _LiveEngine(
         broker, symbol, profile, strategy_name, profile_name,
         ConsoleAlertChannel(), ManualKillSwitch(),
         CircuitBreaker(max_drawdown_pct, max_daily_loss_pct),
         Heartbeat(max_staleness_seconds=3600),  # en un loop real, ajustar según frecuencia del feed
         StateStore(path=state_path), reconcile_every, log,
+        trade_history=trade_history,
     )
     shutdown_requested = _make_shutdown_flag(log)
 
@@ -343,7 +367,7 @@ def run_live_polling(price_source, symbol: str, strategy_name: str, profile_name
                       state_path: str = "engine_state.json", reconcile_every: int = 10,
                       max_drawdown_pct: float = 15.0, max_daily_loss_pct: float = 5.0,
                       regime_filter: bool = True, multi_timeframe_filter: bool = True,
-                      max_history_rows: int = 5000, news_guard=None):
+                      max_history_rows: int = 5000, news_guard=None, trade_history_path: str = None):
     """
     Paper trading contra un feed de precios REAL (no replay histórico): en
     cada intervalo de `poll_interval_seconds` pide el precio actual a
@@ -382,13 +406,14 @@ def run_live_polling(price_source, symbol: str, strategy_name: str, profile_name
     profile = get_profile(profile_name)
 
     broker = PaperBroker(initial_balance=initial_balance)
+    trade_history = TradeHistoryLog(trade_history_path) if trade_history_path else None
     engine = _LiveEngine(
         broker, symbol, profile, strategy_name, profile_name,
         ConsoleAlertChannel(), ManualKillSwitch(),
         CircuitBreaker(max_drawdown_pct, max_daily_loss_pct),
         Heartbeat(max_staleness_seconds=max(poll_interval_seconds * 5, 300)),
         StateStore(path=state_path), reconcile_every, log,
-        news_guard=news_guard,
+        news_guard=news_guard, trade_history=trade_history,
     )
     shutdown_requested = _make_shutdown_flag(log)
 
@@ -456,6 +481,10 @@ def main():
                          help="[modo replay] Segundos de pausa entre cada 'vela' simulada (0 = lo más rápido posible)")
     parser.add_argument("--state-path", type=str, default="engine_state.json",
                          help="Ruta del archivo de estado persistente (posiciones, stop/take profit)")
+    parser.add_argument("--trade-history-path", type=str, default=None,
+                         help="Ruta de un CSV donde se registra cada operación cerrada, acumulado entre reinicios "
+                              "(pensado para uso intermitente: parar y retomar días o semanas después y tener un "
+                              "único reporte de todo lo operado en el medio). Si no se pasa, no se registra.")
     parser.add_argument("--max-drawdown", type=float, default=15.0)
     parser.add_argument("--max-daily-loss", type=float, default=5.0)
     parser.add_argument("--no-regime-filter", action="store_true",
@@ -510,7 +539,7 @@ def main():
             max_ticks=args.max_ticks, state_path=args.state_path,
             max_drawdown_pct=args.max_drawdown, max_daily_loss_pct=args.max_daily_loss,
             regime_filter=not args.no_regime_filter, multi_timeframe_filter=not args.no_mtf_filter,
-            news_guard=news_guard,
+            news_guard=news_guard, trade_history_path=args.trade_history_path,
         )
     else:
         run_live(
@@ -520,6 +549,7 @@ def main():
             max_drawdown_pct=args.max_drawdown, max_daily_loss_pct=args.max_daily_loss,
             regime_filter=not args.no_regime_filter,
             multi_timeframe_filter=not args.no_mtf_filter,
+            trade_history_path=args.trade_history_path,
         )
 
 

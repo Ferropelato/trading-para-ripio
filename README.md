@@ -1180,6 +1180,50 @@ BTC_USDC y ETH_USDC ahora mismo). Detalle de las tres en
 `propuesta_ripio_trading_integrado.md`, sección "Ideas para próximas
 iteraciones".
 
+## Diecinueveava ronda: historial persistente entre reinicios + robustez del test runner
+
+Surgió de una pregunta de producto directa: si el usuario (o, en esta
+etapa, yo probando la demo) cierra la app o apaga la máquina y el motor se
+para, ¿se pierde la continuidad? La respuesta correcta para un producto
+real es que el motor de decisión vive en un servidor, no en el dispositivo
+del usuario -- eso ya estaba resuelto por diseño (`UserSessionManager`,
+`SharedPriceFeed`, etc. son conceptos de backend). Pero probar esa
+respuesta reveló un hueco real: **el registro de operaciones cerradas no
+sobrevivía a un reinicio del proceso.**
+
+`state_store.py` (`StateStore`/`SQLiteStateStore`) persiste una FOTO del
+momento -- posiciones abiertas y capital --, pero nunca guardó el detalle
+de cada operación ya cerrada; eso solo vivía en la memoria del bróker
+(`PaperBroker.orders`, que se resetea al reiniciar) y como texto libre en
+el log. Para un uso intermitente real (activarlo hoy, pausar, retomar en
+semanas, y en algún momento pedir un reporte de todo lo operado en el
+medio para soporte) esto no alcanza -- un reinicio de proceso volvía
+invisible todo lo operado antes de él.
+
+**Se agregó `trade_history.py`** (`TradeHistoryLog`): un registro
+append-only en CSV, separado del estado de posiciones a propósito, que
+graba cada apertura y cierre (símbolo, motivo, unidades, precio,
+resultado, saldo resultante) con marca de tiempo. Al ser append-only y
+vivir en su propio archivo, sobrevive intacto a cualquier cantidad de
+reinicios del proceso -- se probó abriendo una segunda instancia contra el
+mismo archivo simulando un reinicio, y el historial acumulado sigue
+completo. Conectado a `_LiveEngine` (activación opcional vía
+`--trade-history-path`, sin romper compatibilidad con quien no lo pasa) en
+los cuatro puntos donde se resuelve una compra o venta (inmediata o tras
+quedar pendiente), sin duplicar la lógica de cálculo de resultado en cada
+uno.
+
+**De paso, se encontró y corrigió un problema real en el propio test
+runner**: el loop de `tests.py` solo atrapaba `AssertionError` -- un test
+que depende de red (el ticker público de Ripio) puede tirar un error de
+conexión en vez de una aserción fallida, y como ese tipo de excepción no
+se atrapaba, cortaba el script entero antes de llegar a los tests
+siguientes, escondiendo su resultado por completo. Se generalizó a atrapar
+cualquier excepción, así un test roto o con mala suerte de red nunca vuelve
+a esconder a los demás.
+
+95/95 tests pasando.
+
 
 ## Notas importantes (leer antes de avanzar)
 
