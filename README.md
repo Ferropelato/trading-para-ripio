@@ -1066,7 +1066,25 @@ contra un cálculo hecho aparte, sobre la Series original sin ese
 problema), sin necesitar debug manual. Corregido construyendo la Series
 ya con el índice final desde el principio.
 
-91/91 tests pasando.
+**Segundo bug real encontrado, este sí del proyecto** (no de un test):
+al verificar manualmente `run_backtest.py` (el script de entrada
+principal, también sin ningún test propio hasta esta ronda), `python
+run_backtest.py --config config_ejemplo.yaml` crasheaba con
+`UnicodeDecodeError` en esta máquina Windows. Causa: `open(args.config)`
+sin `encoding` explícito abre con el codepage del sistema (cp1252 acá) en
+vez de UTF-8, y `config_ejemplo.yaml` tiene tildes en sus comentarios.
+**El CI nunca lo detectó porque corre en Linux** (UTF-8 por defecto) --
+un recordatorio concreto de que "los tests pasan en CI" no es lo mismo
+que "funciona en la máquina del usuario". Se corrigió agregando
+`encoding="utf-8"` explícito ahí, y de paso en `safety.py`
+(`ManualKillSwitch.activate`/`reason`, que tenía el mismo patrón al
+guardar el motivo del kill-switch -- no crasheaba hoy porque escribe y
+lee en la misma máquina, pero rompería si el archivo se crea en Windows
+y se lee dentro de un container Linux, o al revés). Se agregó un test
+para `run_backtest.py --config` (tampoco tenía ninguno) que reproduce
+exactamente este escenario.
+
+92/92 tests pasando.
 
 
 ## Notas importantes (leer antes de avanzar)

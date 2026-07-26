@@ -75,7 +75,13 @@ class ManualKillSwitch:
         return os.path.exists(self.control_file)
 
     def activate(self, reason: str = "Detenido manualmente"):
-        with open(self.control_file, "w") as f:
+        # encoding explícito: sin esto, Python escribe con el codepage del
+        # sistema (cp1252 en Windows) -- si este archivo se crea en Windows
+        # y despues se lee dentro de un container Linux (Docker, UTF-8 por
+        # defecto), o al reves, un motivo con tildes puede leerse mal o
+        # directamente fallar. Mismo tipo de bug que el de --config en
+        # run_backtest.py, encontrado en la misma auditoria.
+        with open(self.control_file, "w", encoding="utf-8") as f:
             f.write(reason)
         log.warning("KILL-SWITCH MANUAL ACTIVADO: %s", reason)
 
@@ -89,7 +95,7 @@ class ManualKillSwitch:
         """Devuelve el motivo guardado al activar el kill-switch (None si no está activo)."""
         if not self.is_active():
             return None
-        with open(self.control_file) as f:
+        with open(self.control_file, encoding="utf-8") as f:
             return f.read().strip()
 
 

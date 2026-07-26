@@ -66,7 +66,12 @@ def main():
 
     # El YAML pisa los defaults
     if args.config:
-        with open(args.config) as f:
+        # encoding explícito: sin esto, en Windows Python abre con el
+        # codepage del sistema (cp1252 acá) en vez de UTF-8, y crashea con
+        # UnicodeDecodeError apenas el YAML tiene una tilde -- exactamente
+        # lo que tiene config_ejemplo.yaml. El CI corre en Linux (default
+        # UTF-8), por eso nunca se detectó ahí.
+        with open(args.config, encoding="utf-8") as f:
             yaml_params = yaml.safe_load(f) or {}
         params.update(yaml_params)
         log.info("Configuración cargada desde %s", args.config)

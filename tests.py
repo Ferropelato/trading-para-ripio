@@ -2163,6 +2163,45 @@ def test_run_crisis_stress_test_skips_periods_outside_dataset_range():
     print("OK: run_crisis_stress_test informa (no crashea) los períodos que el dataset no alcanza a cubrir")
 
 
+def test_run_backtest_config_yaml_with_accents_does_not_crash():
+    """
+    Regresión de un bug real: `python run_backtest.py --config config_ejemplo.yaml`
+    abría el YAML con `open(args.config)` sin encoding explícito -- en
+    Windows eso usa el codepage del sistema (cp1252) en vez de UTF-8, y
+    crasheaba con UnicodeDecodeError apenas el archivo tenía una tilde
+    (como config_ejemplo.yaml, que las tiene en sus comentarios). El CI
+    corre en Linux (UTF-8 por defecto), por eso nunca se detectó ahí --
+    esto no se hubiera visto sin correr el proyecto en Windows de verdad.
+    """
+    import sys
+    import os
+    import tempfile
+    import run_backtest
+
+    fd, out_path = tempfile.mkstemp(suffix="_rb_config_test.png")
+    os.close(fd)
+    os.remove(out_path)
+    fd2, html_path = tempfile.mkstemp(suffix="_rb_config_test.html")
+    os.close(fd2)
+    os.remove(html_path)
+
+    old_argv = sys.argv
+    try:
+        sys.argv = [
+            "run_backtest.py", "--config", "config_ejemplo.yaml",
+            "--csv", "real_data/aapl_daily.csv", "--out", out_path, "--html-report", html_path,
+        ]
+        run_backtest.main()  # no debe tirar UnicodeDecodeError
+        assert os.path.exists(out_path), "Debería haber generado el gráfico"
+        assert os.path.exists(html_path), "Debería haber generado el reporte HTML"
+    finally:
+        sys.argv = old_argv
+        for p in (out_path, html_path):
+            if os.path.exists(p):
+                os.remove(p)
+    print("OK: run_backtest.py --config lee un YAML con tildes sin crashear (regresión de encoding)")
+
+
 if __name__ == "__main__":
     tests = [
         test_risk_never_exceeds_profile,
@@ -2256,6 +2295,7 @@ if __name__ == "__main__":
         test_rolling_walk_forward_validate_rejects_too_many_windows_for_data_size,
         test_run_crisis_stress_test_covers_known_periods_with_real_data,
         test_run_crisis_stress_test_skips_periods_outside_dataset_range,
+        test_run_backtest_config_yaml_with_accents_does_not_crash,
     ]
     failed = 0
     for t in tests:
