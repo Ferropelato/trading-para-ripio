@@ -832,11 +832,20 @@ ambos. Comportamiento esperado, no un bug.
 **Limitación honesta**: esto corre en la PC de desarrollo, no en un
 servidor. "Paper trading en vivo durante semanas" (pendiente real,
 sección de próximos pasos) necesita que la máquina se mantenga prendida
-todo ese tiempo -- si se apaga o suspende, el proceso se corta. Esto es
-el arranque de esa evidencia, no la evidencia completa. El paso
+todo ese tiempo -- si se apaga o suspende, el proceso se corta. El paso
 siguiente real sería migrar esto a una VPS chica y barata (o a un
 scheduled job) para que corra sin depender de que una laptop personal
 quede encendida.
+
+**Actualización**: ambas sesiones llevan **17+ horas corriendo sin
+interrupción**, sobreviviendo picos de tráfico real (varios 429 de rate
+limit de Ripio durante desarrollo intensivo, manejados sin caerse -- el
+comportamiento de resiliencia diseñado funcionando en la práctica, no
+solo en un test) y siguen reaccionando en vivo a noticias reales del
+sector cada vez que aparecen (el cierre de un exchange, prácticas de
+seguridad de Binance, entre otras detectadas durante la noche). Sigue
+siendo el arranque de la evidencia de "semanas", no la evidencia
+completa, pero ya es más que un smoke test de unos minutos.
 
 
 ## Visión: más allá de cripto (prueba de concepto, no una promesa)
