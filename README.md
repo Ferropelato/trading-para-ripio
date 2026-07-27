@@ -1485,25 +1485,39 @@ Primera de las tres ideas documentadas como roadmap (ronda 17) que pasa a
 ser código real: un freno simétrico al circuit breaker, pero a la suba.
 El circuit breaker solo protegía contra pérdidas (drawdown desde el pico,
 o pérdida diaria); no había forma de decirle al motor "si llegás a tal
-ganancia, pausá y dejame decidir si sigo expuesto o no".
+ganancia, hacé algo para asegurarla".
 
-- **`safety.ProfitLock`**: se define con una meta (`target_pct`) y un
-  capital de referencia (`reference_capital`, el punto de partida contra
-  el que se mide la ganancia -- a propósito NO el pico histórico como el
-  circuit breaker, sino "desde que empecé a vigilar"). Una vez activado,
-  se queda activado (no se reactiva solo si el capital vuelve a bajar) --
-  hace falta una decisión explícita para volver a operar, igual que el
-  circuit breaker.
-- **Mismo alcance que el circuit breaker**: bloquea posiciones *nuevas*,
-  nunca toca una posición ya abierta (sigue con su stop loss/take profit
-  normal).
-- **Aplicada la lección de esta sesión desde el primer día**: se integró
-  con persistencia entre reinicios desde el principio (estado `triggered`
-  + `reference_capital` guardados y restaurados), en vez de construirla
-  primero y descubrir el mismo bug de memoria después.
-- **CLI**: `--profit-lock-pct` (ej. `--profit-lock-pct 20` pausa al
-  llegar a +20% desde el `--capital` inicial). Sin la opción, desactivado
-  -- comportamiento idéntico al de antes de esta ronda.
+**Primera versión (descartada tras feedback)**: al llegar a la meta,
+simplemente dejaba de abrir posiciones nuevas -- la posición ya abierta
+seguía viva con su stop loss/take profit normal. El usuario señaló el
+problema real: esa ganancia no estaba asegurada de verdad, solo estaba
+"flotando" en una posición todavía abierta -- si el precio se daba vuelta
+antes de tocar el stop loss propio de esa posición (que no tiene por qué
+coincidir con la meta de ganancia), la ganancia se perdía igual. Además,
+pausar del todo le pone techo a la ganancia total sin necesidad.
+
+**Diseño final, con lógica de "trinquete" (ratchet)**:
+
+- **`safety.ProfitLock`**: al llegar a la meta, el motor CIERRA la
+  posición abierta en ese momento para realizar la ganancia de verdad (no
+  solo pausa). `check()` avisa que se llegó a la meta; tras cerrar, se
+  llama a `lock_in(nuevo_capital)`, que sube el piso de referencia al
+  capital ya realizado y sigue vigilando la PRÓXIMA meta desde ahí. Nunca
+  se queda pausado para siempre -- no hay techo para la ganancia total,
+  solo un piso que sube en escalones cada vez que se asegura una porción.
+- **Alcance**: fuerza el cierre de la posición abierta (a diferencia del
+  circuit breaker, que nunca cierra nada solo, solo bloquea entradas
+  nuevas) -- son mecanismos distintos a propósito: uno protege deteniendo,
+  el otro asegura realizando.
+- **Persistencia entre reinicios desde el primer día**: `reference_capital`
+  (el piso, que sube con cada aseguramiento) y `times_locked` sobreviven a
+  un reinicio del proceso, aplicando la lección de las rondas anteriores
+  desde el diseño inicial en vez de como un fix posterior.
+- **CLI**: `--profit-lock-pct` (ej. `--profit-lock-pct 25` asegura
+  ganancias cada vez que se cruza +25% desde el último aseguramiento).
+  Sin la opción, desactivado -- comportamiento idéntico al de antes de
+  esta ronda. Activado en las dos sesiones reales (`BTC_USDC`/`ETH_USDC`)
+  al 25%.
 
 108/108 tests pasando.
 

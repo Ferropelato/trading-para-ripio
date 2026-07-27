@@ -138,13 +138,13 @@ class _LiveEngine:
         saved_peak_equity = extra.get("peak_equity")
 
         # Restaurar el estado del seguro de ganancias -- mismo cuidado que
-        # el circuit breaker: si ya se activó, o si ya tenía un punto de
-        # referencia fijado, un reinicio no debe resetear ninguno de los
-        # dos (el punto de referencia es "desde que empecé a vigilar", no
-        # "desde el --capital de esta corrida en particular").
+        # el circuit breaker: el piso de referencia (que sube cada vez que
+        # se asegura una ganancia) no debe resetearse solo con un reinicio
+        # -- es "desde el último aseguramiento", no "desde el --capital de
+        # esta corrida en particular".
         if self.profit_lock is not None and saved_state["saved_at"]:
-            self.profit_lock.triggered = extra.get("profit_lock_triggered", False)
-            self.profit_lock.trigger_reason = extra.get("profit_lock_trigger_reason")
+            self.profit_lock.times_locked = extra.get("profit_lock_times_locked", 0)
+            self.profit_lock.last_lock_reason = extra.get("profit_lock_last_reason")
             saved_reference = extra.get("profit_lock_reference_capital")
             if saved_reference is not None:
                 self.profit_lock.reference_capital = saved_reference
@@ -212,6 +212,11 @@ class _LiveEngine:
             pos["unidades"] = remaining
         pnl = (price_filled - entry_price) * filled_units if price_filled is not None else None
         self._record_trade("sell", motivo, filled_units, price_filled, pnl=pnl)
+        if motivo == "seguro_de_ganancias" and self.profit_lock is not None:
+            # La venta ya se ejecutó y el capital resultante quedó en el
+            # bróker -- recién ACÁ la ganancia está realmente asegurada
+            # (no antes, mientras todavía era una posición abierta).
+            self.profit_lock.lock_in(self.broker.get_balance())
 
     def _resolve_pending_order(self):
         """
@@ -283,7 +288,7 @@ class _LiveEngine:
             self.day_start_equity = equity
 
         breaker_active = self.circuit_breaker.check(self.equity_curve, self.day_start_equity, equity)
-        profit_locked = self.profit_lock is not None and self.profit_lock.check(equity)
+        profit_lock_hit = self.profit_lock is not None and self.profit_lock.check(equity)
         self.equity_curve.append(equity)
 
         # Mientras haya una orden todavía sin resolver, no se evalúa nada
@@ -297,6 +302,13 @@ class _LiveEngine:
         broker_positions = self.broker.get_open_positions()
         in_position = self.symbol in broker_positions
 
+        if profit_lock_hit and not in_position:
+            # La meta ya está cubierta solo con lo que hay en efectivo (no
+            # hay una posición que cerrar) -- se banca directo, sin pasar
+            # por el bróker.
+            self.profit_lock.lock_in(self.broker.get_balance())
+            profit_lock_hit = False
+
         # 4) Lógica de salida (si hay posición abierta)
         if in_position:
             pos = broker_positions[self.symbol]
@@ -304,10 +316,11 @@ class _LiveEngine:
             hit_target = self.take_profit is not None and price >= self.take_profit
             strategy_exit = sig == 0
 
-            if hit_stop or hit_target or strategy_exit:
+            if hit_stop or hit_target or strategy_exit or profit_lock_hit:
                 client_order_id = f"{self.symbol}-sell-{date}"
                 order = self.broker.place_order(self.symbol, "sell", pos["unidades"], client_order_id=client_order_id)
-                motivo = "stop_loss" if hit_stop else ("take_profit" if hit_target else "señal_estrategia")
+                motivo = ("stop_loss" if hit_stop else "take_profit" if hit_target
+                          else "seguro_de_ganancias" if profit_lock_hit else "señal_estrategia")
                 status = order["status"]
                 filled_units = order.get("units") or 0
 
@@ -322,10 +335,11 @@ class _LiveEngine:
                         self.log.warning("Venta parcial en %s: %s/%s unidades -- se sigue adelante con lo efectivamente vendido",
                                           self.symbol, filled_units, pos["unidades"])
 
-        # 5) Lógica de entrada (si no hay posición abierta, el breaker no está
-        # activo, no hay una pausa automática por noticias en curso, y no
-        # se alcanzó la meta del seguro de ganancias)
-        elif not breaker_active and not profit_locked and not (self.news_guard is not None and self.news_guard.entries_paused()):
+        # 5) Lógica de entrada (si no hay posición abierta, el breaker no
+        # está activo, y no hay una pausa automática por noticias en curso.
+        # El seguro de ganancias NO bloquea entradas -- solo fuerza el
+        # cierre para asegurar la ganancia y sigue operando normalmente.)
+        elif not breaker_active and not (self.news_guard is not None and self.news_guard.entries_paused()):
             if sig == 1 and not pd.isna(current_atr) and current_atr > 0:
                 sizing = position_size(self.broker.get_balance(), price, current_atr, self.profile)
                 if sizing["unidades"] > 0 and sizing["viable"] is not False:
@@ -368,8 +382,8 @@ class _LiveEngine:
                                       "news_paused_until": news_paused_until.isoformat() if news_paused_until else None,
                                       "current_day": self.current_day.isoformat() if self.current_day else None,
                                       "day_start_equity": self.day_start_equity,
-                                      "profit_lock_triggered": self.profit_lock.triggered if self.profit_lock else None,
-                                      "profit_lock_trigger_reason": self.profit_lock.trigger_reason if self.profit_lock else None,
+                                      "profit_lock_times_locked": self.profit_lock.times_locked if self.profit_lock else None,
+                                      "profit_lock_last_reason": self.profit_lock.last_lock_reason if self.profit_lock else None,
                                       "profit_lock_reference_capital": self.profit_lock.reference_capital if self.profit_lock else None})
         report = reconcile(self.internal_positions, self.broker.get_open_positions())
         if not report["coincide"]:
