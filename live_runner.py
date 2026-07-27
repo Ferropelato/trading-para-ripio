@@ -93,6 +93,15 @@ class _LiveEngine:
         # y a la espera de mas) -- ver Fase 3c / _resolve_pending_order.
         self.pending_order = saved_state["extra"].get("pending_order") if saved_state["saved_at"] else None
 
+        # Restaurar el capital guardado -- sin esto, cada reinicio del
+        # proceso volvía a arrancar el bróker con el --capital inicial de
+        # la CLI, descartando en silencio cualquier ganancia/pérdida real
+        # acumulada en corridas anteriores (bug real: se detectó porque
+        # ETH_USDC volvió a mostrar 1000.00 tras un reinicio, pese a haber
+        # cerrado en 991.87 antes de pararlo).
+        if saved_state["saved_at"] and saved_state.get("capital") is not None:
+            self.broker.balance = saved_state["capital"]
+
         self.ticks_processed = 0
         self.equity_curve = []
         self.day_start_equity = None

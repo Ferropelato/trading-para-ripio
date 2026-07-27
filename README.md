@@ -1320,6 +1320,43 @@ hasta ahora solo se habían tocado de pasada: `kill_switch.py`,
 
 98/98 tests pasando.
 
+## Veintidosava ronda: bug real -- el capital no sobrevivía a un reinicio
+
+Encontrado usando la propia herramienta recién construida (`status_report.py`)
+en las sesiones reales: después de reiniciar `ETH_USDC` para aislar el
+kill-switch (ronda anterior), el reporte mostró **capital: 1000.00** --
+pero esa sesión había cerrado en **991.87** tras sus dos operaciones
+reales. El historial de operaciones (`trade_history.py`) seguía
+perfecto; el capital no.
+
+**Causa**: `_LiveEngine.__init__` restaura desde el estado guardado las
+posiciones abiertas, el stop loss/take profit y la orden pendiente -- pero
+nunca el capital. El bróker siempre arrancaba con el `--capital` fijo de
+la CLI (1000.0 por defecto), sin importar cuánto quedara realmente de
+corridas anteriores. Como ahora mismo no había ninguna posición abierta,
+el síntoma fue "solo" un capital incorrecto -- pero si hubiera habido una
+posición abierta al reiniciar, el bug hubiera sido peor: el motor
+terminaría pensando que tiene la posición Y el capital inicial completo
+en efectivo al mismo tiempo, sobreestimando cuánto hay disponible para
+la próxima operación.
+
+Es, además, un buen ejemplo de un hueco que dos partes bien testeadas por
+separado no garantizan: `state_store.py` ya tenía su propio test
+verificando que el capital se guarda y se lee bien (`test_state_survives_simulated_restart`),
+pero nadie verificaba que `_LiveEngine` lo tomara y lo aplicara al
+bróker real -- el hueco estaba en la integración entre ambos, no en
+ninguno de los dos por separado.
+
+**Corrección**: `_LiveEngine.__init__` ahora sobrescribe `self.broker.balance`
+con el capital guardado cuando existe un estado previo. Test de regresión
+agregado que arma un estado con un capital distinto al `--capital` de
+arranque y verifica que gana el guardado. El archivo de estado real de
+`ETH_USDC` (que había quedado corrompido a 1000.00 por este bug) se
+corrigió a mano a 991.87 -- el valor real, recuperado del historial de
+operaciones persistente -- antes de reiniciar la sesión con el fix.
+
+99/99 tests pasando.
+
 
 ## Notas importantes (leer antes de avanzar)
 

@@ -446,6 +446,63 @@ def test_state_survives_simulated_restart():
     print("OK: el estado sobrevive a un reinicio simulado del proceso")
 
 
+def test_live_engine_restores_saved_capital_on_restart():
+    """
+    Bug real encontrado en producción (visto en el status_report.py real
+    de ETH_USDC): tras reiniciar la sesión para aislar el kill-switch, el
+    capital volvió a mostrar 1000.00 pese a que la corrida anterior había
+    cerrado en 991.87 tras dos operaciones reales. Causa: _LiveEngine
+    restauraba posiciones, stop/take profit y orden pendiente desde el
+    estado guardado, pero NUNCA el capital -- el bróker siempre arrancaba
+    con el --capital de la CLI, descartando en silencio cualquier
+    ganancia o pérdida acumulada en corridas anteriores. Este test arma
+    un estado guardado con un capital DISTINTO al --capital inicial y
+    verifica que, tras "reiniciar" (nueva instancia de _LiveEngine), el
+    bróker arranca con el capital REAL guardado, no con el de la CLI.
+    """
+    import os
+    import tempfile
+    from datetime import datetime, timezone
+    from live_runner import _LiveEngine
+    from broker import PaperBroker
+    from risk_profiles import get_profile
+    from safety import CircuitBreaker, ManualKillSwitch
+    from health import Heartbeat
+    from state_store import StateStore
+    from alerts import ConsoleAlertChannel
+    from app_logger import get_logger
+
+    fd, state_path = tempfile.mkstemp(suffix="_live_engine_capital_restart.json")
+    os.close(fd)
+    os.remove(state_path)
+    kill_switch_path = ".KILL_SWITCH_test_live_engine_capital"
+
+    try:
+        # Corrida 1: arranca con 1000, una operación la deja en 850 y se persiste.
+        StateStore(path=state_path).save({}, capital=850.0, extra={})
+
+        # Corrida 2 ("reinicio"): un broker NUEVO, arrancado con el mismo
+        # --capital de siempre (1000.0) -- el bug hacía que se quedara así.
+        broker = PaperBroker(initial_balance=1000.0)
+        engine = _LiveEngine(
+            broker, "TEST_SYM", get_profile("moderado"), "momentum", "moderado",
+            ConsoleAlertChannel(), ManualKillSwitch(control_file=kill_switch_path),
+            CircuitBreaker(), Heartbeat(max_staleness_seconds=99999),
+            StateStore(path=state_path), reconcile_every=1000, log=get_logger("test_live_engine_capital"),
+        )
+
+        assert engine.broker.get_balance() == 850.0, (
+            f"Debería restaurar el capital guardado (850.0), no quedarse con el --capital "
+            f"inicial de la CLI (obtuvo {engine.broker.get_balance()})"
+        )
+    finally:
+        if os.path.exists(state_path):
+            os.remove(state_path)
+        if os.path.exists(kill_switch_path):
+            os.remove(kill_switch_path)
+    print("OK: _LiveEngine restaura el capital real guardado en vez de reiniciar con el --capital de la CLI")
+
+
 def test_state_store_handles_corrupt_file():
     import os
     import tempfile
@@ -2503,6 +2560,7 @@ if __name__ == "__main__":
         test_live_polling_runs_with_stub_price_feed,
         test_broker_adapters_dont_leak_into_each_other,
         test_state_survives_simulated_restart,
+        test_live_engine_restores_saved_capital_on_restart,
         test_state_store_handles_corrupt_file,
         test_reconciliation_detects_all_mismatch_types,
         test_retry_with_backoff_retries_transient_not_permanent,
