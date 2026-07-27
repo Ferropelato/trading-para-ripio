@@ -1429,6 +1429,36 @@ fix quede activo de cara a cualquier freno real futuro.
 
 101/101 tests pasando.
 
+## Veinticincoava ronda: el mismo bug, un tercer freno afectado -- la pausa por noticias
+
+Cerrando la línea de auditoría de "¿qué otro freno automático no
+sobrevive a un reinicio?": `NewsGuard._paused_until` (la pausa temporal
+que se activa cuando hay una noticia de alto impacto en ventana
+automática) tenía exactamente el mismo problema que el circuit breaker
+-- vivía solo en memoria. Reproducido antes de corregir: se simula una
+pausa activa, se persiste el estado, y una instancia nueva de `NewsGuard`
+tras el "reinicio" reporta `entries_paused() == False` pese a que la
+pausa real seguía vigente.
+
+Menos crítico que el circuit breaker en la práctica (la ventana de
+vulnerabilidad es la duración del cooldown, 60 minutos por defecto, no
+indefinida como un freno manual), pero el mismo hueco real -- y esta
+sesión ya vio una pausa automática dispararse de verdad contra noticias
+reales (ronda 20), así que no es un escenario hipotético.
+
+**Corrección**: `NewsGuard` gana `get_paused_until()`/`restore_paused_until()`;
+`force_persist()` guarda la pausa activa (si hay una) junto con todo lo
+demás; `_LiveEngine.__init__` la restaura. Test de regresión que
+reproduce el escenario exacto.
+
+Con esto, los tres frenos automáticos del motor (circuit breaker,
+kill-switch manual, pausa por noticias) sobreviven todos a un reinicio
+del proceso -- el kill-switch manual ya lo hacía desde el principio (es
+un archivo en disco, no un objeto en memoria), y ahora los otros dos
+también.
+
+102/102 tests pasando.
+
 
 ## Notas importantes (leer antes de avanzar)
 

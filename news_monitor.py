@@ -232,3 +232,13 @@ class NewsGuard:
             return False
         now = now or datetime.now(timezone.utc)
         return now < self._paused_until
+
+    def get_paused_until(self):
+        """Para persistir la pausa entre reinicios del proceso (ver
+        _LiveEngine en live_runner.py) -- sin esto, reiniciar el proceso
+        durante una pausa automática activa la levantaba en silencio,
+        igual que le pasaba al circuit breaker antes de corregirlo."""
+        return self._paused_until
+
+    def restore_paused_until(self, paused_until) -> None:
+        self._paused_until = paused_until

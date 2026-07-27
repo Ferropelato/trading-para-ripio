@@ -634,6 +634,71 @@ def test_live_engine_restores_circuit_breaker_state_on_restart():
     print("OK: _LiveEngine restaura el estado del circuit breaker (tripped + pico de equity) tras un reinicio")
 
 
+def test_live_engine_restores_news_pause_on_restart():
+    """
+    Mismo problema, encontrado auditando el resto de los frenos
+    automáticos tras el bug del circuit breaker: NewsGuard también
+    guardaba su pausa activa (`_paused_until`) solo en memoria. Un
+    reinicio del proceso durante una pausa automática por noticia de alto
+    impacto la levantaba en silencio, igual que le pasaba al circuit
+    breaker antes de corregirlo.
+    """
+    import os
+    import tempfile
+    from datetime import datetime, timezone, timedelta
+    from live_runner import _LiveEngine
+    from broker import PaperBroker
+    from risk_profiles import get_profile
+    from safety import CircuitBreaker, ManualKillSwitch
+    from health import Heartbeat
+    from state_store import StateStore
+    from alerts import ConsoleAlertChannel
+    from app_logger import get_logger
+    from news_monitor import NewsGuard, NewsMonitor, NewsAutomationSchedule, AutomationWindow
+
+    fd, state_path = tempfile.mkstemp(suffix="_live_engine_news_restart.json")
+    os.close(fd)
+    os.remove(state_path)
+    kill_switch_path = ".KILL_SWITCH_test_live_engine_news"
+
+    try:
+        guard = NewsGuard(NewsMonitor(feeds=[]),
+                           NewsAutomationSchedule([AutomationWindow(0, 24)], cooldown_minutes=60),
+                           ConsoleAlertChannel())
+        guard.restore_paused_until(datetime.now(timezone.utc) + timedelta(minutes=45))
+        assert guard.entries_paused() is True
+
+        broker = PaperBroker(initial_balance=1000.0)
+        engine = _LiveEngine(
+            broker, "TEST_SYM", get_profile("moderado"), "momentum", "moderado",
+            ConsoleAlertChannel(), ManualKillSwitch(control_file=kill_switch_path),
+            CircuitBreaker(), Heartbeat(max_staleness_seconds=99999),
+            StateStore(path=state_path), reconcile_every=1000, log=get_logger("test_live_engine_news"),
+            news_guard=guard,
+        )
+        engine.force_persist()
+
+        # "Reinicio": un NewsGuard completamente nuevo.
+        guard2 = NewsGuard(NewsMonitor(feeds=[]),
+                            NewsAutomationSchedule([AutomationWindow(0, 24)], cooldown_minutes=60),
+                            ConsoleAlertChannel())
+        engine2 = _LiveEngine(
+            broker, "TEST_SYM", get_profile("moderado"), "momentum", "moderado",
+            ConsoleAlertChannel(), ManualKillSwitch(control_file=kill_switch_path),
+            CircuitBreaker(), Heartbeat(max_staleness_seconds=99999),
+            StateStore(path=state_path), reconcile_every=1000, log=get_logger("test_live_engine_news2"),
+            news_guard=guard2,
+        )
+
+        assert guard2.entries_paused() is True, "La pausa por noticias activa debe seguir activa tras el reinicio"
+    finally:
+        if os.path.exists(state_path):
+            os.remove(state_path)
+        if os.path.exists(kill_switch_path):
+            os.remove(kill_switch_path)
+    print("OK: _LiveEngine restaura la pausa automática por noticias tras un reinicio")
+
+
 def test_state_store_handles_corrupt_file():
     import os
     import tempfile
@@ -2694,6 +2759,7 @@ if __name__ == "__main__":
         test_live_engine_restores_saved_capital_on_restart,
         test_live_engine_restores_open_position_in_broker_on_restart,
         test_live_engine_restores_circuit_breaker_state_on_restart,
+        test_live_engine_restores_news_pause_on_restart,
         test_state_store_handles_corrupt_file,
         test_reconciliation_detects_all_mismatch_types,
         test_retry_with_backoff_retries_transient_not_permanent,

@@ -26,6 +26,7 @@ Uso:
 import argparse
 import signal as system_signal
 import time
+from datetime import datetime
 
 import pandas as pd
 
@@ -129,6 +130,15 @@ class _LiveEngine:
             self.circuit_breaker.tripped = extra.get("circuit_breaker_tripped", False)
             self.circuit_breaker.trip_reason = extra.get("circuit_breaker_trip_reason")
         saved_peak_equity = extra.get("peak_equity")
+
+        # Restaurar la pausa automática por noticias -- mismo problema que
+        # el circuit breaker: sin esto, reiniciar el proceso en medio de
+        # una pausa activa (ej. tras una noticia de alto impacto) la
+        # levantaba en silencio.
+        if self.news_guard is not None and saved_state["saved_at"]:
+            paused_until_str = extra.get("news_paused_until")
+            if paused_until_str:
+                self.news_guard.restore_paused_until(datetime.fromisoformat(paused_until_str))
 
         self.ticks_processed = 0
         self.equity_curve = [saved_peak_equity] if saved_peak_equity is not None else []
@@ -320,12 +330,14 @@ class _LiveEngine:
 
     def force_persist(self):
         peak_equity = max(self.equity_curve) if self.equity_curve else None
+        news_paused_until = self.news_guard.get_paused_until() if self.news_guard is not None else None
         self.state_store.save(self.internal_positions, capital=self.broker.get_balance(),
                                extra={"stop_loss": self.stop_loss, "take_profit": self.take_profit,
                                       "pending_order": self.pending_order,
                                       "circuit_breaker_tripped": self.circuit_breaker.tripped,
                                       "circuit_breaker_trip_reason": self.circuit_breaker.trip_reason,
-                                      "peak_equity": peak_equity})
+                                      "peak_equity": peak_equity,
+                                      "news_paused_until": news_paused_until.isoformat() if news_paused_until else None})
         report = reconcile(self.internal_positions, self.broker.get_open_positions())
         if not report["coincide"]:
             self.log.error("Desfasaje detectado entre el estado interno y el bróker: %s", report)
