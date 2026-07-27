@@ -1740,6 +1740,97 @@ def test_live_engine_partial_buy_fill_registers_position_with_actual_units():
     print("OK: un llenado parcial en la compra registra la posición con las unidades REALMENTE compradas")
 
 
+def test_pair_trades_and_tax_export_consume_real_trade_history():
+    """
+    tax_export.py existía pero no estaba conectado a ninguna fuente de
+    datos real -- ningún otro módulo lo llamaba, ni tenía test propio.
+    Ahora que trade_history.py persiste operaciones reales, se agrega
+    pair_trades() para convertir el registro plano (una fila por lado de
+    cada operación) al formato de "operación completa" (entrada+salida)
+    que tax_export.py necesita, y se verifica el camino completo:
+    TradeHistoryLog -> pair_trades -> export_tax_report/tax_summary.
+    """
+    import os
+    import tempfile
+    from trade_history import TradeHistoryLog, pair_trades
+    from tax_export import export_tax_report, tax_summary
+
+    fd, trades_path = tempfile.mkstemp(suffix="_tax_export_trades.csv")
+    os.close(fd)
+    os.remove(trades_path)
+    fd2, report_path = tempfile.mkstemp(suffix="_tax_export_report.csv")
+    os.close(fd2)
+    os.remove(report_path)
+
+    try:
+        log = TradeHistoryLog(trades_path)
+        log.append(symbol="ETH_USDC", side="buy", motivo="apertura", units=0.5,
+                    price=1955.0, pnl=None, balance_resultante=1000.0)
+        log.append(symbol="ETH_USDC", side="sell", motivo="señal_estrategia", units=0.5,
+                    price=1951.0, pnl=-2.0, balance_resultante=998.0)
+        log.append(symbol="BTC_USDC", side="buy", motivo="apertura", units=0.01,
+                    price=60000.0, pnl=None, balance_resultante=998.0)
+        log.append(symbol="BTC_USDC", side="sell", motivo="take_profit", units=0.01,
+                    price=61000.0, pnl=10.0, balance_resultante=1008.0)
+
+        trades = pair_trades(log.load_all())
+        assert len(trades) == 2, "Debe emparejar cada compra con su venta correspondiente"
+        assert trades[0]["precio_entrada"] == 1955.0 and trades[0]["precio_salida"] == 1951.0
+        assert trades[1]["precio_entrada"] == 60000.0 and trades[1]["precio_salida"] == 61000.0
+
+        df = export_tax_report(trades, output_path=report_path)
+        assert os.path.exists(report_path)
+        assert len(df) == 2
+        assert set(df["tipo"]) == {"pérdida", "ganancia"}
+
+        summary = tax_summary(trades)
+        assert summary["resultado_neto_usd"] == 8.0, "El neto debe ser -2 + 10 = 8"
+        assert summary["cantidad_operaciones_ganadoras"] == 1
+        assert summary["cantidad_operaciones_perdedoras"] == 1
+    finally:
+        if os.path.exists(trades_path):
+            os.remove(trades_path)
+        if os.path.exists(report_path):
+            os.remove(report_path)
+    print("OK: pair_trades conecta el historial persistente real con tax_export.py de punta a punta")
+
+
+def test_kill_switch_cli_respects_custom_control_file():
+    """
+    Bug real encontrado auditando el código: kill_switch.py (el comando
+    para activar/desactivar el freno a mano) siempre apuntaba al archivo
+    genérico .KILL_SWITCH -- una sesión arrancada con --kill-switch-file
+    propio (ver live_runner.py) quedaba imposible de pausar con este
+    comando, porque miraba un archivo que esa sesión ni siquiera consulta.
+    Verifica que --file lo dirige al archivo correcto, y que NO toca el
+    genérico cuando se le pasa uno propio.
+    """
+    import os
+    import sys
+    import kill_switch
+
+    custom_path = ".KILL_SWITCH_test_cli_custom"
+    generic_existed_before = os.path.exists(".KILL_SWITCH")
+
+    old_argv = sys.argv
+    try:
+        sys.argv = ["kill_switch.py", "activar", "motivo de prueba", "--file", custom_path]
+        kill_switch.main()
+        assert os.path.exists(custom_path), "Debería haber creado el archivo de control PROPIO, no el genérico"
+        assert os.path.exists(".KILL_SWITCH") == generic_existed_before, (
+            "No debería haber tocado el archivo de control genérico al pasar --file"
+        )
+
+        sys.argv = ["kill_switch.py", "desactivar", "--file", custom_path]
+        kill_switch.main()
+        assert not os.path.exists(custom_path), "Desactivar con --file debe borrar el archivo PROPIO"
+    finally:
+        sys.argv = old_argv
+        if os.path.exists(custom_path):
+            os.remove(custom_path)
+    print("OK: kill_switch.py respeta --file y no interfiere con el archivo de control genérico")
+
+
 def test_status_report_reflects_state_and_history():
     """
     status_report.py lee el estado y el historial ya persistidos y arma un
@@ -2465,6 +2556,8 @@ if __name__ == "__main__":
         test_trade_history_log_persists_across_process_restarts,
         test_live_engine_records_buy_and_sell_in_trade_history,
         test_status_report_reflects_state_and_history,
+        test_kill_switch_cli_respects_custom_control_file,
+        test_pair_trades_and_tax_export_consume_real_trade_history,
         test_load_many_simultaneous_circuit_breakers_stay_isolated_and_detected,
         test_manual_kill_switch_reason_returns_saved_message,
         test_live_engine_process_tick_with_active_kill_switch_does_not_crash,

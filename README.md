@@ -1270,6 +1270,56 @@ un heurístico silenciosamente equivocado.
 
 96/96 tests pasando.
 
+## Veintiunava ronda: auditoría dirigida a los módulos menos revisados
+
+Con la propuesta y el mockup ya cerrados, se recorrieron los archivos que
+hasta ahora solo se habían tocado de pasada: `kill_switch.py`,
+`tax_export.py`, `state_store.py`, `resilience.py`, `health.py`,
+`report.py`, `experiment_log.py`.
+
+- **Bug real**: `kill_switch.py` (el comando para pausar/reanudar a mano)
+  siempre apuntaba al archivo de control genérico `.KILL_SWITCH`, sin
+  forma de elegir otro -- con el aislamiento agregado en la ronda
+  anterior (`--kill-switch-file`), este comando había quedado inútil para
+  pausar una sesión puntual: miraba un archivo que esa sesión ya ni
+  siquiera consulta. Se agregó `--file` para que apunte al mismo archivo
+  que la sesión que se quiere frenar, con test de regresión.
+- **Hueco real de integración**: `tax_export.py` existía desde antes pero
+  ningún otro módulo lo llamaba, y no tenía ningún test -- estaba
+  completamente desconectado de cualquier fuente de datos real. Se agregó
+  `pair_trades()` en `trade_history.py`, que convierte el registro plano
+  del historial persistente (una fila por compra/venta) al formato de
+  "operación completa" que `tax_export.py` necesita, y se verificó el
+  camino de punta a punta (incluyendo con los mismos números reales que
+  ya generó `ETH_USDC` en esta sesión).
+- **Autocorrección**: se sospechó el mismo bug de encoding ya encontrado
+  dos veces antes (Windows/cp1252) en `state_store.py`, que abre el
+  archivo de estado sin `encoding="utf-8"` explícito. Se probó antes de
+  afirmarlo -- `json.dump` escapa por defecto cualquier caracter fuera de
+  ASCII a su secuencia `\uXXXX` (una tilde nunca llega a escribirse en el
+  archivo tal cual), así que el contenido siempre termina siendo ASCII
+  puro y el encoding de apertura no cambia nada en la práctica. **No era
+  un bug real**, y se corrige acá para no
+  repetir la afirmación sin haber verificado. Se agregó igual el
+  `encoding="utf-8"` explícito como buena práctica preventiva (si algún
+  día se cambia a `ensure_ascii=False` por legibilidad, ahí sí importaría),
+  documentado como mejora de estilo, no como corrección de un bug.
+- **Observación sin acción** (para dejar registrada, no urgente): el
+  `Heartbeat` de `health.py` se actualiza en cada tick pero nadie llama a
+  `is_stale()`/`status()` en el camino de las sesiones standalone de
+  `live_runner.py` -- solo lo consulta `ops_monitor.py`, que es parte de
+  la arquitectura multi-usuario, no de estos dos procesos de demo. En la
+  práctica esto no deja ciego al operador porque cada fallo de red ya se
+  loggea individualmente (se vio varias veces en los logs reales de esta
+  sesión), así que no se priorizó -- pero si algún día el feed devolviera
+  un precio "viejo" sin lanzar una excepción, no habría ninguna alerta
+  explícita de eso hoy.
+- `resilience.py`, `report.py`, `experiment_log.py` se revisaron sin
+  encontrar problemas -- ya tenían manejo de encoding correcto y su
+  cobertura de tests existente sigue siendo representativa.
+
+98/98 tests pasando.
+
 
 ## Notas importantes (leer antes de avanzar)
 

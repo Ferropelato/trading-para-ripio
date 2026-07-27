@@ -39,7 +39,7 @@ class StateStore:
             "saved_at": datetime.utcnow().isoformat(),
         }
         tmp_path = self.path + ".tmp"
-        with open(tmp_path, "w") as f:
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2, default=str)
         os.replace(tmp_path, self.path)  # atómico en la mayoría de los sistemas de archivos
         log.debug("Estado guardado: %d posiciones, capital=%.2f", len(positions), capital)
@@ -50,7 +50,7 @@ class StateStore:
             return {"positions": {}, "capital": None, "extra": {}, "saved_at": None}
 
         try:
-            with open(self.path) as f:
+            with open(self.path, encoding="utf-8") as f:
                 state = json.load(f)
             log.info("Estado restaurado desde %s (guardado el %s): %d posiciones abiertas",
                       self.path, state.get("saved_at"), len(state.get("positions", {})))
