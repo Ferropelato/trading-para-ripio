@@ -1479,6 +1479,34 @@ pérdida diaria --, y pausa por noticias) están todos cubiertos.
 
 103/103 tests pasando.
 
+## Veintisieteava ronda: seguro de ganancias (primera pieza del roadmap, ya construida)
+
+Primera de las tres ideas documentadas como roadmap (ronda 17) que pasa a
+ser código real: un freno simétrico al circuit breaker, pero a la suba.
+El circuit breaker solo protegía contra pérdidas (drawdown desde el pico,
+o pérdida diaria); no había forma de decirle al motor "si llegás a tal
+ganancia, pausá y dejame decidir si sigo expuesto o no".
+
+- **`safety.ProfitLock`**: se define con una meta (`target_pct`) y un
+  capital de referencia (`reference_capital`, el punto de partida contra
+  el que se mide la ganancia -- a propósito NO el pico histórico como el
+  circuit breaker, sino "desde que empecé a vigilar"). Una vez activado,
+  se queda activado (no se reactiva solo si el capital vuelve a bajar) --
+  hace falta una decisión explícita para volver a operar, igual que el
+  circuit breaker.
+- **Mismo alcance que el circuit breaker**: bloquea posiciones *nuevas*,
+  nunca toca una posición ya abierta (sigue con su stop loss/take profit
+  normal).
+- **Aplicada la lección de esta sesión desde el primer día**: se integró
+  con persistencia entre reinicios desde el principio (estado `triggered`
+  + `reference_capital` guardados y restaurados), en vez de construirla
+  primero y descubrir el mismo bug de memoria después.
+- **CLI**: `--profit-lock-pct` (ej. `--profit-lock-pct 20` pausa al
+  llegar a +20% desde el `--capital` inicial). Sin la opción, desactivado
+  -- comportamiento idéntico al de antes de esta ronda.
+
+108/108 tests pasando.
+
 
 ## Notas importantes (leer antes de avanzar)
 

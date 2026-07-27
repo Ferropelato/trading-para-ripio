@@ -10,7 +10,7 @@ import numpy as np
 
 from risk_manager import position_size
 from risk_profiles import get_profile
-from safety import validate_ohlcv, CircuitBreaker
+from safety import validate_ohlcv, CircuitBreaker, ProfitLock
 
 
 def test_risk_never_exceeds_profile():
@@ -112,6 +112,38 @@ def test_circuit_breaker_trips_on_drawdown():
     tripped = cb.check(equity_curve, 1000, 880)  # 12% de drawdown desde el pico
     assert tripped, "El circuit breaker debería activarse con 12% de drawdown y límite de 10%"
     print("OK: el circuit breaker se activa al superar el drawdown máximo")
+
+
+def test_profit_lock_triggers_at_target_gain():
+    lock = ProfitLock(target_pct=20.0, reference_capital=1000.0)
+    assert lock.check(1150.0) is False, "No debería activarse con +15%, el objetivo es +20%"
+    assert lock.check(1200.0) is True, "Debería activarse al llegar exactamente a +20%"
+    assert lock.triggered is True
+    assert "20.0" in lock.trigger_reason
+    print("OK: el seguro de ganancias se activa al alcanzar la meta configurada")
+
+
+def test_profit_lock_stays_triggered_even_if_capital_drops_back():
+    lock = ProfitLock(target_pct=10.0, reference_capital=1000.0)
+    assert lock.check(1100.0) is True
+    # Aunque el capital baje después de activarse, sigue activo -- no se reactiva
+    # solo, hace falta una decisión explícita para volver a operar.
+    assert lock.check(900.0) is True, "Una vez activado, debe seguir activo aunque el capital baje después"
+    print("OK: el seguro de ganancias, una vez activado, no se desactiva solo")
+
+
+def test_profit_lock_rejects_invalid_params():
+    try:
+        ProfitLock(target_pct=0, reference_capital=1000.0)
+        assert False, "Debería rechazar un target_pct de 0 o negativo"
+    except ValueError:
+        pass
+    try:
+        ProfitLock(target_pct=10.0, reference_capital=0)
+        assert False, "Debería rechazar un reference_capital de 0 o negativo"
+    except ValueError:
+        pass
+    print("OK: ProfitLock rechaza parámetros inválidos en vez de calcular con ellos")
 
 
 def test_min_trade_value_rejects_tiny_trades():
@@ -761,6 +793,122 @@ def test_live_engine_restores_daily_loss_reference_on_restart():
         if os.path.exists(kill_switch_path):
             os.remove(kill_switch_path)
     print("OK: _LiveEngine restaura la referencia de pérdida diaria tras un reinicio")
+
+
+def test_live_engine_blocks_new_entries_when_profit_lock_triggered():
+    """
+    El seguro de ganancias debe comportarse igual que el circuit breaker
+    en cuanto a alcance: bloquea posiciones NUEVAS, pero una posición ya
+    abierta se sigue manejando con normalidad (stop loss/take profit),
+    no se cierra de golpe solo porque se activó.
+    """
+    import os
+    import tempfile
+    from datetime import datetime, timezone
+    from live_runner import _LiveEngine
+    from broker import PaperBroker
+    from risk_profiles import get_profile
+    from safety import CircuitBreaker, ManualKillSwitch, ProfitLock
+    from health import Heartbeat
+    from state_store import StateStore
+    from alerts import ConsoleAlertChannel
+    from app_logger import get_logger
+
+    fd, state_path = tempfile.mkstemp(suffix="_live_engine_profit_lock.json")
+    os.close(fd)
+    os.remove(state_path)
+    kill_switch_path = ".KILL_SWITCH_test_live_engine_profit_lock"
+
+    try:
+        broker = PaperBroker(initial_balance=1000.0)
+        lock = ProfitLock(target_pct=10.0, reference_capital=1000.0)
+        engine = _LiveEngine(
+            broker, "TEST_SYM", get_profile("moderado"), "momentum", "moderado",
+            ConsoleAlertChannel(), ManualKillSwitch(control_file=kill_switch_path),
+            CircuitBreaker(), Heartbeat(max_staleness_seconds=99999),
+            StateStore(path=state_path), reconcile_every=1000, log=get_logger("test_live_engine_profit_lock"),
+            profit_lock=lock,
+        )
+        now = datetime.now(timezone.utc)
+
+        # Se activa el seguro de ganancias manualmente (equivalente a que
+        # el equity ya haya cruzado la meta en un tick anterior).
+        lock.triggered = True
+        lock.trigger_reason = "prueba"
+
+        orders_before = len(broker.order_history)
+        broker.set_price("TEST_SYM", 100.0)
+        engine.process_tick(now, 100.0, current_atr=2.0, sig=1)  # señal de compra
+        assert len(broker.order_history) == orders_before, (
+            "No debería abrir una posición nueva con el seguro de ganancias activado"
+        )
+        assert "TEST_SYM" not in engine.internal_positions
+    finally:
+        if os.path.exists(state_path):
+            os.remove(state_path)
+        if os.path.exists(kill_switch_path):
+            os.remove(kill_switch_path)
+    print("OK: el seguro de ganancias activado bloquea posiciones nuevas (no toca las ya abiertas)")
+
+
+def test_live_engine_restores_profit_lock_state_on_restart():
+    """
+    Mismo cuidado que con el circuit breaker: si el seguro de ganancias ya
+    se activó, un reinicio no debe desactivarlo solo. Y el punto de
+    referencia (desde dónde se mide la ganancia) tampoco debe cambiar
+    solo porque el proceso se reinició.
+    """
+    import os
+    import tempfile
+    from live_runner import _LiveEngine
+    from broker import PaperBroker
+    from risk_profiles import get_profile
+    from safety import CircuitBreaker, ManualKillSwitch, ProfitLock
+    from health import Heartbeat
+    from state_store import StateStore
+    from alerts import ConsoleAlertChannel
+    from app_logger import get_logger
+
+    fd, state_path = tempfile.mkstemp(suffix="_live_engine_profit_lock_restart.json")
+    os.close(fd)
+    os.remove(state_path)
+    kill_switch_path = ".KILL_SWITCH_test_live_engine_profit_lock_restart"
+
+    try:
+        broker = PaperBroker(initial_balance=1000.0)
+        lock = ProfitLock(target_pct=10.0, reference_capital=1000.0)
+        lock.check(1150.0)  # dispara el freno de verdad, no a mano
+        assert lock.triggered is True
+
+        engine = _LiveEngine(
+            broker, "TEST_SYM", get_profile("moderado"), "momentum", "moderado",
+            ConsoleAlertChannel(), ManualKillSwitch(control_file=kill_switch_path),
+            CircuitBreaker(), Heartbeat(max_staleness_seconds=99999),
+            StateStore(path=state_path), reconcile_every=1000, log=get_logger("test_live_engine_pl_restart"),
+            profit_lock=lock,
+        )
+        engine.force_persist()
+
+        # "Reinicio": un ProfitLock nuevo, con un reference_capital de
+        # arranque DISTINTO (como pasaría si --capital cambiara entre
+        # corridas) -- debe ganar el guardado, no el de esta instancia nueva.
+        lock2 = ProfitLock(target_pct=10.0, reference_capital=999.0)
+        engine2 = _LiveEngine(
+            broker, "TEST_SYM", get_profile("moderado"), "momentum", "moderado",
+            ConsoleAlertChannel(), ManualKillSwitch(control_file=kill_switch_path),
+            CircuitBreaker(), Heartbeat(max_staleness_seconds=99999),
+            StateStore(path=state_path), reconcile_every=1000, log=get_logger("test_live_engine_pl_restart2"),
+            profit_lock=lock2,
+        )
+
+        assert lock2.triggered is True, "El seguro de ganancias activo debe seguir activo tras el reinicio"
+        assert lock2.reference_capital == 1000.0, "El punto de referencia real debe sobrevivir al reinicio"
+    finally:
+        if os.path.exists(state_path):
+            os.remove(state_path)
+        if os.path.exists(kill_switch_path):
+            os.remove(kill_switch_path)
+    print("OK: _LiveEngine restaura el estado del seguro de ganancias (activo + referencia) tras un reinicio")
 
 
 def test_state_store_handles_corrupt_file():
@@ -2801,6 +2949,9 @@ if __name__ == "__main__":
         test_validation_detects_corrupt_data,
         test_validation_passes_clean_data,
         test_circuit_breaker_trips_on_drawdown,
+        test_profit_lock_triggers_at_target_gain,
+        test_profit_lock_stays_triggered_even_if_capital_drops_back,
+        test_profit_lock_rejects_invalid_params,
         test_min_trade_value_rejects_tiny_trades,
         test_adx_bounded_and_regime_classifies,
         test_heartbeat_detects_staleness,
@@ -2825,6 +2976,8 @@ if __name__ == "__main__":
         test_live_engine_restores_circuit_breaker_state_on_restart,
         test_live_engine_restores_news_pause_on_restart,
         test_live_engine_restores_daily_loss_reference_on_restart,
+        test_live_engine_blocks_new_entries_when_profit_lock_triggered,
+        test_live_engine_restores_profit_lock_state_on_restart,
         test_state_store_handles_corrupt_file,
         test_reconciliation_detects_all_mismatch_types,
         test_retry_with_backoff_retries_transient_not_permanent,

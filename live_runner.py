@@ -36,7 +36,7 @@ from risk_manager import position_size
 from risk_profiles import get_profile
 from broker import PaperBroker
 from alerts import ConsoleAlertChannel, format_signal_alert
-from safety import ManualKillSwitch, CircuitBreaker
+from safety import ManualKillSwitch, CircuitBreaker, ProfitLock
 from health import Heartbeat
 from state_store import StateStore
 from trade_history import TradeHistoryLog
@@ -63,7 +63,8 @@ class _LiveEngine:
 
     def __init__(self, broker, symbol, profile, strategy_name, profile_name,
                  alert_channel, kill_switch, circuit_breaker, heartbeat,
-                 state_store, reconcile_every, log, news_guard=None, trade_history=None):
+                 state_store, reconcile_every, log, news_guard=None, trade_history=None,
+                 profit_lock=None):
         self.broker = broker
         self.symbol = symbol
         self.profile = profile
@@ -85,6 +86,11 @@ class _LiveEngine:
         # (activar hoy, pausar, retomar en semanas) con un reporte único de
         # todo lo operado en el medio.
         self.trade_history = trade_history
+        # Opcional (ver safety.ProfitLock): freno simétrico al circuit
+        # breaker, pero a la suba -- asegura una ganancia cuando se
+        # alcanza la meta que el usuario definió, en vez de proteger
+        # contra una pérdida.
+        self.profit_lock = profit_lock
 
         saved_state = state_store.load()
         self.stop_loss = saved_state["extra"].get("stop_loss") if saved_state["saved_at"] else None
@@ -130,6 +136,18 @@ class _LiveEngine:
             self.circuit_breaker.tripped = extra.get("circuit_breaker_tripped", False)
             self.circuit_breaker.trip_reason = extra.get("circuit_breaker_trip_reason")
         saved_peak_equity = extra.get("peak_equity")
+
+        # Restaurar el estado del seguro de ganancias -- mismo cuidado que
+        # el circuit breaker: si ya se activó, o si ya tenía un punto de
+        # referencia fijado, un reinicio no debe resetear ninguno de los
+        # dos (el punto de referencia es "desde que empecé a vigilar", no
+        # "desde el --capital de esta corrida en particular").
+        if self.profit_lock is not None and saved_state["saved_at"]:
+            self.profit_lock.triggered = extra.get("profit_lock_triggered", False)
+            self.profit_lock.trigger_reason = extra.get("profit_lock_trigger_reason")
+            saved_reference = extra.get("profit_lock_reference_capital")
+            if saved_reference is not None:
+                self.profit_lock.reference_capital = saved_reference
 
         # Restaurar la pausa automática por noticias -- mismo problema que
         # el circuit breaker: sin esto, reiniciar el proceso en medio de
@@ -265,6 +283,7 @@ class _LiveEngine:
             self.day_start_equity = equity
 
         breaker_active = self.circuit_breaker.check(self.equity_curve, self.day_start_equity, equity)
+        profit_locked = self.profit_lock is not None and self.profit_lock.check(equity)
         self.equity_curve.append(equity)
 
         # Mientras haya una orden todavía sin resolver, no se evalúa nada
@@ -304,8 +323,9 @@ class _LiveEngine:
                                           self.symbol, filled_units, pos["unidades"])
 
         # 5) Lógica de entrada (si no hay posición abierta, el breaker no está
-        # activo, y no hay una pausa automática por noticias en curso)
-        elif not breaker_active and not (self.news_guard is not None and self.news_guard.entries_paused()):
+        # activo, no hay una pausa automática por noticias en curso, y no
+        # se alcanzó la meta del seguro de ganancias)
+        elif not breaker_active and not profit_locked and not (self.news_guard is not None and self.news_guard.entries_paused()):
             if sig == 1 and not pd.isna(current_atr) and current_atr > 0:
                 sizing = position_size(self.broker.get_balance(), price, current_atr, self.profile)
                 if sizing["unidades"] > 0 and sizing["viable"] is not False:
@@ -347,7 +367,10 @@ class _LiveEngine:
                                       "peak_equity": peak_equity,
                                       "news_paused_until": news_paused_until.isoformat() if news_paused_until else None,
                                       "current_day": self.current_day.isoformat() if self.current_day else None,
-                                      "day_start_equity": self.day_start_equity})
+                                      "day_start_equity": self.day_start_equity,
+                                      "profit_lock_triggered": self.profit_lock.triggered if self.profit_lock else None,
+                                      "profit_lock_trigger_reason": self.profit_lock.trigger_reason if self.profit_lock else None,
+                                      "profit_lock_reference_capital": self.profit_lock.reference_capital if self.profit_lock else None})
         report = reconcile(self.internal_positions, self.broker.get_open_positions())
         if not report["coincide"]:
             self.log.error("Desfasaje detectado entre el estado interno y el bróker: %s", report)
@@ -371,7 +394,8 @@ def run_live(csv_path: str, strategy_name: str, profile_name: str,
              state_path: str = "engine_state.json", reconcile_every: int = 10,
              max_drawdown_pct: float = 15.0, max_daily_loss_pct: float = 5.0,
              regime_filter: bool = True, multi_timeframe_filter: bool = True,
-             trade_history_path: str = None, kill_switch_path: str = ".KILL_SWITCH"):
+             trade_history_path: str = None, kill_switch_path: str = ".KILL_SWITCH",
+             profit_lock_pct: float = None):
     log = get_logger("live_runner")
     log.info("Iniciando runner en vivo (modo paper trading, replay histórico) — %s / %s sobre %s",
               strategy_name, profile_name, symbol)
@@ -393,13 +417,14 @@ def run_live(csv_path: str, strategy_name: str, profile_name: str,
 
     broker = PaperBroker(initial_balance=initial_balance)
     trade_history = TradeHistoryLog(trade_history_path) if trade_history_path else None
+    profit_lock = ProfitLock(profit_lock_pct, initial_balance) if profit_lock_pct else None
     engine = _LiveEngine(
         broker, symbol, profile, strategy_name, profile_name,
         ConsoleAlertChannel(), ManualKillSwitch(control_file=kill_switch_path),
         CircuitBreaker(max_drawdown_pct, max_daily_loss_pct),
         Heartbeat(max_staleness_seconds=3600),  # en un loop real, ajustar según frecuencia del feed
         StateStore(path=state_path), reconcile_every, log,
-        trade_history=trade_history,
+        trade_history=trade_history, profit_lock=profit_lock,
     )
     shutdown_requested = _make_shutdown_flag(log)
 
@@ -431,7 +456,7 @@ def run_live_polling(price_source, symbol: str, strategy_name: str, profile_name
                       max_drawdown_pct: float = 15.0, max_daily_loss_pct: float = 5.0,
                       regime_filter: bool = True, multi_timeframe_filter: bool = True,
                       max_history_rows: int = 5000, news_guard=None, trade_history_path: str = None,
-                      kill_switch_path: str = ".KILL_SWITCH"):
+                      kill_switch_path: str = ".KILL_SWITCH", profit_lock_pct: float = None):
     """
     Paper trading contra un feed de precios REAL (no replay histórico): en
     cada intervalo de `poll_interval_seconds` pide el precio actual a
@@ -471,13 +496,14 @@ def run_live_polling(price_source, symbol: str, strategy_name: str, profile_name
 
     broker = PaperBroker(initial_balance=initial_balance)
     trade_history = TradeHistoryLog(trade_history_path) if trade_history_path else None
+    profit_lock = ProfitLock(profit_lock_pct, initial_balance) if profit_lock_pct else None
     engine = _LiveEngine(
         broker, symbol, profile, strategy_name, profile_name,
         ConsoleAlertChannel(), ManualKillSwitch(control_file=kill_switch_path),
         CircuitBreaker(max_drawdown_pct, max_daily_loss_pct),
         Heartbeat(max_staleness_seconds=max(poll_interval_seconds * 5, 300)),
         StateStore(path=state_path), reconcile_every, log,
-        news_guard=news_guard, trade_history=trade_history,
+        news_guard=news_guard, trade_history=trade_history, profit_lock=profit_lock,
     )
     shutdown_requested = _make_shutdown_flag(log)
 
@@ -554,6 +580,11 @@ def main():
                               "usan el mismo (.KILL_SWITCH) -- si corrés varias sesiones a la vez (ej. un símbolo "
                               "por proceso) y querés poder pausar cada una por separado, pasale un archivo distinto "
                               "a cada una (ej. .KILL_SWITCH_BTC_USDC).")
+    parser.add_argument("--profit-lock-pct", type=float, default=None,
+                         help="Meta de ganancia (%%) desde el --capital inicial que, al alcanzarse, pausa la "
+                              "apertura de posiciones nuevas -- un freno simétrico al circuit breaker, pero para "
+                              "asegurar lo ganado en vez de proteger contra una pérdida. Sin esta opción, desactivado "
+                              "(comportamiento de siempre). Ej.: --profit-lock-pct 20 pausa al llegar a +20%%.")
     parser.add_argument("--max-drawdown", type=float, default=15.0)
     parser.add_argument("--max-daily-loss", type=float, default=5.0)
     parser.add_argument("--no-regime-filter", action="store_true",
@@ -609,7 +640,7 @@ def main():
             max_drawdown_pct=args.max_drawdown, max_daily_loss_pct=args.max_daily_loss,
             regime_filter=not args.no_regime_filter, multi_timeframe_filter=not args.no_mtf_filter,
             news_guard=news_guard, trade_history_path=args.trade_history_path,
-            kill_switch_path=args.kill_switch_file,
+            kill_switch_path=args.kill_switch_file, profit_lock_pct=args.profit_lock_pct,
         )
     else:
         run_live(
@@ -620,7 +651,7 @@ def main():
             regime_filter=not args.no_regime_filter,
             multi_timeframe_filter=not args.no_mtf_filter,
             trade_history_path=args.trade_history_path,
-            kill_switch_path=args.kill_switch_file,
+            kill_switch_path=args.kill_switch_file, profit_lock_pct=args.profit_lock_pct,
         )
 
 

@@ -137,3 +137,49 @@ class CircuitBreaker:
                 return True
 
         return False
+
+
+class ProfitLock:
+    """
+    Freno simétrico al circuit breaker, pero a la suba: en vez de
+    proteger contra pérdidas, asegura una ganancia cuando el capital
+    alcanza una meta que el propio usuario define (ej. "+20% desde que
+    empecé a vigilar"). Ninguno de los dos reemplaza al otro -- protegen
+    lados opuestos de la misma cuenta.
+
+    A diferencia del circuit breaker, que se activa por un problema, este
+    freno se activa por una decisión deliberada: "llegué a donde quería,
+    prefiero asegurar esto antes que seguir expuesto buscando más". Una
+    vez activo, el motor deja de abrir posiciones nuevas -- las que ya
+    están abiertas se siguen manejando con su stop loss/take profit
+    normal, igual que con el circuit breaker.
+
+    `reference_capital` es el punto de partida contra el que se mide la
+    ganancia -- a propósito NO es el pico histórico (a diferencia del
+    circuit breaker): lo que importa acá es cuánto se ganó desde que se
+    empezó a vigilar, no desde cualquier máximo pasado.
+    """
+
+    def __init__(self, target_pct: float, reference_capital: float):
+        if target_pct <= 0:
+            raise ValueError("target_pct debe ser positivo (ej. 20.0 para +20%)")
+        if reference_capital <= 0:
+            raise ValueError("reference_capital debe ser positivo")
+        self.target_pct = target_pct
+        self.reference_capital = reference_capital
+        self.triggered = False
+        self.trigger_reason = None
+
+    def check(self, current_capital: float) -> bool:
+        """Devuelve True si el seguro de ganancias está activo (hay que dejar de operar)."""
+        if self.triggered:
+            return True
+
+        gain_pct = (current_capital - self.reference_capital) / self.reference_capital * 100
+        if gain_pct >= self.target_pct:
+            self.triggered = True
+            self.trigger_reason = f"Meta de ganancia alcanzada: +{gain_pct:.1f}% (objetivo: +{self.target_pct:.1f}%)"
+            log.warning("Seguro de ganancias activado: %s", self.trigger_reason)
+            return True
+
+        return False
