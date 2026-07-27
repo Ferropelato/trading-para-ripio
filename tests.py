@@ -503,6 +503,63 @@ def test_live_engine_restores_saved_capital_on_restart():
     print("OK: _LiveEngine restaura el capital real guardado en vez de reiniciar con el --capital de la CLI")
 
 
+def test_live_engine_restores_open_position_in_broker_on_restart():
+    """
+    Bug real, encontrado siguiendo la misma pista que el del capital: si
+    el proceso se para con una posición abierta, `internal_positions` se
+    restauraba bien, pero el bróker (una instancia nueva, sin memoria de
+    nada) quedaba SIN esa posición. `in_position` en process_tick() se
+    calcula mirando solo al bróker (`self.symbol in
+    self.broker.get_open_positions()`), así que en el primer tick tras un
+    reinicio el motor pensaría que no hay nada abierto -- y podría
+    intentar abrir una posición nueva encima de la que en realidad seguía
+    activa, en vez de vigilarla con su stop loss/take profit real.
+    """
+    import os
+    import tempfile
+    from live_runner import _LiveEngine
+    from broker import PaperBroker
+    from risk_profiles import get_profile
+    from safety import CircuitBreaker, ManualKillSwitch
+    from health import Heartbeat
+    from state_store import StateStore
+    from alerts import ConsoleAlertChannel
+    from app_logger import get_logger
+
+    fd, state_path = tempfile.mkstemp(suffix="_live_engine_position_restart.json")
+    os.close(fd)
+    os.remove(state_path)
+    kill_switch_path = ".KILL_SWITCH_test_live_engine_position"
+
+    try:
+        # Corrida 1: se para con una posición abierta y la persiste.
+        StateStore(path=state_path).save(
+            {"TEST_SYM": {"unidades": 0.5, "precio_entrada": 1955.0}}, capital=1023.0, extra={}
+        )
+
+        # Corrida 2 ("reinicio"): un bróker NUEVO, que nunca vio esa operación.
+        broker = PaperBroker(initial_balance=1000.0)
+        engine = _LiveEngine(
+            broker, "TEST_SYM", get_profile("moderado"), "momentum", "moderado",
+            ConsoleAlertChannel(), ManualKillSwitch(control_file=kill_switch_path),
+            CircuitBreaker(), Heartbeat(max_staleness_seconds=99999),
+            StateStore(path=state_path), reconcile_every=1000, log=get_logger("test_live_engine_position"),
+        )
+
+        broker_positions = engine.broker.get_open_positions()
+        assert "TEST_SYM" in broker_positions, (
+            "El bróker debería conocer la posición restaurada, no solo el registro interno"
+        )
+        assert broker_positions["TEST_SYM"]["unidades"] == 0.5
+        assert broker_positions["TEST_SYM"]["precio_entrada"] == 1955.0
+    finally:
+        if os.path.exists(state_path):
+            os.remove(state_path)
+        if os.path.exists(kill_switch_path):
+            os.remove(kill_switch_path)
+    print("OK: _LiveEngine restaura la posición abierta también en el bróker, no solo en el registro interno")
+
+
 def test_state_store_handles_corrupt_file():
     import os
     import tempfile
@@ -2561,6 +2618,7 @@ if __name__ == "__main__":
         test_broker_adapters_dont_leak_into_each_other,
         test_state_survives_simulated_restart,
         test_live_engine_restores_saved_capital_on_restart,
+        test_live_engine_restores_open_position_in_broker_on_restart,
         test_state_store_handles_corrupt_file,
         test_reconciliation_detects_all_mismatch_types,
         test_retry_with_backoff_retries_transient_not_permanent,

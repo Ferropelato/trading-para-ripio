@@ -1357,6 +1357,41 @@ operaciones persistente -- antes de reiniciar la sesión con el fix.
 
 99/99 tests pasando.
 
+## Veintitresava ronda: la misma pista, un bug peor -- posiciones abiertas tampoco sobrevivían al bróker
+
+Siguiendo la misma línea que el bug del capital (ronda anterior), se
+probó a propósito el caso que las dos sesiones reales no habían disparado
+todavía por pura casualidad de timing: **reiniciar el proceso con una
+posición abierta**. Reproducido de forma aislada antes de tocar nada:
+`internal_positions` restauraba la posición correctamente, pero
+`broker.get_open_positions()` quedaba vacío -- el bróker es una instancia
+nueva en cada reinicio, sin memoria de nada anterior, y nada la llenaba
+con lo que ya estaba abierto.
+
+Esto es más serio que el bug del capital: `process_tick()` decide si hay
+que evaluar la salida (`in_position = self.symbol in
+self.broker.get_open_positions()`) mirando SOLO al bróker, no al registro
+interno. Con este bug, tras un reinicio con una posición abierta, el
+motor pensaría que no hay nada activo y podría intentar abrir una
+posición nueva encima de la real, en vez de seguir vigilándola con su
+stop loss/take profit -- perdiendo el control de una posición que sigue
+existiendo. `reconcile()` lo hubiera detectado en el próximo `force_persist()`
+(cada `reconcile_every` ticks) y lo hubiera logueado como error, pero no
+lo corrige solo, y el daño (la posible apertura duplicada) ya podría
+haber pasado antes de esa próxima persistencia.
+
+**Corrección**: `_LiveEngine.__init__` ahora también carga las posiciones
+restauradas directamente en `broker.positions`, no solo en
+`internal_positions`. Test de regresión que reproduce exactamente el
+escenario (estado guardado con una posición abierta, bróker nuevo tras el
+"reinicio") y verifica que el bróker la conoce desde el primer momento.
+Las dos sesiones reales no tenían ninguna posición abierta al momento de
+este fix, así que no hizo falta ninguna corrección manual esta vez -- se
+reiniciaron igual para que el fix quede activo de cara al próximo
+reinicio real que sí encuentre algo abierto.
+
+100/100 tests pasando.
+
 
 ## Notas importantes (leer antes de avanzar)
 

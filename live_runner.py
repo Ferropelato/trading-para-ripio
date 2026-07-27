@@ -102,6 +102,19 @@ class _LiveEngine:
         if saved_state["saved_at"] and saved_state.get("capital") is not None:
             self.broker.balance = saved_state["capital"]
 
+        # Restaurar también las posiciones abiertas EN EL BRÓKER, no solo en
+        # el registro interno -- sin esto, un reinicio con una posición
+        # abierta dejaba `internal_positions` sabiendo que existe pero al
+        # bróker (una instancia nueva, sin memoria de nada anterior) sin
+        # ella. En el primer tick tras el reinicio, `in_position` se
+        # calcula mirando SOLO al bróker (`self.symbol in
+        # self.broker.get_open_positions()`) -- así que el motor pensaría
+        # que no hay nada abierto y podría intentar abrir una posición
+        # nueva encima de la que en realidad seguía activa, en vez de
+        # vigilarla con su stop loss/take profit real.
+        if self.internal_positions:
+            self.broker.positions.update(self.internal_positions)
+
         self.ticks_processed = 0
         self.equity_curve = []
         self.day_start_equity = None
