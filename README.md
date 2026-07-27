@@ -1392,6 +1392,43 @@ reinicio real que sí encuentre algo abierto.
 
 100/100 tests pasando.
 
+## Veinticuatroava ronda: el hallazgo más serio -- un reinicio desactivaba el circuit breaker
+
+Siguiendo la misma línea (¿qué más no sobrevive a un reinicio?), se probó
+el caso más delicado de todos: **¿qué pasa si el circuit breaker está
+activo -- protegiendo la cuenta -- justo cuando el proceso se reinicia?**
+Reproducido antes de escribir ninguna corrección:
+
+1. Se simula una caída del 20% de capital (supera el límite de 15%) -- el
+   circuit breaker se activa correctamente (`tripped = True`).
+2. Se persiste el estado y se crea una instancia nueva de `_LiveEngine`
+   con un `CircuitBreaker` fresco (simulando el reinicio).
+3. El circuit breaker nuevo arranca con `tripped = False` -- **el freno se
+   había desactivado solo**, sin que ninguna condición real lo justificara.
+
+Causa doble: `CircuitBreaker` se construye nuevo en cada arranque sin que
+nada restaure si ya estaba disparado, y `equity_curve` (de donde sale el
+pico histórico para calcular el drawdown) también arrancaba vacía en
+cada reinicio -- así que el primer tick post-reinicio se convertía en el
+nuevo "techo", borrando cualquier caída previa de la cuenta.
+
+Esto es justo el freno de seguridad más destacado en toda la propuesta
+("nunca opera fuera de las reglas de riesgo... frena si el capital cae
+demasiado") -- que un reinicio del proceso (algo tan simple como el que
+se hizo varias veces en esta misma sesión) lo resetee en silencio es el
+hueco más serio encontrado hasta ahora, no uno cosmético.
+
+**Corrección**: `force_persist()` ahora también guarda si el circuit
+breaker está activo, su motivo, y el pico histórico de equity (un solo
+número, no toda la curva -- es lo único que `CircuitBreaker.check()`
+necesita). `_LiveEngine.__init__` restaura los tres. Test de regresión
+que reproduce el escenario exacto (drawdown real, reinicio, freno debe
+seguir activo). Las sesiones reales nunca tuvieron el freno activo, así
+que no hizo falta ninguna corrección manual -- se reiniciaron para que el
+fix quede activo de cara a cualquier freno real futuro.
+
+101/101 tests pasando.
+
 
 ## Notas importantes (leer antes de avanzar)
 

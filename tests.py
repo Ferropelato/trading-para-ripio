@@ -560,6 +560,80 @@ def test_live_engine_restores_open_position_in_broker_on_restart():
     print("OK: _LiveEngine restaura la posición abierta también en el bróker, no solo en el registro interno")
 
 
+def test_live_engine_restores_circuit_breaker_state_on_restart():
+    """
+    Bug real, el más serio de esta línea de auditoría: un reinicio del
+    proceso DESACTIVABA en silencio un circuit breaker que estaba activo
+    (`tripped` siempre arrancaba en False) y borraba el pico histórico de
+    equity que define el drawdown (`equity_curve` volvía a arrancar
+    vacío, así que el primer tick post-reinicio se convertía en el nuevo
+    "pico", ocultando cualquier caída anterior al reinicio). Esto es
+    justo el freno de seguridad más destacado en la propuesta -- que un
+    simple reinicio lo resetee es un hueco serio, no cosmético.
+
+    Reproducido con un caso concreto: capital sube a 1000, cae a 800
+    (-20%, dispara el breaker con el límite en 15%), se persiste, y una
+    instancia NUEVA (bróker y circuit breaker frescos, "reinicio")
+    restaura el estado -- debe seguir tripped, con el pico real (1000)
+    recordado, no reseteado.
+    """
+    import os
+    import tempfile
+    from datetime import datetime, timezone
+    from live_runner import _LiveEngine
+    from broker import PaperBroker
+    from risk_profiles import get_profile
+    from safety import CircuitBreaker, ManualKillSwitch
+    from health import Heartbeat
+    from state_store import StateStore
+    from alerts import ConsoleAlertChannel
+    from app_logger import get_logger
+
+    fd, state_path = tempfile.mkstemp(suffix="_live_engine_breaker_restart.json")
+    os.close(fd)
+    os.remove(state_path)
+    kill_switch_path = ".KILL_SWITCH_test_live_engine_breaker"
+
+    try:
+        broker = PaperBroker(initial_balance=1000.0)
+        cb = CircuitBreaker(max_drawdown_pct=15.0, max_daily_loss_pct=90.0)
+        engine = _LiveEngine(
+            broker, "TEST_SYM", get_profile("moderado"), "momentum", "moderado",
+            ConsoleAlertChannel(), ManualKillSwitch(control_file=kill_switch_path),
+            cb, Heartbeat(max_staleness_seconds=99999),
+            StateStore(path=state_path), reconcile_every=1000, log=get_logger("test_live_engine_breaker"),
+        )
+        now = datetime.now(timezone.utc)
+        engine.process_tick(now, 100.0, current_atr=2.0, sig=0)
+        engine.equity_curve[-1] = 1000.0  # fija el pico en 1000 para el escenario
+        broker.balance = 800.0  # caída del 20% -- supera el límite de 15%
+        engine.process_tick(now, 100.0, current_atr=2.0, sig=0)
+        assert cb.tripped is True, "El circuit breaker debería haberse activado con un drawdown del 20%"
+        engine.force_persist()
+
+        # "Reinicio": bróker y circuit breaker completamente nuevos.
+        broker2 = PaperBroker(initial_balance=1000.0)
+        cb2 = CircuitBreaker(max_drawdown_pct=15.0, max_daily_loss_pct=90.0)
+        engine2 = _LiveEngine(
+            broker2, "TEST_SYM", get_profile("moderado"), "momentum", "moderado",
+            ConsoleAlertChannel(), ManualKillSwitch(control_file=kill_switch_path),
+            cb2, Heartbeat(max_staleness_seconds=99999),
+            StateStore(path=state_path), reconcile_every=1000, log=get_logger("test_live_engine_breaker2"),
+        )
+
+        assert cb2.tripped is True, "El freno activo debe seguir activo tras el reinicio, no resetearse solo"
+        assert cb2.trip_reason == cb.trip_reason
+        assert engine2.equity_curve == [1000.0], (
+            f"El pico histórico de equity debe sobrevivir al reinicio (obtuvo {engine2.equity_curve})"
+        )
+    finally:
+        if os.path.exists(state_path):
+            os.remove(state_path)
+        if os.path.exists(kill_switch_path):
+            os.remove(kill_switch_path)
+    print("OK: _LiveEngine restaura el estado del circuit breaker (tripped + pico de equity) tras un reinicio")
+
+
 def test_state_store_handles_corrupt_file():
     import os
     import tempfile
@@ -2619,6 +2693,7 @@ if __name__ == "__main__":
         test_state_survives_simulated_restart,
         test_live_engine_restores_saved_capital_on_restart,
         test_live_engine_restores_open_position_in_broker_on_restart,
+        test_live_engine_restores_circuit_breaker_state_on_restart,
         test_state_store_handles_corrupt_file,
         test_reconciliation_detects_all_mismatch_types,
         test_retry_with_backoff_retries_transient_not_permanent,

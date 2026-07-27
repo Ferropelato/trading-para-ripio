@@ -115,8 +115,23 @@ class _LiveEngine:
         if self.internal_positions:
             self.broker.positions.update(self.internal_positions)
 
+        # Restaurar la memoria del circuit breaker -- sin esto, un reinicio
+        # DESACTIVABA en silencio un freno que estaba activo (`tripped`
+        # siempre arrancaba en False, sin importar qué tan reciente había
+        # sido el drawdown que lo disparó), y el pico histórico de equity
+        # que define el drawdown también se perdía (`equity_curve` volvía
+        # a arrancar vacío, así que el primer tick post-reinicio se
+        # convertía en el nuevo "pico", borrando cualquier caída anterior
+        # al reinicio). Guardar solo el pico (no toda la curva) alcanza --
+        # es lo único que `CircuitBreaker.check()` necesita.
+        extra = saved_state.get("extra") or {}
+        if saved_state["saved_at"]:
+            self.circuit_breaker.tripped = extra.get("circuit_breaker_tripped", False)
+            self.circuit_breaker.trip_reason = extra.get("circuit_breaker_trip_reason")
+        saved_peak_equity = extra.get("peak_equity")
+
         self.ticks_processed = 0
-        self.equity_curve = []
+        self.equity_curve = [saved_peak_equity] if saved_peak_equity is not None else []
         self.day_start_equity = None
         self.current_day = None
 
@@ -304,9 +319,13 @@ class _LiveEngine:
             self.force_persist()
 
     def force_persist(self):
+        peak_equity = max(self.equity_curve) if self.equity_curve else None
         self.state_store.save(self.internal_positions, capital=self.broker.get_balance(),
                                extra={"stop_loss": self.stop_loss, "take_profit": self.take_profit,
-                                      "pending_order": self.pending_order})
+                                      "pending_order": self.pending_order,
+                                      "circuit_breaker_tripped": self.circuit_breaker.tripped,
+                                      "circuit_breaker_trip_reason": self.circuit_breaker.trip_reason,
+                                      "peak_equity": peak_equity})
         report = reconcile(self.internal_positions, self.broker.get_open_positions())
         if not report["coincide"]:
             self.log.error("Desfasaje detectado entre el estado interno y el bróker: %s", report)
