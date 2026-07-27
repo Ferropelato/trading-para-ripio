@@ -1254,7 +1254,19 @@ también -- justo el tipo de acoplamiento que el aislamiento multi-usuario
 (`multi_user.py`) ya evita para el producto real, pero que las sesiones
 de demo standalone no tenían resuelto. Se agregó `--kill-switch-file` a
 la CLI de `live_runner.py` (con el mismo valor por defecto de siempre,
-así no rompe nada existente) para que cada sesión pueda tener el suyo.
+así no rompe nada existente) para que cada sesión pueda tener el suyo, y
+se reiniciaron `BTC_USDC`/`ETH_USDC` con `.KILL_SWITCH_BTC_USDC` /
+`.KILL_SWITCH_ETH_USDC` propios (el historial de operaciones sobrevivió
+intacto al reinicio, como está pensado).
+
+**Corrección sobre la marcha en `status_report.py`**: la primera versión
+intentaba adivinar si una sesión tenía kill-switch propio chequeando si
+`.KILL_SWITCH_<SÍMBOLO>` existía en disco -- pero ese archivo solo existe
+mientras el freno está ACTIVO (es la bandera, no una ruta de config), así
+que su ausencia no dice nada sobre qué archivo está mirando la sesión.
+Corregido para asumir directamente la convención (siempre reporta sobre
+`.KILL_SWITCH_<SÍMBOLO>`), con una nota aclarando la limitación en vez de
+un heurístico silenciosamente equivocado.
 
 96/96 tests pasando.
 

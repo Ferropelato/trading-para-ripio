@@ -75,13 +75,24 @@ def build_status_report(symbol: str, state_path: str, trades_path: str = None,
 def _discover_sessions():
     """Busca `live_state_<algo>.json` en la carpeta actual y empareja cada
     uno con `trades_<algo>.csv` si existe -- sin necesidad de que el
-    usuario tipee ninguna ruta."""
+    usuario tipee ninguna ruta.
+
+    Para el kill-switch asume la convención `.KILL_SWITCH_<SIMBOLO>` (la
+    que usa `--kill-switch-file` en live_runner.py) -- OJO: el archivo de
+    control solo existe en disco mientras el freno está ACTIVO, así que su
+    ausencia no dice nada sobre qué ruta está mirando la sesión, solo que
+    no está pausada. Si una sesión se arrancó SIN pasar --kill-switch-file
+    (con el genérico .KILL_SWITCH de antes), este reporte igual va a
+    consultar la ruta por convención y puede no coincidir con la real --
+    para confirmarlo con certeza, mirá el comando con el que arrancó esa
+    sesión."""
     sessions = []
     for state_path in sorted(glob.glob("live_state_*.json")):
         base = state_path[len("live_state_"):-len(".json")]
         symbol = base.upper()
         trades_path = f"trades_{base}.csv"
-        sessions.append((symbol, state_path, trades_path if os.path.exists(trades_path) else None))
+        kill_switch = f".KILL_SWITCH_{symbol}"
+        sessions.append((symbol, state_path, trades_path if os.path.exists(trades_path) else None, kill_switch))
     return sessions
 
 
@@ -90,7 +101,8 @@ def main():
     parser.add_argument("--symbol", help="Si se pasa junto con --state, reporta solo esa sesión puntual")
     parser.add_argument("--state", help="Ruta del archivo de estado (--state-path del live_runner)")
     parser.add_argument("--trades", help="Ruta del historial de operaciones (--trade-history-path del live_runner)")
-    parser.add_argument("--kill-switch", default=".KILL_SWITCH", help="Ruta del archivo de control del kill-switch")
+    parser.add_argument("--kill-switch", default=".KILL_SWITCH",
+                         help="Ruta del archivo de control del kill-switch (solo se usa si además pasás --state)")
     parser.add_argument("--recent", type=int, default=5, help="Cuántas operaciones recientes mostrar")
     args = parser.parse_args()
 
@@ -105,20 +117,16 @@ def main():
               "¿estás parado en el directorio del proyecto, con alguna sesión corrida al menos una vez?")
         return
 
-    kill_switch_files = {path for _, path, _ in
-                          [(s, args.kill_switch, None) for s in sessions]}
     reports = []
-    for symbol, state_path, trades_path in sessions:
-        reports.append(build_status_report(symbol, state_path, trades_path, args.kill_switch, args.recent))
+    for symbol, state_path, trades_path, kill_switch_path in sessions:
+        reports.append(build_status_report(symbol, state_path, trades_path, kill_switch_path, args.recent))
     print(("\n" + "-" * 50 + "\n").join(reports))
 
-    if len(sessions) > 1 and len(kill_switch_files) == 1:
-        print("\n[!] Ojo: todas las sesiones de esta demo comparten el mismo archivo de "
-              "kill-switch por defecto (.KILL_SWITCH) -- activar el freno manual pausaría "
-              "TODAS a la vez, no una sola. En el motor multi-usuario real (multi_user.py) "
-              "esto ya está resuelto (cada usuario tiene su propio archivo); acá, si querés "
-              "frenos independientes por sesión, arrancá cada una con --kill-switch-file "
-              "propio (ver nota en el README).")
+    if len(sessions) > 1:
+        print("\nNota: el kill-switch de arriba asume que cada sesión arrancó con "
+              "--kill-switch-file .KILL_SWITCH_<SÍMBOLO> (la convención actual). Si alguna "
+              "sesión sigue corriendo con el genérico .KILL_SWITCH de antes de esta ronda, "
+              "reiniciala con --kill-switch-file para que quede aislada de las demás.")
 
 
 if __name__ == "__main__":
