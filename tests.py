@@ -1740,6 +1740,60 @@ def test_live_engine_partial_buy_fill_registers_position_with_actual_units():
     print("OK: un llenado parcial en la compra registra la posición con las unidades REALMENTE compradas")
 
 
+def test_status_report_reflects_state_and_history():
+    """
+    status_report.py lee el estado y el historial ya persistidos y arma un
+    reporte en texto -- no debe inventar ni recalcular nada, solo mostrar
+    lo que ya está guardado.
+    """
+    import os
+    import tempfile
+    from state_store import StateStore
+    from trade_history import TradeHistoryLog
+    from status_report import build_status_report
+
+    fd, state_path = tempfile.mkstemp(suffix="_status_report_state.json")
+    os.close(fd)
+    os.remove(state_path)
+    fd2, trades_path = tempfile.mkstemp(suffix="_status_report_trades.csv")
+    os.close(fd2)
+    os.remove(trades_path)
+    kill_switch_path = ".KILL_SWITCH_test_status_report"
+
+    try:
+        StateStore(path=state_path).save(
+            {"TEST_SYM": {"unidades": 1.5, "precio_entrada": 100.0}}, capital=850.0,
+            extra={"stop_loss": 95.0, "take_profit": 110.0, "pending_order": None},
+        )
+        history = TradeHistoryLog(trades_path)
+        history.append(symbol="TEST_SYM", side="buy", motivo="apertura", units=1.5,
+                        price=100.0, pnl=None, balance_resultante=850.0)
+        history.append(symbol="TEST_SYM", side="sell", motivo="take_profit", units=1.5,
+                        price=110.0, pnl=15.0, balance_resultante=865.0)
+
+        report = build_status_report("TEST_SYM", state_path, trades_path, kill_switch_path)
+
+        assert "TEST_SYM" in report
+        assert "850.00" in report, "Debe mostrar el capital guardado"
+        assert "1.5 unidades @ 100.0" in report, "Debe mostrar la posición abierta guardada"
+        assert "1 operaciones cerradas (1 ganadoras, 0 perdedoras)" in report
+        assert "+15.00" in report, "Debe mostrar el resultado neto"
+        assert "inactivo" in report, "El kill-switch no existe -- debe reportarse inactivo"
+
+        with open(kill_switch_path, "w", encoding="utf-8") as f:
+            f.write("pausado a mano")
+        report_active = build_status_report("TEST_SYM", state_path, trades_path, kill_switch_path)
+        assert "ACTIVO" in report_active, "Con el archivo de control presente, debe reportar el kill-switch activo"
+    finally:
+        if os.path.exists(state_path):
+            os.remove(state_path)
+        if os.path.exists(trades_path):
+            os.remove(trades_path)
+        if os.path.exists(kill_switch_path):
+            os.remove(kill_switch_path)
+    print("OK: status_report.py refleja fielmente el estado y el historial ya persistidos")
+
+
 def test_trade_history_log_persists_across_process_restarts():
     """
     A diferencia del estado de posiciones (una FOTO del momento), el
@@ -2410,6 +2464,7 @@ if __name__ == "__main__":
         test_live_engine_partial_buy_fill_registers_position_with_actual_units,
         test_trade_history_log_persists_across_process_restarts,
         test_live_engine_records_buy_and_sell_in_trade_history,
+        test_status_report_reflects_state_and_history,
         test_load_many_simultaneous_circuit_breakers_stay_isolated_and_detected,
         test_manual_kill_switch_reason_returns_saved_message,
         test_live_engine_process_tick_with_active_kill_switch_does_not_crash,

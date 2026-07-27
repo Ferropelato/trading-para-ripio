@@ -308,7 +308,7 @@ def run_live(csv_path: str, strategy_name: str, profile_name: str,
              state_path: str = "engine_state.json", reconcile_every: int = 10,
              max_drawdown_pct: float = 15.0, max_daily_loss_pct: float = 5.0,
              regime_filter: bool = True, multi_timeframe_filter: bool = True,
-             trade_history_path: str = None):
+             trade_history_path: str = None, kill_switch_path: str = ".KILL_SWITCH"):
     log = get_logger("live_runner")
     log.info("Iniciando runner en vivo (modo paper trading, replay histórico) — %s / %s sobre %s",
               strategy_name, profile_name, symbol)
@@ -332,7 +332,7 @@ def run_live(csv_path: str, strategy_name: str, profile_name: str,
     trade_history = TradeHistoryLog(trade_history_path) if trade_history_path else None
     engine = _LiveEngine(
         broker, symbol, profile, strategy_name, profile_name,
-        ConsoleAlertChannel(), ManualKillSwitch(),
+        ConsoleAlertChannel(), ManualKillSwitch(control_file=kill_switch_path),
         CircuitBreaker(max_drawdown_pct, max_daily_loss_pct),
         Heartbeat(max_staleness_seconds=3600),  # en un loop real, ajustar según frecuencia del feed
         StateStore(path=state_path), reconcile_every, log,
@@ -367,7 +367,8 @@ def run_live_polling(price_source, symbol: str, strategy_name: str, profile_name
                       state_path: str = "engine_state.json", reconcile_every: int = 10,
                       max_drawdown_pct: float = 15.0, max_daily_loss_pct: float = 5.0,
                       regime_filter: bool = True, multi_timeframe_filter: bool = True,
-                      max_history_rows: int = 5000, news_guard=None, trade_history_path: str = None):
+                      max_history_rows: int = 5000, news_guard=None, trade_history_path: str = None,
+                      kill_switch_path: str = ".KILL_SWITCH"):
     """
     Paper trading contra un feed de precios REAL (no replay histórico): en
     cada intervalo de `poll_interval_seconds` pide el precio actual a
@@ -409,7 +410,7 @@ def run_live_polling(price_source, symbol: str, strategy_name: str, profile_name
     trade_history = TradeHistoryLog(trade_history_path) if trade_history_path else None
     engine = _LiveEngine(
         broker, symbol, profile, strategy_name, profile_name,
-        ConsoleAlertChannel(), ManualKillSwitch(),
+        ConsoleAlertChannel(), ManualKillSwitch(control_file=kill_switch_path),
         CircuitBreaker(max_drawdown_pct, max_daily_loss_pct),
         Heartbeat(max_staleness_seconds=max(poll_interval_seconds * 5, 300)),
         StateStore(path=state_path), reconcile_every, log,
@@ -485,6 +486,11 @@ def main():
                          help="Ruta de un CSV donde se registra cada operación cerrada, acumulado entre reinicios "
                               "(pensado para uso intermitente: parar y retomar días o semanas después y tener un "
                               "único reporte de todo lo operado en el medio). Si no se pasa, no se registra.")
+    parser.add_argument("--kill-switch-file", type=str, default=".KILL_SWITCH",
+                         help="Ruta del archivo de control del kill-switch manual. Por defecto todas las sesiones "
+                              "usan el mismo (.KILL_SWITCH) -- si corrés varias sesiones a la vez (ej. un símbolo "
+                              "por proceso) y querés poder pausar cada una por separado, pasale un archivo distinto "
+                              "a cada una (ej. .KILL_SWITCH_BTC_USDC).")
     parser.add_argument("--max-drawdown", type=float, default=15.0)
     parser.add_argument("--max-daily-loss", type=float, default=5.0)
     parser.add_argument("--no-regime-filter", action="store_true",
@@ -540,6 +546,7 @@ def main():
             max_drawdown_pct=args.max_drawdown, max_daily_loss_pct=args.max_daily_loss,
             regime_filter=not args.no_regime_filter, multi_timeframe_filter=not args.no_mtf_filter,
             news_guard=news_guard, trade_history_path=args.trade_history_path,
+            kill_switch_path=args.kill_switch_file,
         )
     else:
         run_live(
@@ -550,6 +557,7 @@ def main():
             regime_filter=not args.no_regime_filter,
             multi_timeframe_filter=not args.no_mtf_filter,
             trade_history_path=args.trade_history_path,
+            kill_switch_path=args.kill_switch_file,
         )
 
 

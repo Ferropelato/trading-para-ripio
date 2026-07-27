@@ -1224,6 +1224,40 @@ a esconder a los demás.
 
 95/95 tests pasando.
 
+## Veinteava ronda: primeras operaciones reales cerradas + reporte de estado + kill-switch compartido
+
+**El fix de la ronda anterior (margen de seguridad en `position_size()`)
+ya se validó con operaciones reales**: tras reiniciar la sesión de
+`ETH_USDC` con la corrección aplicada, el motor completó dos operaciones
+de punta a punta (compra y venta) sin ningún rechazo por saldo
+insuficiente -- las dos cerraron con una pérdida chica y controlada
+(-2.01 y -2.15 sobre un capital de ~1000), exactamente el comportamiento
+esperado de un stop loss haciendo su trabajo, no un error. Es la primera
+vez que este prototipo ejecuta un ciclo completo de compra+venta contra
+precios reales de punta a punta, y el historial persistente (ronda
+anterior) lo registró correctamente.
+
+**Se agregó `status_report.py`**: un comando de una sola línea
+(`python status_report.py`, sin argumentos) que arma un reporte en texto
+plano del estado de todas las sesiones en vivo que encuentra en la carpeta
+-- capital, posiciones abiertas, si el kill-switch está activo, y un
+resumen del historial de operaciones con las últimas N. Pensado para que
+el usuario pueda chequear "¿cómo está esto ahora?" él mismo, sin tener que
+revisar logs a mano ni pedirlo.
+
+**Al construirlo apareció un bug real**: `run_live`/`run_live_polling` no
+exponían forma de elegir el archivo de control del kill-switch manual --
+todas las sesiones usaban el mismo por defecto (`.KILL_SWITCH`). Con dos
+sesiones corriendo a la vez (`BTC_USDC` y `ETH_USDC`, como ahora mismo),
+esto significa que pausar una a mano pausaría accidentalmente la otra
+también -- justo el tipo de acoplamiento que el aislamiento multi-usuario
+(`multi_user.py`) ya evita para el producto real, pero que las sesiones
+de demo standalone no tenían resuelto. Se agregó `--kill-switch-file` a
+la CLI de `live_runner.py` (con el mismo valor por defecto de siempre,
+así no rompe nada existente) para que cada sesión pueda tener el suyo.
+
+96/96 tests pasando.
+
 
 ## Notas importantes (leer antes de avanzar)
 
