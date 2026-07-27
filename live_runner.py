@@ -26,7 +26,7 @@ Uso:
 import argparse
 import signal as system_signal
 import time
-from datetime import datetime
+from datetime import datetime, date as date_cls
 
 import pandas as pd
 
@@ -140,10 +140,18 @@ class _LiveEngine:
             if paused_until_str:
                 self.news_guard.restore_paused_until(datetime.fromisoformat(paused_until_str))
 
+        # Restaurar la referencia de pérdida diaria -- mismo problema, un
+        # tercer lugar: si el proceso se reinicia a mitad de un día que ya
+        # venía con pérdida, sin esto `day_start_equity` se reseteaba al
+        # equity DE ESE MOMENTO (post-reinicio), ocultando cualquier
+        # caída del día anterior al reinicio del chequeo de pérdida diaria
+        # del circuit breaker.
+        saved_current_day = extra.get("current_day")
+        self.day_start_equity = extra.get("day_start_equity") if saved_current_day else None
+        self.current_day = date_cls.fromisoformat(saved_current_day) if saved_current_day else None
+
         self.ticks_processed = 0
         self.equity_curve = [saved_peak_equity] if saved_peak_equity is not None else []
-        self.day_start_equity = None
-        self.current_day = None
 
     def _mark_to_market(self, price):
         cash = self.broker.get_balance()
@@ -337,7 +345,9 @@ class _LiveEngine:
                                       "circuit_breaker_tripped": self.circuit_breaker.tripped,
                                       "circuit_breaker_trip_reason": self.circuit_breaker.trip_reason,
                                       "peak_equity": peak_equity,
-                                      "news_paused_until": news_paused_until.isoformat() if news_paused_until else None})
+                                      "news_paused_until": news_paused_until.isoformat() if news_paused_until else None,
+                                      "current_day": self.current_day.isoformat() if self.current_day else None,
+                                      "day_start_equity": self.day_start_equity})
         report = reconcile(self.internal_positions, self.broker.get_open_positions())
         if not report["coincide"]:
             self.log.error("Desfasaje detectado entre el estado interno y el bróker: %s", report)

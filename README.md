@@ -1459,6 +1459,26 @@ también.
 
 102/102 tests pasando.
 
+## Veintiseisava ronda: cierre de la línea -- la referencia de pérdida diaria
+
+Último hueco de esta familia: el circuit breaker chequea DOS cosas
+(drawdown desde el pico histórico, y pérdida dentro del día actual). Ya
+se había corregido la primera (ronda 24); la referencia de la segunda
+(`day_start_equity`/`current_day`) tenía el mismo problema -- vivía solo
+en memoria. Un reinicio a mitad de un día que ya venía con pérdida
+reseteaba la referencia al equity del momento del reinicio, ocultando esa
+caída del chequeo de pérdida diaria (aunque el chequeo de drawdown desde
+el pico, ya corregido, seguía funcionando como red de contención de
+fondo).
+
+Corregido igual que los anteriores: se persiste y se restaura. Test de
+regresión. Con esto, **los cuatro puntos de memoria que definen si el
+motor sigue operando con seguridad tras un reinicio** (capital,
+posiciones abiertas, estado del circuit breaker completo -- pico +
+pérdida diaria --, y pausa por noticias) están todos cubiertos.
+
+103/103 tests pasando.
+
 
 ## Notas importantes (leer antes de avanzar)
 

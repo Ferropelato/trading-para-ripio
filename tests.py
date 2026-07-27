@@ -699,6 +699,70 @@ def test_live_engine_restores_news_pause_on_restart():
     print("OK: _LiveEngine restaura la pausa automática por noticias tras un reinicio")
 
 
+def test_live_engine_restores_daily_loss_reference_on_restart():
+    """
+    Cierre de la línea de auditoría de reinicios: la referencia de
+    pérdida diaria (`day_start_equity`/`current_day`, el segundo de los
+    dos chequeos del circuit breaker junto al drawdown desde el pico)
+    tenía el mismo problema -- vivía solo en memoria. Un reinicio a mitad
+    de un día que ya venía con pérdida reseteaba la referencia al equity
+    del momento del reinicio, ocultando la caída previa del chequeo de
+    pérdida diaria.
+    """
+    import os
+    import tempfile
+    from datetime import datetime, timezone
+    from live_runner import _LiveEngine
+    from broker import PaperBroker
+    from risk_profiles import get_profile
+    from safety import CircuitBreaker, ManualKillSwitch
+    from health import Heartbeat
+    from state_store import StateStore
+    from alerts import ConsoleAlertChannel
+    from app_logger import get_logger
+
+    fd, state_path = tempfile.mkstemp(suffix="_live_engine_daily_restart.json")
+    os.close(fd)
+    os.remove(state_path)
+    kill_switch_path = ".KILL_SWITCH_test_live_engine_daily"
+
+    try:
+        broker = PaperBroker(initial_balance=1000.0)
+        engine = _LiveEngine(
+            broker, "TEST_SYM", get_profile("moderado"), "momentum", "moderado",
+            ConsoleAlertChannel(), ManualKillSwitch(control_file=kill_switch_path),
+            CircuitBreaker(), Heartbeat(max_staleness_seconds=99999),
+            StateStore(path=state_path), reconcile_every=1000, log=get_logger("test_live_engine_daily"),
+        )
+        now = datetime.now(timezone.utc)
+        engine.process_tick(now, 100.0, current_atr=2.0, sig=0)  # day_start_equity queda en 1000
+        broker.balance = 950.0  # -5% en el mismo día
+        engine.process_tick(now, 100.0, current_atr=2.0, sig=0)
+        assert engine.day_start_equity == 1000.0
+        engine.force_persist()
+
+        broker2 = PaperBroker(initial_balance=1000.0)
+        broker2.balance = 950.0
+        engine2 = _LiveEngine(
+            broker2, "TEST_SYM", get_profile("moderado"), "momentum", "moderado",
+            ConsoleAlertChannel(), ManualKillSwitch(control_file=kill_switch_path),
+            CircuitBreaker(), Heartbeat(max_staleness_seconds=99999),
+            StateStore(path=state_path), reconcile_every=1000, log=get_logger("test_live_engine_daily2"),
+        )
+
+        assert engine2.day_start_equity == 1000.0, (
+            f"Debe restaurar el equity real de inicio del día (1000.0), no reiniciarlo al actual "
+            f"(obtuvo {engine2.day_start_equity})"
+        )
+        assert engine2.current_day == engine.current_day
+    finally:
+        if os.path.exists(state_path):
+            os.remove(state_path)
+        if os.path.exists(kill_switch_path):
+            os.remove(kill_switch_path)
+    print("OK: _LiveEngine restaura la referencia de pérdida diaria tras un reinicio")
+
+
 def test_state_store_handles_corrupt_file():
     import os
     import tempfile
@@ -2760,6 +2824,7 @@ if __name__ == "__main__":
         test_live_engine_restores_open_position_in_broker_on_restart,
         test_live_engine_restores_circuit_breaker_state_on_restart,
         test_live_engine_restores_news_pause_on_restart,
+        test_live_engine_restores_daily_loss_reference_on_restart,
         test_state_store_handles_corrupt_file,
         test_reconciliation_detects_all_mismatch_types,
         test_retry_with_backoff_retries_transient_not_permanent,
