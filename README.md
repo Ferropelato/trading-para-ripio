@@ -1521,6 +1521,63 @@ pausar del todo le pone techo a la ganancia total sin necesidad.
 
 108/108 tests pasando.
 
+## Veintiochoava ronda: multi-par real con cupo compartido (segunda pieza del roadmap, ya construida)
+
+Segunda de las tres ideas del roadmap (ronda 17) que pasa a ser código
+real: que un mismo usuario reparta su asignación entre varios pares a la
+vez, compartiendo un único cupo de posiciones simultáneas -- en vez de
+una sesión por par, como corrían hasta ahora `BTC_USDC` y `ETH_USDC`.
+
+**Hallazgo de paso, antes de escribir nada nuevo**: `risk_profiles.py`
+define `max_open_positions` para cada perfil (3/5/8 según
+conservador/moderado/agresivo) desde las primeras rondas del proyecto --
+pero **nunca se aplicaba en ningún lado del motor**, ni en `_LiveEngine`
+ni en `portfolio.py` (el backtester multi-activo existente). No era un
+bug visible porque una sesión de un solo símbolo nunca podía abrir más de
+una posición de todos modos -- recién con multi-símbolo hacía falta que
+ese número significara algo de verdad.
+
+**Diseño**: en vez de duplicar la lógica de decisión por-tick en una
+función nueva (la lección más citada en este README: la lógica copiada
+en dos lugares es de donde salieron varios bugs reales), se generalizó
+`_LiveEngine` para aceptar uno o varios símbolos con el mismo código:
+
+- `stop_loss`/`take_profit`/`pending_order` pasan de un único valor a un
+  diccionario `símbolo -> valor` -- lo único genuinamente por-símbolo.
+- Capital, circuit breaker, seguro de ganancias, kill-switch y pausa por
+  noticias siguen siendo UN solo objeto compartido -- protegen la cuenta
+  completa, no un par en particular (ya lo eran así incluso en la versión
+  de un solo símbolo).
+- `_mark_to_market()` ahora suma el valor de TODAS las posiciones
+  abiertas (cada una a su último precio conocido), no solo la del tick
+  actual -- necesario para que el circuit breaker/seguro de ganancias
+  midan la cuenta entera.
+- Nuevo: `max_positions`, el cupo COMPARTIDO -- antes de abrir una
+  posición nueva en cualquier símbolo, se chequea el total de posiciones
+  abiertas entre TODOS los símbolos contra este límite, no un conteo por
+  símbolo. Por defecto usa el `max_open_positions` del perfil elegido
+  (finalmente conectado a algo real).
+- `process_tick()` ahora recibe un `symbol` explícito (opcional si el
+  motor solo maneja uno, para no romper ninguno de los ~15 tests
+  existentes que lo llamaban sin ese argumento).
+- `run_live_polling()` se generalizó de la misma forma (acepta un símbolo
+  suelto o una lista, con `seed_csv` como dict `{símbolo: ruta}` en ese
+  caso) -- un solo ciclo de polling pide el precio de cada símbolo por
+  separado (son instrumentos distintos, no hay forma de compartir esa
+  consulta) y procesa el tick de cada uno contra la misma cuenta.
+- CLI: `--symbols BTC_USDC,ETH_USDC,...` + `--csvs ruta1,ruta2,...` (en
+  el mismo orden) reemplazan a `--symbol`/`--csv` para este modo;
+  `--max-positions` permite overridear el cupo del perfil.
+
+`run_live` (replay histórico de un CSV) se dejó sin tocar -- el
+backtesting multi-activo ya lo cubre `portfolio.py` desde antes, y
+mezclar ambos casos en el mismo refactor no aportaba nada.
+
+108/108 → **111/111** tests pasando (3 tests nuevos: cupo compartido
+haciendo lo que promete, varios símbolos operando en simultáneo sin
+límite artificial cuando no se pide uno, y una corrida de punta a punta
+con dos símbolos bajo un feed de prueba).
+
 
 ## Notas importantes (leer antes de avanzar)
 

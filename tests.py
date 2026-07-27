@@ -449,6 +449,151 @@ def test_live_polling_runs_with_stub_price_feed():
     print("OK: el modo de paper trading con precios en vivo corre de punta a punta con un feed de prueba")
 
 
+def test_live_engine_enforces_shared_position_cap_across_symbols():
+    """
+    El cupo de posiciones simultáneas (`max_positions`) es COMPARTIDO
+    entre todos los símbolos que maneja un mismo motor -- no un cupo por
+    símbolo. Con el cupo en 1, una señal de compra en un segundo símbolo
+    no debe abrir nada mientras ya hay una posición abierta en el primero.
+    """
+    import os
+    import tempfile
+    from datetime import datetime, timezone
+    from live_runner import _LiveEngine
+    from broker import PaperBroker
+    from risk_profiles import get_profile
+    from safety import CircuitBreaker, ManualKillSwitch
+    from health import Heartbeat
+    from state_store import StateStore
+    from alerts import ConsoleAlertChannel
+    from app_logger import get_logger
+
+    fd, state_path = tempfile.mkstemp(suffix="_live_engine_shared_cap.json")
+    os.close(fd)
+    os.remove(state_path)
+    kill_switch_path = ".KILL_SWITCH_test_live_engine_shared_cap"
+
+    try:
+        broker = PaperBroker(initial_balance=1000.0)
+        engine = _LiveEngine(
+            broker, ["SYM_A", "SYM_B"], get_profile("moderado"), "momentum", "moderado",
+            ConsoleAlertChannel(), ManualKillSwitch(control_file=kill_switch_path),
+            CircuitBreaker(), Heartbeat(max_staleness_seconds=99999),
+            StateStore(path=state_path), reconcile_every=1000, log=get_logger("test_live_engine_shared_cap"),
+            max_positions=1,
+        )
+        now = datetime.now(timezone.utc)
+
+        engine.process_tick(now, 100.0, current_atr=2.0, sig=1, symbol="SYM_A")
+        assert "SYM_A" in engine.internal_positions, "Debería abrir la primera posición sin problema"
+
+        engine.process_tick(now, 50.0, current_atr=1.0, sig=1, symbol="SYM_B")
+        assert "SYM_B" not in engine.internal_positions, (
+            "No debería abrir una segunda posición -- el cupo compartido (1) ya está ocupado por SYM_A"
+        )
+        assert len(broker.get_open_positions()) == 1
+    finally:
+        if os.path.exists(state_path):
+            os.remove(state_path)
+        if os.path.exists(kill_switch_path):
+            os.remove(kill_switch_path)
+    print("OK: el cupo de posiciones simultáneas es compartido entre símbolos, no por símbolo")
+
+
+def test_live_engine_multi_symbol_shares_broker_without_artificial_limit():
+    """
+    Sin un cupo explícito (max_positions=None, el default), cada símbolo
+    puede abrir su propia posición con normalidad -- todos comparten el
+    mismo bróker (mismo pool de capital), pero no hay un límite
+    artificial de a uno.
+    """
+    import os
+    import tempfile
+    from datetime import datetime, timezone
+    from live_runner import _LiveEngine
+    from broker import PaperBroker
+    from risk_profiles import get_profile
+    from safety import CircuitBreaker, ManualKillSwitch
+    from health import Heartbeat
+    from state_store import StateStore
+    from alerts import ConsoleAlertChannel
+    from app_logger import get_logger
+
+    fd, state_path = tempfile.mkstemp(suffix="_live_engine_multi_free.json")
+    os.close(fd)
+    os.remove(state_path)
+    kill_switch_path = ".KILL_SWITCH_test_live_engine_multi_free"
+
+    try:
+        broker = PaperBroker(initial_balance=1000.0)
+        engine = _LiveEngine(
+            broker, ["SYM_A", "SYM_B"], get_profile("moderado"), "momentum", "moderado",
+            ConsoleAlertChannel(), ManualKillSwitch(control_file=kill_switch_path),
+            CircuitBreaker(), Heartbeat(max_staleness_seconds=99999),
+            StateStore(path=state_path), reconcile_every=1000, log=get_logger("test_live_engine_multi_free"),
+        )
+        now = datetime.now(timezone.utc)
+        balance_before = broker.get_balance()
+
+        engine.process_tick(now, 100.0, current_atr=2.0, sig=1, symbol="SYM_A")
+        balance_after_a = broker.get_balance()
+        assert "SYM_A" in engine.internal_positions
+        assert balance_after_a < balance_before, "Abrir en SYM_A debe consumir capital del mismo pool compartido"
+
+        engine.process_tick(now, 50.0, current_atr=1.0, sig=1, symbol="SYM_B")
+        assert "SYM_B" in engine.internal_positions, "Sin cupo explícito, un segundo símbolo también debe poder abrir"
+        assert len(broker.get_open_positions()) == 2
+
+        equity = engine._mark_to_market()
+        assert abs(equity - balance_before) < 5.0, (
+            "El equity total (efectivo + ambas posiciones a su precio de entrada) debe seguir cerca del capital inicial"
+        )
+    finally:
+        if os.path.exists(state_path):
+            os.remove(state_path)
+        if os.path.exists(kill_switch_path):
+            os.remove(kill_switch_path)
+    print("OK: varios símbolos bajo un mismo motor comparten capital y pueden operar en simultáneo sin un cupo artificial")
+
+
+def test_run_live_polling_multi_symbol_smoke_test():
+    """
+    Test de humo de run_live_polling con VARIOS símbolos a la vez (ver
+    Fase roadmap: multi-par con cupo compartido) -- un price_source de
+    prueba con un precio distinto por símbolo, corre varios ciclos sin
+    romperse, y nunca deja más posiciones abiertas que el cupo compartido.
+    """
+    import os
+    import tempfile
+    from live_runner import run_live_polling
+
+    class StubMultiPriceSource:
+        def __init__(self, prices_by_symbol):
+            self._prices = prices_by_symbol
+
+        def get_current_price(self, symbol):
+            return self._prices[symbol]
+
+    price_source = StubMultiPriceSource({"SYM_A": 100.0, "SYM_B": 50.0})
+
+    fd, state_path = tempfile.mkstemp(suffix="_live_polling_multi_state.json")
+    os.close(fd)
+    os.remove(state_path)
+    try:
+        broker = run_live_polling(
+            price_source, symbol=["SYM_A", "SYM_B"], strategy_name="momentum", profile_name="moderado",
+            seed_csv={"SYM_A": "real_data/btc_daily.csv", "SYM_B": "real_data/eth_daily.csv"},
+            initial_balance=1000.0, poll_interval_seconds=0, max_ticks=10, state_path=state_path,
+            max_positions=1,
+        )
+        assert broker.get_balance() >= 0, "El balance nunca debería quedar negativo"
+        assert len(broker.get_open_positions()) <= 1, "El cupo compartido (1) nunca debería superarse"
+    finally:
+        if os.path.exists(state_path):
+            os.remove(state_path)
+    print("OK: run_live_polling multi-símbolo corre de punta a punta y respeta el cupo compartido de posiciones")
+
+
 def test_broker_adapters_dont_leak_into_each_other():
     """
     Test específico para el tipo de bug que apareció durante el desarrollo:
@@ -853,10 +998,10 @@ def test_live_engine_closes_position_to_lock_profit_and_keeps_operating():
         # Neutraliza el stop loss/take profit propios de la posición para
         # aislar el efecto del seguro de ganancias (que se lo dispare a él,
         # no a los frenos normales de la operación).
-        engine.stop_loss = 0.0
-        engine.take_profit = 10_000_000.0
+        engine.stop_loss["TEST_SYM"] = 0.0
+        engine.take_profit["TEST_SYM"] = 10_000_000.0
 
-        current_equity = engine._mark_to_market(broker.get_current_price("TEST_SYM"))
+        current_equity = engine._mark_to_market()
         target_equity = 1000.0 * 1.10
         needed_price = entry_price + (target_equity - current_equity) / units + 5.0  # margen
         broker.set_price("TEST_SYM", needed_price)
@@ -2163,22 +2308,22 @@ def test_live_engine_open_buy_order_resolves_without_double_ordering():
 
         # Tick 1: señal de compra -> la orden queda "open"
         engine.process_tick(now, 100.0, current_atr=2.0, sig=1)
-        assert engine.pending_order is not None, "Debería haber quedado una orden pendiente"
+        assert "TEST_SYM" in engine.pending_order, "Debería haber quedado una orden pendiente"
         assert "TEST_SYM" not in engine.internal_positions, "Todavía no debería haber posición (0 unidades llenadas)"
-        pending_order_id = engine.pending_order["order_id"]
+        pending_order_id = engine.pending_order["TEST_SYM"]["order_id"]
 
         # Tick 2: misma señal -- NO debe mandar una segunda orden (hay una pendiente)
         history_len_before = len(broker.order_history)
         engine.process_tick(now, 100.0, current_atr=2.0, sig=1)
         assert len(broker.order_history) == history_len_before, "No debe colocar una segunda orden mientras la primera sigue pendiente"
-        assert engine.pending_order is not None  # sigue abierta
+        assert "TEST_SYM" in engine.pending_order  # sigue abierta
 
         # Simula que la orden finalmente se llena del todo entre el tick 2 y el 3
         broker.simulate_additional_fill(pending_order_id, broker.orders_by_id[pending_order_id]["requested_units"])
 
         # Tick 3: al resolver la orden pendiente, ahora debería registrar la posición
         engine.process_tick(now, 100.0, current_atr=2.0, sig=1)
-        assert engine.pending_order is None, "La orden ya debería estar resuelta"
+        assert "TEST_SYM" not in engine.pending_order, "La orden ya debería estar resuelta"
         assert "TEST_SYM" in engine.internal_positions
         assert engine.internal_positions["TEST_SYM"]["unidades"] > 0
     finally:
@@ -2220,7 +2365,7 @@ def test_live_engine_partial_buy_fill_registers_position_with_actual_units():
         now = datetime.now(timezone.utc)
         engine.process_tick(now, 100.0, current_atr=2.0, sig=1)
 
-        assert engine.pending_order is None, "Un llenado parcial se trata como definitivo, no queda pendiente"
+        assert "TEST_SYM" not in engine.pending_order, "Un llenado parcial se trata como definitivo, no queda pendiente"
         assert "TEST_SYM" in engine.internal_positions
         internal_units = engine.internal_positions["TEST_SYM"]["unidades"]
         broker_units = broker.get_open_positions()["TEST_SYM"]["unidades"]
@@ -2998,6 +3143,9 @@ if __name__ == "__main__":
         test_multi_timeframe_no_lookahead,
         test_live_runner_smoke_test,
         test_live_polling_runs_with_stub_price_feed,
+        test_live_engine_enforces_shared_position_cap_across_symbols,
+        test_live_engine_multi_symbol_shares_broker_without_artificial_limit,
+        test_run_live_polling_multi_symbol_smoke_test,
         test_broker_adapters_dont_leak_into_each_other,
         test_state_survives_simulated_restart,
         test_live_engine_restores_saved_capital_on_restart,
