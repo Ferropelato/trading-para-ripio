@@ -1680,6 +1680,33 @@ esta ronda el mockup mostraba visualmente 3 posiciones simultáneas pero
 no explicaba estas dos piezas del motor real -- ahora sí.
 
 
+## Trigésima primera ronda: auditoría del modo manual -- una venta sin posición se perdía en silencio
+
+Pasada de auditoría dirigida específicamente al código más nuevo del
+proyecto (seguro de ganancias, multi-par, modo manual), por ser el menos
+probado en el tiempo. Se encontró un bug real en `process_tick()`
+(`live_runner.py`): `manual_orders.pop_order(symbol)` consume la orden
+manual de la cola apenas se lee, sin importar si después hay algo que
+hacer con ella. Cuando la orden es una venta y NO hay posición abierta
+para ese símbolo (ej. el stop loss ya la cerró en un tick anterior, o el
+usuario pide vender algo que nunca llegó a comprarse), la rama de salida
+no se ejecuta (`if in_position:` es falso) y la rama de entrada tampoco la
+contempla (solo mira `manual_side == "buy"`) -- la orden se pierde sin que
+ningún log explique qué pasó. Es una inconsistencia real: **todos** los
+demás rechazos manuales (breaker activo, pausa por noticias, ATR
+inválido, cupo de posiciones lleno, tamaño no viable) sí quedan
+explicados en el log; este caso, el único que involucraba una venta, no.
+
+Corregido agregando una rama explícita (`elif manual_side == "sell":` justo
+después del bloque de salida) que loguea el rechazo con motivo. Test de
+regresión (`test_live_engine_manual_sell_without_position_is_discarded_not_stuck`):
+pide una venta manual sin haber abierto nunca una posición, corre un tick,
+y verifica que no se abre nada y que la orden se consume de la cola (no
+queda reintentando sola).
+
+118/118 tests pasando.
+
+
 ## Notas importantes (leer antes de avanzar)
 
 1. **Este backtest usa datos sintéticos por defecto.** Los resultados que

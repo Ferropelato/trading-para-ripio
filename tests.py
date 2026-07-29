@@ -2747,6 +2747,66 @@ def test_live_engine_manual_sell_always_closes_position():
     print("OK: una venta manual siempre cierra la posición, sin importar otros frenos activos")
 
 
+def test_live_engine_manual_sell_without_position_is_discarded_not_stuck():
+    """
+    Bug real encontrado en auditoría: pedir una venta manual cuando no hay
+    posición abierta para ese símbolo (ej. el stop loss ya la cerró en un
+    tick anterior) hacía que `pop_order()` la consumiera igual y la
+    descartara en silencio, sin ningún log -- a diferencia de TODOS los
+    demás rechazos manuales (breaker, pausa por noticias, ATR inválido,
+    cupo de posiciones, tamaño no viable), que sí quedan explicados. Acá
+    se verifica el efecto observable: la orden se consume (no queda
+    reintentando sola en cada tick) y el motor no crashea ni abre nada.
+    """
+    import os
+    import tempfile
+    from datetime import datetime, timezone
+    from live_runner import _LiveEngine
+    from broker import PaperBroker
+    from risk_profiles import get_profile
+    from safety import CircuitBreaker, ManualKillSwitch
+    from health import Heartbeat
+    from state_store import StateStore
+    from manual_trading import ManualOrderQueue
+    from alerts import ConsoleAlertChannel
+    from app_logger import get_logger
+
+    fd, state_path = tempfile.mkstemp(suffix="_live_engine_manual_sell_no_pos.json")
+    os.close(fd)
+    os.remove(state_path)
+    kill_switch_path = ".KILL_SWITCH_test_live_engine_manual_sell_no_pos"
+    manual_orders_path = ".MANUAL_ORDERS_test_live_engine_manual_sell_no_pos"
+
+    try:
+        broker = PaperBroker(initial_balance=1000.0)
+        cb = CircuitBreaker(max_drawdown_pct=15.0, max_daily_loss_pct=90.0)
+        manual_orders = ManualOrderQueue(manual_orders_path)
+        engine = _LiveEngine(
+            broker, "TEST_SYM", get_profile("moderado"), "momentum", "moderado",
+            ConsoleAlertChannel(), ManualKillSwitch(control_file=kill_switch_path),
+            cb, Heartbeat(max_staleness_seconds=99999),
+            StateStore(path=state_path), reconcile_every=1000, log=get_logger("test_live_engine_manual_sell_no_pos"),
+            manual_orders=manual_orders,
+        )
+        now = datetime.now(timezone.utc)
+        broker.set_price("TEST_SYM", 100.0)
+
+        assert "TEST_SYM" not in engine.internal_positions  # nunca se abrió nada
+        manual_orders.queue_order("TEST_SYM", "sell")
+        engine.process_tick(now, 100.0, current_atr=2.0, sig=0)  # sig=0: tampoco dispara una entrada
+
+        assert "TEST_SYM" not in engine.internal_positions, "No debe abrirse ninguna posición por una venta manual"
+        assert manual_orders.pending() == {}, "La orden sin posición que vender se descarta, no queda reintentando sola"
+    finally:
+        if os.path.exists(state_path):
+            os.remove(state_path)
+        if os.path.exists(kill_switch_path):
+            os.remove(kill_switch_path)
+        if os.path.exists(manual_orders_path):
+            os.remove(manual_orders_path)
+    print("OK: una venta manual sin posición abierta se descarta sin crashear ni quedar reintentando")
+
+
 def test_status_report_reflects_state_and_history():
     """
     status_report.py lee el estado y el historial ya persistidos y arma un
@@ -3492,6 +3552,7 @@ if __name__ == "__main__":
         test_manual_order_cli_queues_and_reports_orders,
         test_live_engine_manual_buy_opens_position_respecting_shared_gates,
         test_live_engine_manual_sell_always_closes_position,
+        test_live_engine_manual_sell_without_position_is_discarded_not_stuck,
         test_pair_trades_and_tax_export_consume_real_trade_history,
         test_load_many_simultaneous_circuit_breakers_stay_isolated_and_detected,
         test_manual_kill_switch_reason_returns_saved_message,

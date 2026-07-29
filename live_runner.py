@@ -399,6 +399,17 @@ class _LiveEngine:
             elif manual_side == "buy":
                 self.log.info("Orden manual de compra en %s ignorada -- ya hay una posición abierta en ese símbolo", symbol)
 
+        # 4b) Venta manual pedida sin posición abierta para vender: sin este
+        # chequeo, `manual_side == "sell"` quedaba consumido (ver 3d, arriba)
+        # y descartado en silencio -- ningún log explicaba qué pasó, a
+        # diferencia de todos los demás rechazos manuales (breaker, pausa
+        # por noticias, ATR inválido, cupo de posiciones, tamaño no viable),
+        # que sí quedan explicados. Un usuario pidiendo vender algo que ya se
+        # cerró (ej. por stop loss, en un tick anterior) merece la misma
+        # claridad que cualquier otro rechazo.
+        elif manual_side == "sell":
+            self.log.warning("Orden manual de venta en %s rechazada -- no hay posición abierta para vender", symbol)
+
         # 5) Lógica de entrada (si no hay posición abierta en este símbolo,
         # el breaker no está activo, y no hay una pausa automática por
         # noticias en curso -- una compra manual respeta los mismos
