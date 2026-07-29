@@ -260,7 +260,13 @@ class _LiveEngine:
             # La venta ya se ejecutó y el capital resultante quedó en el
             # bróker -- recién ACÁ la ganancia está realmente asegurada
             # (no antes, mientras todavía era una posición abierta).
-            self.profit_lock.lock_in(self.broker.get_balance())
+            # OJO: `_mark_to_market()`, no `self.broker.get_balance()` --
+            # mismo motivo que en el atajo de arriba (ver auditoría multi-
+            # par): si OTRO símbolo sigue con una posición abierta, el
+            # efectivo solo la deja afuera del nuevo piso y puede terminar
+            # bancando un valor menor al equity real que disparó el
+            # gatillo, e incluso menor al piso anterior.
+            self.profit_lock.lock_in(self._mark_to_market())
 
     def _resolve_pending_order(self):
         """

@@ -1733,6 +1733,23 @@ el nuevo piso sea el equity total, no el efectivo.
 
 119/119 tests pasando.
 
+**El mismo bug tenía una segunda instancia**, en el otro lugar donde
+`lock_in()` se llama: `_apply_sell_fill()`, justo después de ejecutar la
+venta que SÍ cierra la posición que disparó el seguro de ganancias. Ahí
+también se bancaba `self.broker.get_balance()` -- correcto si ese es el
+único símbolo con actividad, pero si OTRO símbolo sigue con una posición
+abierta y valiosa en paralelo, esa venta puntual no la incluye. Mismo
+riesgo: bancar un piso más bajo que el equity real, e incluso menor al
+anterior. Corregido con `self._mark_to_market()` (ya reflejaba
+correctamente la posición recién cerrada, porque el bróker actualiza su
+estado antes de que se llame a este método). Test de regresión
+(`test_live_engine_profit_lock_sell_close_banks_full_equity_not_just_cash`):
+SYM_B queda abierta con una ganancia enorme mientras se cierra SYM_A por
+seguro de ganancias, y se verifica que el nuevo piso incluya el valor de
+SYM_B, no solo el efectivo resultante de esa venta puntual.
+
+120/120 tests pasando.
+
 
 ## Notas importantes (leer antes de avanzar)
 

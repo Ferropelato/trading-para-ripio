@@ -1099,6 +1099,81 @@ def test_live_engine_profit_lock_multi_symbol_banks_full_equity_not_just_cash():
     print("OK: el seguro de ganancias banca el equity total multi-símbolo, no solo el efectivo del símbolo del tick")
 
 
+def test_live_engine_profit_lock_sell_close_banks_full_equity_not_just_cash():
+    """
+    Segunda instancia del mismo bug (ver auditoría, README): al cerrar la
+    posición del símbolo que sí disparó la venta por seguro de ganancias,
+    `_apply_sell_fill()` bancaba `self.broker.get_balance()` (solo
+    efectivo) en vez del equity total. Acá SYM_B queda abierta y con una
+    ganancia enorme no realizada mientras se cierra SYM_A por seguro de
+    ganancias -- el efectivo solo tras esa venta deja completamente afuera
+    el valor de SYM_B.
+    """
+    import os
+    import tempfile
+    from datetime import datetime, timezone
+    from live_runner import _LiveEngine
+    from broker import PaperBroker
+    from risk_profiles import get_profile
+    from safety import CircuitBreaker, ManualKillSwitch, ProfitLock
+    from health import Heartbeat
+    from state_store import StateStore
+    from alerts import ConsoleAlertChannel
+    from app_logger import get_logger
+
+    fd, state_path = tempfile.mkstemp(suffix="_live_engine_profit_lock_sell_multi.json")
+    os.close(fd)
+    os.remove(state_path)
+    kill_switch_path = ".KILL_SWITCH_test_live_engine_profit_lock_sell_multi"
+
+    try:
+        broker = PaperBroker(initial_balance=1000.0)
+        lock = ProfitLock(target_pct=10.0, reference_capital=1000.0)
+        engine = _LiveEngine(
+            broker, ["SYM_A", "SYM_B"], get_profile("moderado"), "momentum", "moderado",
+            ConsoleAlertChannel(), ManualKillSwitch(control_file=kill_switch_path),
+            CircuitBreaker(), Heartbeat(max_staleness_seconds=99999),
+            StateStore(path=state_path), reconcile_every=1000, log=get_logger("test_live_engine_profit_lock_sell_multi"),
+            profit_lock=lock,
+        )
+        now = datetime.now(timezone.utc)
+
+        broker.set_price("SYM_A", 100.0)
+        engine.process_tick(now, 100.0, current_atr=2.0, sig=1, symbol="SYM_A")
+        assert "SYM_A" in engine.internal_positions
+        engine.stop_loss["SYM_A"] = 0.0
+        engine.take_profit["SYM_A"] = 10_000_000.0
+
+        # SYM_B se abre directo contra el bróker -- no hace falta que el
+        # motor la registre como propia, solo que quede abierta y valiosa.
+        broker.set_price("SYM_B", 50.0)
+        broker.place_order("SYM_B", "buy", 6.0)
+        broker.set_price("SYM_B", 300.0)  # sube fuerte, sin que SYM_A se mueva de precio
+
+        equity_before_close = engine._mark_to_market()
+        assert equity_before_close >= 1000.0 * 1.10, "El escenario debe cruzar la meta antes de cerrar nada"
+
+        engine.process_tick(now, 100.0, current_atr=2.0, sig=1, symbol="SYM_A")  # sig=1: no es salida de estrategia
+
+        assert "SYM_A" not in engine.internal_positions, "Debe cerrar SYM_A para asegurar la ganancia"
+        assert lock.times_locked == 1
+        b_units = broker.get_open_positions()["SYM_B"]["unidades"]
+        expected = broker.get_balance() + b_units * broker.get_current_price("SYM_B")
+        assert abs(lock.reference_capital - expected) < 0.01, (
+            "Debe bancar equity total (incluye la posición abierta de SYM_B), no solo el efectivo tras la venta"
+        )
+        assert lock.reference_capital > broker.get_balance() + 1.0, (
+            "El efectivo solo, sin SYM_B, hubiera sido muchísimo menor que el equity real"
+        )
+        assert "SYM_B" in broker.get_open_positions(), "No debe tocar la posición abierta de otro símbolo"
+    finally:
+        if os.path.exists(state_path):
+            os.remove(state_path)
+        if os.path.exists(kill_switch_path):
+            os.remove(kill_switch_path)
+    print("OK: cerrar por seguro de ganancias banca el equity total multi-símbolo, no solo el efectivo tras la venta")
+
+
 def test_live_engine_restores_profit_lock_state_on_restart():
     """
     Mismo cuidado que con el circuit breaker: el piso de referencia (que
@@ -3566,6 +3641,7 @@ if __name__ == "__main__":
         test_live_engine_restores_daily_loss_reference_on_restart,
         test_live_engine_closes_position_to_lock_profit_and_keeps_operating,
         test_live_engine_profit_lock_multi_symbol_banks_full_equity_not_just_cash,
+        test_live_engine_profit_lock_sell_close_banks_full_equity_not_just_cash,
         test_live_engine_restores_profit_lock_state_on_restart,
         test_state_store_handles_corrupt_file,
         test_reconciliation_detects_all_mismatch_types,
