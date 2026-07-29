@@ -2470,6 +2470,192 @@ def test_kill_switch_cli_respects_custom_control_file():
     print("OK: kill_switch.py respeta --file y no interfiere con el archivo de control genérico")
 
 
+def test_manual_order_queue_persists_and_consumes_once():
+    """
+    ManualOrderQueue debe sobrevivir entre instancias (como cualquier
+    archivo de control, ver kill_switch.py), y pop_order() debe consumir
+    la orden -- no debe volver a aparecer en una consulta posterior."""
+    import os
+    from manual_trading import ManualOrderQueue
+
+    control_path = ".MANUAL_ORDERS_test_queue"
+    try:
+        q1 = ManualOrderQueue(control_path)
+        q1.queue_order("BTC_USDC", "buy")
+        q1.queue_order("ETH_USDC", "sell")
+
+        q2 = ManualOrderQueue(control_path)  # instancia nueva, mismo archivo
+        assert q2.pending() == {"BTC_USDC": "buy", "ETH_USDC": "sell"}
+
+        assert q2.pop_order("BTC_USDC") == "buy"
+        assert q2.pop_order("BTC_USDC") is None, "Una orden ya consumida no debe volver a aparecer"
+        assert q2.pending() == {"ETH_USDC": "sell"}, "Consumir una orden no debe tocar las demás en cola"
+
+        assert ManualOrderQueue(control_path).pending() == {"ETH_USDC": "sell"}
+    finally:
+        if os.path.exists(control_path):
+            os.remove(control_path)
+    print("OK: ManualOrderQueue persiste entre instancias y consume cada orden una sola vez")
+
+
+def test_manual_order_cli_queues_and_reports_orders():
+    """CLI de manual_order.py (comprar/vender/estado) contra un archivo propio."""
+    import os
+    import sys
+    import manual_order
+    from manual_trading import ManualOrderQueue
+
+    control_path = ".MANUAL_ORDERS_test_cli"
+    old_argv = sys.argv
+    try:
+        sys.argv = ["manual_order.py", "comprar", "BTC_USDC", "--file", control_path]
+        manual_order.main()
+        assert ManualOrderQueue(control_path).pending() == {"BTC_USDC": "buy"}
+
+        sys.argv = ["manual_order.py", "vender", "ETH_USDC", "--file", control_path]
+        manual_order.main()
+        assert ManualOrderQueue(control_path).pending() == {"BTC_USDC": "buy", "ETH_USDC": "sell"}
+
+        sys.argv = ["manual_order.py", "estado", "--file", control_path]
+        manual_order.main()  # no debe lanzar excepción
+    finally:
+        sys.argv = old_argv
+        if os.path.exists(control_path):
+            os.remove(control_path)
+    print("OK: manual_order.py deja pedidas compras/ventas manuales y reporta el estado sin romper")
+
+
+def test_live_engine_manual_buy_opens_position_respecting_shared_gates():
+    """
+    Una compra manual respeta los MISMOS frenos que una automática: acá
+    se verifica que, con el circuit breaker activo, la orden manual se
+    rechaza (no abre nada); y que sin ningún freno activo, sí abre la
+    posición -- registrada con motivo "apertura_manual" en el historial.
+    """
+    import os
+    import tempfile
+    from datetime import datetime, timezone
+    from live_runner import _LiveEngine
+    from broker import PaperBroker
+    from risk_profiles import get_profile
+    from safety import CircuitBreaker, ManualKillSwitch
+    from health import Heartbeat
+    from state_store import StateStore
+    from trade_history import TradeHistoryLog
+    from manual_trading import ManualOrderQueue
+    from alerts import ConsoleAlertChannel
+    from app_logger import get_logger
+
+    fd, state_path = tempfile.mkstemp(suffix="_live_engine_manual_buy.json")
+    os.close(fd)
+    os.remove(state_path)
+    fd2, trades_path = tempfile.mkstemp(suffix="_live_engine_manual_buy_trades.csv")
+    os.close(fd2)
+    os.remove(trades_path)
+    kill_switch_path = ".KILL_SWITCH_test_live_engine_manual_buy"
+    manual_orders_path = ".MANUAL_ORDERS_test_live_engine_manual_buy"
+
+    try:
+        broker = PaperBroker(initial_balance=1000.0)
+        cb = CircuitBreaker(max_drawdown_pct=15.0, max_daily_loss_pct=90.0)
+        trade_history = TradeHistoryLog(trades_path)
+        manual_orders = ManualOrderQueue(manual_orders_path)
+        engine = _LiveEngine(
+            broker, "TEST_SYM", get_profile("moderado"), "momentum", "moderado",
+            ConsoleAlertChannel(), ManualKillSwitch(control_file=kill_switch_path),
+            cb, Heartbeat(max_staleness_seconds=99999),
+            StateStore(path=state_path), reconcile_every=1000, log=get_logger("test_live_engine_manual_buy"),
+            trade_history=trade_history, manual_orders=manual_orders,
+        )
+        now = datetime.now(timezone.utc)
+
+        # Con el circuit breaker activo, la compra manual debe rechazarse.
+        cb.tripped = True
+        manual_orders.queue_order("TEST_SYM", "buy")
+        broker.set_price("TEST_SYM", 100.0)
+        engine.process_tick(now, 100.0, current_atr=2.0, sig=0)
+        assert "TEST_SYM" not in engine.internal_positions, "El breaker activo debe bloquear también una compra manual"
+        assert manual_orders.pending() == {}, "La orden rechazada se descarta, no queda reintentando sola"
+
+        # Sin ningún freno, la misma compra manual sí debe abrir la posición.
+        cb.tripped = False
+        manual_orders.queue_order("TEST_SYM", "buy")
+        engine.process_tick(now, 100.0, current_atr=2.0, sig=0)
+        assert "TEST_SYM" in engine.internal_positions, "Sin frenos activos, la compra manual debe abrir la posición"
+
+        rows = trade_history.load_all()
+        assert rows[-1]["motivo"] == "apertura_manual", "El historial debe distinguir una apertura manual de una automática"
+    finally:
+        if os.path.exists(state_path):
+            os.remove(state_path)
+        if os.path.exists(trades_path):
+            os.remove(trades_path)
+        if os.path.exists(kill_switch_path):
+            os.remove(kill_switch_path)
+        if os.path.exists(manual_orders_path):
+            os.remove(manual_orders_path)
+    print("OK: una compra manual respeta el circuit breaker y queda registrada como apertura manual")
+
+
+def test_live_engine_manual_sell_always_closes_position():
+    """
+    Una venta manual (salir, reducir riesgo) SIEMPRE se deja pasar, sin
+    importar el circuit breaker ni si el precio todavía no tocó el stop
+    loss/take profit propios -- salir nunca está bloqueado, igual que ya
+    pasaba con esos dos frenos automáticos.
+    """
+    import os
+    import tempfile
+    from datetime import datetime, timezone
+    from live_runner import _LiveEngine
+    from broker import PaperBroker
+    from risk_profiles import get_profile
+    from safety import CircuitBreaker, ManualKillSwitch
+    from health import Heartbeat
+    from state_store import StateStore
+    from manual_trading import ManualOrderQueue
+    from alerts import ConsoleAlertChannel
+    from app_logger import get_logger
+
+    fd, state_path = tempfile.mkstemp(suffix="_live_engine_manual_sell.json")
+    os.close(fd)
+    os.remove(state_path)
+    kill_switch_path = ".KILL_SWITCH_test_live_engine_manual_sell"
+    manual_orders_path = ".MANUAL_ORDERS_test_live_engine_manual_sell"
+
+    try:
+        broker = PaperBroker(initial_balance=1000.0)
+        cb = CircuitBreaker(max_drawdown_pct=15.0, max_daily_loss_pct=90.0)
+        manual_orders = ManualOrderQueue(manual_orders_path)
+        engine = _LiveEngine(
+            broker, "TEST_SYM", get_profile("moderado"), "momentum", "moderado",
+            ConsoleAlertChannel(), ManualKillSwitch(control_file=kill_switch_path),
+            cb, Heartbeat(max_staleness_seconds=99999),
+            StateStore(path=state_path), reconcile_every=1000, log=get_logger("test_live_engine_manual_sell"),
+            manual_orders=manual_orders,
+        )
+        now = datetime.now(timezone.utc)
+        broker.set_price("TEST_SYM", 100.0)
+        engine.process_tick(now, 100.0, current_atr=2.0, sig=1)  # abre posición
+        assert "TEST_SYM" in engine.internal_positions
+
+        # Precio a mitad de camino entre el stop loss y el take profit --
+        # ninguno de los dos frenos automáticos se dispararía solo acá.
+        cb.tripped = True  # ni siquiera el circuit breaker debería frenar una salida
+        manual_orders.queue_order("TEST_SYM", "sell")
+        engine.process_tick(now, 101.0, current_atr=2.0, sig=1)  # sig=1: tampoco es salida de estrategia
+
+        assert "TEST_SYM" not in engine.internal_positions, "Una venta manual debe cerrar la posición sin importar otros frenos"
+    finally:
+        if os.path.exists(state_path):
+            os.remove(state_path)
+        if os.path.exists(kill_switch_path):
+            os.remove(kill_switch_path)
+        if os.path.exists(manual_orders_path):
+            os.remove(manual_orders_path)
+    print("OK: una venta manual siempre cierra la posición, sin importar otros frenos activos")
+
+
 def test_status_report_reflects_state_and_history():
     """
     status_report.py lee el estado y el historial ya persistidos y arma un
@@ -3209,6 +3395,10 @@ if __name__ == "__main__":
         test_live_engine_records_buy_and_sell_in_trade_history,
         test_status_report_reflects_state_and_history,
         test_kill_switch_cli_respects_custom_control_file,
+        test_manual_order_queue_persists_and_consumes_once,
+        test_manual_order_cli_queues_and_reports_orders,
+        test_live_engine_manual_buy_opens_position_respecting_shared_gates,
+        test_live_engine_manual_sell_always_closes_position,
         test_pair_trades_and_tax_export_consume_real_trade_history,
         test_load_many_simultaneous_circuit_breakers_stay_isolated_and_detected,
         test_manual_kill_switch_reason_returns_saved_message,

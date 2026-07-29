@@ -1578,6 +1578,59 @@ haciendo lo que promete, varios símbolos operando en simultáneo sin
 límite artificial cuando no se pide uno, y una corrida de punta a punta
 con dos símbolos bajo un feed de prueba).
 
+También en esta etapa: las tres sesiones en vivo (`BTC_USDC`, `ETH_USDC`,
+y una tercera combinando ambas bajo una sola cuenta con cupo compartido,
+para demostrar multi-par de verdad) sobrevivieron un corte real de casi
+dos días (la máquina se apagó/durmió sin ningún error de código antes del
+corte) -- al reiniciarlas, todo el estado volvió exactamente como había
+quedado (capital, historial, pausa por noticias ya vencida
+correctamente). No fue una prueba planeada, pero es la validación más
+realista posible de todo lo persistido en las últimas rondas.
+
+## Veintinoveava ronda: modo manual/asistido (tercera y última pieza del roadmap, ya construida)
+
+Tercera y última de las tres ideas del roadmap (ronda 17): para el
+usuario que ya sabe operar y prefiere elegir él mismo cuándo entrar y
+salir, en vez de dejarlo en manos de la estrategia automática -- sin
+perder ninguna de las protecciones que ya tiene el modo automático.
+
+- **`manual_trading.ManualOrderQueue`**: mismo patrón que `kill_switch.py`
+  -- un archivo de control simple que `_LiveEngine` consulta en cada tick,
+  sin necesitar ningún servicio nuevo corriendo aparte. Cada símbolo tiene
+  a lo sumo una orden manual en cola; se consume (se borra) apenas el
+  motor la procesa, sea que se haya ejecutado o rechazado.
+- **Una compra manual respeta los MISMOS frenos que una automática**:
+  circuit breaker, pausa automática por noticias, y el cupo compartido de
+  posiciones -- si algo la bloquea, se descarta con el motivo explicado
+  en el log, no queda reintentando sola en silencio. Si el ATR es
+  inválido o el tamaño de posición resultante no es viable, también se
+  rechaza con motivo explícito (a diferencia de una señal automática, que
+  simplemente no hace nada ese tick -- una orden manual explícita merece
+  una respuesta, no silencio).
+- **Una venta manual (salir) SIEMPRE se deja pasar**, sin importar el
+  circuit breaker ni si el precio todavía no tocó el stop loss/take
+  profit propios -- salir nunca está bloqueado, el mismo principio que ya
+  regía para los frenos automáticos.
+- El historial persistente distingue `apertura_manual` de `apertura` (automática) y `manual` de
+  `señal_estrategia`/`stop_loss`/`take_profit`/`seguro_de_ganancias` como
+  motivo de cierre -- un reporte de soporte puede ver exactamente qué
+  decidió la persona y qué decidió la estrategia.
+- **CLI**: `manual_order.py comprar/vender SÍMBOLO --file RUTA` (mismo
+  estilo que `kill_switch.py`) para dejar pedida una orden desde otro
+  proceso, más `manual_order.py estado --file RUTA` para ver qué queda en
+  cola. La sesión en vivo se activa con
+  `--manual-orders-file RUTA` (sin esta opción, desactivado -- comportamiento
+  de siempre).
+
+Con esto, las tres ideas documentadas en la ronda 17 como roadmap
+("seguro de ganancias", "multi-par con cupo compartido", "modo
+manual/asistido") ya son las tres código real, no solo dirección.
+
+115/115 tests pasando (4 nuevos: la cola persiste y consume una vez,
+la CLI funciona de punta a punta, una compra manual respeta el circuit
+breaker y queda etiquetada como manual en el historial, y una venta
+manual cierra sin importar otros frenos).
+
 
 ## Notas importantes (leer antes de avanzar)
 

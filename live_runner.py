@@ -40,6 +40,7 @@ from safety import ManualKillSwitch, CircuitBreaker, ProfitLock
 from health import Heartbeat
 from state_store import StateStore
 from trade_history import TradeHistoryLog
+from manual_trading import ManualOrderQueue
 from reconciliation import reconcile
 from regime import apply_regime_filter
 from multi_timeframe import apply_multi_timeframe_filter
@@ -77,7 +78,7 @@ class _LiveEngine:
     def __init__(self, broker, symbol, profile, strategy_name, profile_name,
                  alert_channel, kill_switch, circuit_breaker, heartbeat,
                  state_store, reconcile_every, log, news_guard=None, trade_history=None,
-                 profit_lock=None, max_positions=None):
+                 profit_lock=None, max_positions=None, manual_orders=None):
         self.broker = broker
         # Acepta un símbolo suelto (uso de siempre, un motor = un par) o
         # una lista (varios pares bajo el mismo motor) -- normalizado acá
@@ -112,6 +113,12 @@ class _LiveEngine:
         # explícito (el comportamiento de siempre, de antes de que
         # existiera esta opción).
         self.max_positions = max_positions
+        # Opcional (ver manual_trading.py): modo manual/asistido -- una
+        # compra manual respeta los mismos frenos que una automática
+        # (circuit breaker, pausa por noticias, cupo compartido); una
+        # venta manual siempre se deja pasar, igual que el stop
+        # loss/take profit -- salir nunca está bloqueado.
+        self.manual_orders = manual_orders
 
         saved_state = state_store.load()
         extra_saved = saved_state["extra"] if saved_state["saved_at"] else {}
@@ -220,15 +227,17 @@ class _LiveEngine:
             price=price, pnl=pnl, balance_resultante=self.broker.get_balance(),
         )
 
-    def _apply_buy_fill(self, symbol, filled_units, price_filled, sizing):
+    def _apply_buy_fill(self, symbol, filled_units, price_filled, sizing, motivo="apertura"):
         """Registra (o suma a) la posición interna con lo EFECTIVAMENTE
-        comprado -- nunca con la cantidad pedida (ver Fase 3c)."""
+        comprado -- nunca con la cantidad pedida (ver Fase 3c). `motivo`
+        distingue una apertura automática (por señal de estrategia) de
+        una manual (ver manual_trading.py) en el historial."""
         if filled_units <= 0:
             return
         self.stop_loss[symbol] = sizing["stop_loss"]
         self.take_profit[symbol] = sizing["take_profit"]
         self.internal_positions[symbol] = {"unidades": filled_units, "precio_entrada": price_filled}
-        self._record_trade(symbol, "buy", "apertura", filled_units, price_filled)
+        self._record_trade(symbol, "buy", motivo, filled_units, price_filled)
 
     def _apply_sell_fill(self, symbol, filled_units, price_filled=None, motivo=None):
         """Reduce (o cierra del todo) la posición interna según lo
@@ -279,7 +288,8 @@ class _LiveEngine:
             filled_units = status_order.get("units") or 0
             side = pending["side"]
             if side == "buy":
-                self._apply_buy_fill(symbol, filled_units, status_order.get("price"), pending["sizing"])
+                self._apply_buy_fill(symbol, filled_units, status_order.get("price"), pending["sizing"],
+                                      motivo=pending.get("motivo", "apertura"))
             else:
                 self._apply_sell_fill(symbol, filled_units, price_filled=status_order.get("price"),
                                        motivo=pending.get("motivo"))
@@ -351,18 +361,28 @@ class _LiveEngine:
             self.profit_lock.lock_in(self.broker.get_balance())
             profit_lock_hit = False
 
+        # 3d) Modo manual/asistido (ver manual_trading.py): si hay una
+        # orden manual en cola para este símbolo, se consume acá (una
+        # sola vez). Una venta manual siempre se deja pasar más abajo,
+        # igual que el stop loss/take profit -- salir nunca está
+        # bloqueado. Una compra manual respeta los mismos frenos que una
+        # automática (breaker, pausa por noticias, cupo compartido).
+        manual_side = self.manual_orders.pop_order(symbol) if self.manual_orders is not None else None
+
         # 4) Lógica de salida (si hay posición abierta en ESTE símbolo)
         if in_position:
             pos = broker_positions[symbol]
             hit_stop = self.stop_loss.get(symbol) is not None and price <= self.stop_loss[symbol]
             hit_target = self.take_profit.get(symbol) is not None and price >= self.take_profit[symbol]
             strategy_exit = sig == 0
+            manual_exit = manual_side == "sell"
 
-            if hit_stop or hit_target or strategy_exit or profit_lock_hit:
+            if hit_stop or hit_target or strategy_exit or profit_lock_hit or manual_exit:
                 client_order_id = f"{symbol}-sell-{date}"
                 order = self.broker.place_order(symbol, "sell", pos["unidades"], client_order_id=client_order_id)
                 motivo = ("stop_loss" if hit_stop else "take_profit" if hit_target
-                          else "seguro_de_ganancias" if profit_lock_hit else "señal_estrategia")
+                          else "seguro_de_ganancias" if profit_lock_hit
+                          else "manual" if manual_exit else "señal_estrategia")
                 status = order["status"]
                 filled_units = order.get("units") or 0
 
@@ -376,43 +396,60 @@ class _LiveEngine:
                     if status == "partially_filled":
                         self.log.warning("Venta parcial en %s: %s/%s unidades -- se sigue adelante con lo efectivamente vendido",
                                           symbol, filled_units, pos["unidades"])
+            elif manual_side == "buy":
+                self.log.info("Orden manual de compra en %s ignorada -- ya hay una posición abierta en ese símbolo", symbol)
 
         # 5) Lógica de entrada (si no hay posición abierta en este símbolo,
-        # el breaker no está activo, no hay una pausa automática por
-        # noticias en curso, y hay lugar en el cupo compartido de
-        # posiciones. El seguro de ganancias NO bloquea entradas -- solo
-        # fuerza el cierre para asegurar la ganancia y sigue operando.)
-        elif not breaker_active and not (self.news_guard is not None and self.news_guard.entries_paused()):
-            if sig == 1 and not pd.isna(current_atr) and current_atr > 0:
-                total_open = len(self.broker.get_open_positions())
-                if self.max_positions is not None and total_open >= self.max_positions:
-                    self.log.info("Cupo de posiciones simultáneas alcanzado (%d/%d) -- no se abre %s pese a la señal",
-                                  total_open, self.max_positions, symbol)
+        # el breaker no está activo, y no hay una pausa automática por
+        # noticias en curso -- una compra manual respeta los mismos
+        # frenos que una automática. El seguro de ganancias NO bloquea
+        # entradas -- solo fuerza el cierre para asegurar la ganancia y
+        # sigue operando.)
+        elif breaker_active or (self.news_guard is not None and self.news_guard.entries_paused()):
+            if manual_side == "buy":
+                motivo_bloqueo = "el circuit breaker está activo" if breaker_active else "hay una pausa automática por noticias en curso"
+                self.log.warning("Orden manual de compra en %s rechazada -- %s", symbol, motivo_bloqueo)
+        else:
+            manual_entry = manual_side == "buy"
+            if sig == 1 or manual_entry:
+                if pd.isna(current_atr) or current_atr <= 0:
+                    if manual_entry:
+                        self.log.warning("Orden manual de compra en %s rechazada -- ATR inválido, no se puede calcular el tamaño de la posición", symbol)
                 else:
-                    sizing = position_size(self.broker.get_balance(), price, current_atr, self.profile)
-                    if sizing["unidades"] > 0 and sizing["viable"] is not False:
-                        client_order_id = f"{symbol}-buy-{date}"
-                        order = self.broker.place_order(symbol, "buy", sizing["unidades"], client_order_id=client_order_id)
-                        status = order["status"]
-                        filled_units = order.get("units") or 0
+                    total_open = len(self.broker.get_open_positions())
+                    if self.max_positions is not None and total_open >= self.max_positions:
+                        self.log.info("Cupo de posiciones simultáneas alcanzado (%d/%d) -- no se abre %s%s",
+                                      total_open, self.max_positions, symbol,
+                                      " (orden manual)" if manual_entry else " pese a la señal")
+                    else:
+                        sizing = position_size(self.broker.get_balance(), price, current_atr, self.profile)
+                        if sizing["unidades"] > 0 and sizing["viable"] is not False:
+                            client_order_id = f"{symbol}-buy-{date}"
+                            order = self.broker.place_order(symbol, "buy", sizing["unidades"], client_order_id=client_order_id)
+                            status = order["status"]
+                            filled_units = order.get("units") or 0
+                            motivo_compra = "apertura_manual" if manual_entry and sig != 1 else "apertura"
 
-                        if status == "open":
-                            self.pending_order[symbol] = {
-                                "order_id": order.get("broker_order_id") or order.get("order_id"),
-                                "side": "buy", "sizing": sizing,
-                            }
-                            self.log.info("Orden de compra de %s quedó abierta (0 unidades llenadas todavía) -- "
-                                           "se revisará en el próximo tick", symbol)
-                        else:
-                            self._apply_buy_fill(symbol, filled_units, order.get("price"), sizing)
-                            if filled_units > 0:
-                                alert_msg = format_signal_alert(
-                                    symbol, self.strategy_name, self.profile_name, date, price, sizing
-                                )
-                                self.alert_channel.send(alert_msg)
-                            if status == "partially_filled":
-                                self.log.warning("Compra parcial en %s: %s/%s unidades -- se registra la posición con lo efectivamente comprado",
-                                                  symbol, filled_units, sizing["unidades"])
+                            if status == "open":
+                                self.pending_order[symbol] = {
+                                    "order_id": order.get("broker_order_id") or order.get("order_id"),
+                                    "side": "buy", "sizing": sizing, "motivo": motivo_compra,
+                                }
+                                self.log.info("Orden de compra de %s quedó abierta (0 unidades llenadas todavía) -- "
+                                               "se revisará en el próximo tick", symbol)
+                            else:
+                                self._apply_buy_fill(symbol, filled_units, order.get("price"), sizing, motivo=motivo_compra)
+                                if filled_units > 0:
+                                    alert_msg = format_signal_alert(
+                                        symbol, self.strategy_name, self.profile_name, date, price, sizing
+                                    )
+                                    self.alert_channel.send(alert_msg)
+                                if status == "partially_filled":
+                                    self.log.warning("Compra parcial en %s: %s/%s unidades -- se registra la posición con lo efectivamente comprado",
+                                                      symbol, filled_units, sizing["unidades"])
+                        elif manual_entry:
+                            self.log.warning("Orden manual de compra en %s rechazada -- %s", symbol,
+                                              sizing.get("motivo_no_viable") or "tamaño de posición no viable")
 
         # 6) Persistir estado y reconciliar cada N ticks
         if self.ticks_processed % self.reconcile_every == 0:
@@ -519,7 +556,7 @@ def run_live_polling(price_source, symbol, strategy_name: str, profile_name: str
                       regime_filter: bool = True, multi_timeframe_filter: bool = True,
                       max_history_rows: int = 5000, news_guard=None, trade_history_path: str = None,
                       kill_switch_path: str = ".KILL_SWITCH", profit_lock_pct: float = None,
-                      max_positions: int = None):
+                      max_positions: int = None, manual_orders_path: str = None):
     """
     Paper trading contra un feed de precios REAL (no replay histórico): en
     cada intervalo de `poll_interval_seconds` pide el precio actual a
@@ -560,6 +597,13 @@ def run_live_polling(price_source, symbol, strategy_name: str, profile_name: str
     pide el precio de cada símbolo por separado (son instrumentos
     distintos, no hay forma de ahorrarse esas consultas) y se procesa su
     tick correspondiente.
+
+    `manual_orders_path` (ver manual_trading.py): si se pasa, activa el
+    modo manual/asistido -- un archivo de control que otro proceso (ej.
+    manual_order.py) puede usar para dejar pedida una compra o venta
+    manual de un símbolo. Una compra manual respeta los mismos frenos que
+    una automática (breaker, pausa por noticias, cupo compartido); una
+    venta manual siempre se deja pasar.
     """
     symbols = [symbol] if isinstance(symbol, str) else list(symbol)
     seed_csvs = {symbols[0]: seed_csv} if isinstance(seed_csv, str) else dict(seed_csv)
@@ -583,6 +627,7 @@ def run_live_polling(price_source, symbol, strategy_name: str, profile_name: str
     broker = PaperBroker(initial_balance=initial_balance)
     trade_history = TradeHistoryLog(trade_history_path) if trade_history_path else None
     profit_lock = ProfitLock(profit_lock_pct, initial_balance) if profit_lock_pct else None
+    manual_orders = ManualOrderQueue(manual_orders_path) if manual_orders_path else None
     engine = _LiveEngine(
         broker, symbols, profile, strategy_name, profile_name,
         ConsoleAlertChannel(), ManualKillSwitch(control_file=kill_switch_path),
@@ -590,7 +635,7 @@ def run_live_polling(price_source, symbol, strategy_name: str, profile_name: str
         Heartbeat(max_staleness_seconds=max(poll_interval_seconds * 5, 300)),
         StateStore(path=state_path), reconcile_every, log,
         news_guard=news_guard, trade_history=trade_history, profit_lock=profit_lock,
-        max_positions=max_positions,
+        max_positions=max_positions, manual_orders=manual_orders,
     )
     shutdown_requested = _make_shutdown_flag(log)
 
@@ -680,10 +725,16 @@ def main():
                               "por proceso) y querés poder pausar cada una por separado, pasale un archivo distinto "
                               "a cada una (ej. .KILL_SWITCH_BTC_USDC).")
     parser.add_argument("--profit-lock-pct", type=float, default=None,
-                         help="Meta de ganancia (%%) desde el --capital inicial que, al alcanzarse, pausa la "
-                              "apertura de posiciones nuevas -- un freno simétrico al circuit breaker, pero para "
-                              "asegurar lo ganado en vez de proteger contra una pérdida. Sin esta opción, desactivado "
-                              "(comportamiento de siempre). Ej.: --profit-lock-pct 20 pausa al llegar a +20%%.")
+                         help="Meta de ganancia (%%) que, al alcanzarse, CIERRA la posición abierta para asegurar "
+                              "la ganancia (no solo pausa) y sigue operando -- mide la próxima meta desde ese nuevo "
+                              "piso, en escalones, sin techo para la ganancia total. Freno simétrico al circuit "
+                              "breaker, pero para asegurar lo ganado en vez de proteger contra una pérdida. Sin "
+                              "esta opción, desactivado. Ej.: --profit-lock-pct 20 asegura cada +20%%.")
+    parser.add_argument("--manual-orders-file", type=str, default=None,
+                         help="Ruta de un archivo de control para el modo manual/asistido (ver manual_trading.py) "
+                              "-- si se pasa, otro proceso (ej. manual_order.py) puede dejar pedida una compra o "
+                              "venta manual de un símbolo, con los mismos frenos de seguridad que una orden "
+                              "automática. Sin esta opción, desactivado (comportamiento de siempre).")
     parser.add_argument("--max-drawdown", type=float, default=15.0)
     parser.add_argument("--max-daily-loss", type=float, default=5.0)
     parser.add_argument("--no-regime-filter", action="store_true",
@@ -758,7 +809,7 @@ def main():
             regime_filter=not args.no_regime_filter, multi_timeframe_filter=not args.no_mtf_filter,
             news_guard=news_guard, trade_history_path=args.trade_history_path,
             kill_switch_path=args.kill_switch_file, profit_lock_pct=args.profit_lock_pct,
-            max_positions=args.max_positions,
+            max_positions=args.max_positions, manual_orders_path=args.manual_orders_file,
         )
     else:
         run_live(

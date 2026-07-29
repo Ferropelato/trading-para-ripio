@@ -5,6 +5,8 @@ __pycache__/
 experiments.csv
 .KILL_SWITCH
 .KILL_SWITCH_*
+.MANUAL_ORDERS
+.MANUAL_ORDERS_*
 *.png
 reporte.html
 .DS_Store
