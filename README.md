@@ -1680,7 +1680,7 @@ esta ronda el mockup mostraba visualmente 3 posiciones simultáneas pero
 no explicaba estas dos piezas del motor real -- ahora sí.
 
 
-## Trigésima primera ronda: auditoría del modo manual -- una venta sin posición se perdía en silencio
+## Trigésima primera ronda: auditoría del código más nuevo -- dos bugs reales en modo manual y seguro de ganancias multi-par
 
 Pasada de auditoría dirigida específicamente al código más nuevo del
 proyecto (seguro de ganancias, multi-par, modo manual), por ser el menos
@@ -1705,6 +1705,33 @@ y verifica que no se abre nada y que la orden se consume de la cola (no
 queda reintentando sola).
 
 118/118 tests pasando.
+
+**Segundo bug, mismo pasada de auditoría, más serio -- el seguro de
+ganancias podía bajar su propio piso en multi-par.** El atajo de
+`process_tick()` para cuando la meta ya se alcanzó y el símbolo del tick
+actual no tiene posición propia ("se banca directo, sin pasar por el
+bróker") usaba `self.broker.get_balance()` (solo efectivo) como nuevo
+piso de referencia. Eso es correcto en modo un-solo-símbolo (ahí, sin
+posición abierta, efectivo == equity total), pero en multi-par es
+incorrecto: la meta puede haberse alcanzado por la ganancia NO realizada
+de OTRO símbolo que sigue abierto, y el efectivo solo no la incluye.
+Bancar solo el efectivo banca un piso más bajo que el equity real que
+disparó el gatillo -- y como `ProfitLock.lock_in()` no valida que el
+nuevo piso sea mayor al anterior (no tenía por qué hacerlo: nunca antes
+podía pasarle un valor menor), en el peor caso el "seguro de ganancias"
+terminaba *bajando* el piso del trinquete en vez de subirlo, violando su
+garantía central ("nunca hay techo, pero tampoco debería haber retrocesos").
+
+Corregido bancando `equity` (la variable ya calculada como efectivo + TODAS
+las posiciones, la misma que `check()` usó para decidir que la meta se
+alcanzó) en vez de `self.broker.get_balance()`. Test de regresión
+(`test_live_engine_profit_lock_multi_symbol_banks_full_equity_not_just_cash`):
+abre una posición grande en SYM_B (ganancia no realizada que por sí sola
+supera la meta), procesa un tick de SYM_A (que nunca tuvo posición propia,
+y cuyo efectivo solo queda por debajo del piso original), y verifica que
+el nuevo piso sea el equity total, no el efectivo.
+
+119/119 tests pasando.
 
 
 ## Notas importantes (leer antes de avanzar)

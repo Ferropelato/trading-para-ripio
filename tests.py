@@ -1025,6 +1025,80 @@ def test_live_engine_closes_position_to_lock_profit_and_keeps_operating():
     print("OK: el seguro de ganancias cierra la posición para asegurar la ganancia y sigue operando después")
 
 
+def test_live_engine_profit_lock_multi_symbol_banks_full_equity_not_just_cash():
+    """
+    Bug real encontrado en auditoría: cuando el símbolo del tick actual NO
+    tiene posición propia pero la meta de ganancia igual se alcanzó (por
+    la ganancia no realizada de OTRO símbolo que sigue abierto), el atajo
+    de "bancar directo, sin pasar por el bróker" usaba
+    `self.broker.get_balance()` (solo efectivo) en vez de `equity`
+    (efectivo + TODAS las posiciones). Acá SYM_B queda con una posición
+    cuya ganancia no realizada por sí sola ya supera la meta, mientras
+    SYM_A (el símbolo que procesa este tick) nunca tuvo posición -- el
+    efectivo solo (500) es MENOR que el piso de referencia original
+    (1000), así que el bug original hacía bajar el piso del trinquete, no
+    subirlo, violando su garantía central.
+    """
+    import os
+    import tempfile
+    from datetime import datetime, timezone
+    from live_runner import _LiveEngine
+    from broker import PaperBroker
+    from risk_profiles import get_profile
+    from safety import CircuitBreaker, ManualKillSwitch, ProfitLock
+    from health import Heartbeat
+    from state_store import StateStore
+    from alerts import ConsoleAlertChannel
+    from app_logger import get_logger
+
+    fd, state_path = tempfile.mkstemp(suffix="_live_engine_profit_lock_multi.json")
+    os.close(fd)
+    os.remove(state_path)
+    kill_switch_path = ".KILL_SWITCH_test_live_engine_profit_lock_multi"
+
+    try:
+        broker = PaperBroker(initial_balance=1000.0)
+        broker.set_price("SYM_B", 100.0)
+        broker.place_order("SYM_B", "buy", 5.0)  # ~500 en efectivo consumidos (slippage + comisión incluidos)
+        cash_after_buy = broker.get_balance()
+        assert cash_after_buy < 500.0, "La compra debe consumir efectivo (más comisión/slippage)"
+
+        lock = ProfitLock(target_pct=25.0, reference_capital=1000.0)
+        engine = _LiveEngine(
+            broker, ["SYM_A", "SYM_B"], get_profile("moderado"), "momentum", "moderado",
+            ConsoleAlertChannel(), ManualKillSwitch(control_file=kill_switch_path),
+            CircuitBreaker(), Heartbeat(max_staleness_seconds=99999),
+            StateStore(path=state_path), reconcile_every=1000, log=get_logger("test_live_engine_profit_lock_multi"),
+            profit_lock=lock,
+        )
+        now = datetime.now(timezone.utc)
+
+        # SYM_B sube a 160: su posición sola vale 800, equity total =
+        # ~499 (efectivo) + 800 = ~1299 -> ~+30% sobre el piso de 1000,
+        # supera la meta de 25%. El efectivo solo (~499) NUNCA la
+        # alcanzaría -- de hecho es menor al piso original.
+        broker.set_price("SYM_B", 160.0)
+        expected_equity = cash_after_buy + 5.0 * 160.0  # sin más slippage: no se pasa por el bróker de nuevo
+
+        # Se procesa un tick de SYM_A, que nunca tuvo posición propia.
+        engine.process_tick(now, 50.0, current_atr=1.0, sig=0, symbol="SYM_A")
+
+        assert lock.times_locked == 1, "Debe registrar el aseguramiento aunque el símbolo del tick no tenga posición"
+        assert abs(lock.reference_capital - expected_equity) < 0.01, (
+            "Debe bancar el equity total (efectivo + posición de SYM_B), no solo el efectivo"
+        )
+        assert lock.reference_capital > 1000.0, "El piso del trinquete NUNCA debe bajar del original"
+        assert "SYM_B" in broker.get_open_positions(), (
+            "Este atajo es solo contable -- no debe tocar la posición abierta de otro símbolo"
+        )
+    finally:
+        if os.path.exists(state_path):
+            os.remove(state_path)
+        if os.path.exists(kill_switch_path):
+            os.remove(kill_switch_path)
+    print("OK: el seguro de ganancias banca el equity total multi-símbolo, no solo el efectivo del símbolo del tick")
+
+
 def test_live_engine_restores_profit_lock_state_on_restart():
     """
     Mismo cuidado que con el circuit breaker: el piso de referencia (que
@@ -3491,6 +3565,7 @@ if __name__ == "__main__":
         test_live_engine_restores_news_pause_on_restart,
         test_live_engine_restores_daily_loss_reference_on_restart,
         test_live_engine_closes_position_to_lock_profit_and_keeps_operating,
+        test_live_engine_profit_lock_multi_symbol_banks_full_equity_not_just_cash,
         test_live_engine_restores_profit_lock_state_on_restart,
         test_state_store_handles_corrupt_file,
         test_reconciliation_detects_all_mismatch_types,

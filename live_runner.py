@@ -355,10 +355,16 @@ class _LiveEngine:
         in_position = symbol in broker_positions
 
         if profit_lock_hit and not in_position:
-            # La meta ya está cubierta solo con lo que hay en efectivo (no
-            # hay una posición que cerrar) -- se banca directo, sin pasar
-            # por el bróker.
-            self.profit_lock.lock_in(self.broker.get_balance())
+            # OJO: bancar con `equity` (efectivo + TODAS las posiciones,
+            # de cualquier símbolo), no con `self.broker.get_balance()`
+            # (solo efectivo) -- este símbolo puede no tener posición
+            # propia y aun así la meta haberse alcanzado por la ganancia
+            # no realizada de OTRO símbolo que sí sigue abierto. Bancar
+            # solo el efectivo banca un piso más bajo que el equity real
+            # que disparó el gatillo, violando la garantía central del
+            # trinquete (el piso nunca debería bajar) -- ver README,
+            # ronda de auditoría del seguro de ganancias multi-par.
+            self.profit_lock.lock_in(equity)
             profit_lock_hit = False
 
         # 3d) Modo manual/asistido (ver manual_trading.py): si hay una
