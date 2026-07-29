@@ -1631,6 +1631,45 @@ la CLI funciona de punta a punta, una compra manual respeta el circuit
 breaker y queda etiquetada como manual en el historial, y una venta
 manual cierra sin importar otros frenos).
 
+## Trigésima ronda: informe consolidado de resultados reales + otro bug de encoding
+
+Con las tres sesiones en vivo acumulando historia real, se agregó
+`real_results_report.py`: un informe que junta todas las sesiones que
+encuentre (mismo criterio que `status_report.py`) y muestra dos cosas por
+separado a propósito -- **fiabilidad de ejecución** (cuánto tiempo lleva
+corriendo cada sesión, cuántos rate limits/errores de conexión reales
+absorbió sin caerse, cuántas pausas por noticias reales se activaron, si
+la reconciliación interna siempre coincidió) y **resultado de las
+operaciones cerradas**, aclarando explícitamente que esto último mide
+fiabilidad, no rentabilidad -- unos días de paper trading no dicen nada
+sobre si una estrategia funciona a largo plazo.
+
+**Bug real encontrado escribiendo el propio informe**: los primeros
+números salieron en cero para "pausas por noticias" y "reconciliaciones
+OK" pese a que sabíamos que hubo muchas -- las palabras de búsqueda
+("automática", "Reconciliación") tienen tilde, y los logs de las
+sesiones en vivo se escriben redirigiendo stdout desde la consola de
+Windows (cp1252), no con UTF-8 explícito -- el mismo patrón de encoding
+que ya rompió dos veces antes en este proyecto, esta vez mordiendo la
+propia herramienta que se armó para reportar sobre las otras. Corregido
+buscando solo el tramo sin tilde de cada frase.
+
+**Segundo bug real, mismo patrón, en el propio script**: al guardar el
+informe con `python real_results_report.py > archivo.md` (la forma obvia
+de usarlo), el archivo resultante quedaba con los acentos codificados en
+cp1252, no UTF-8 -- fallaba al leerlo como UTF-8 estricto. Corregido
+agregando `--output archivo.md`, que el script mismo escribe con
+`encoding="utf-8"` explícito, sin depender de cómo la consola de Windows
+redirija stdout.
+
+**Resultado real acumulado a la fecha** (ver el informe generado para el
+detalle completo): 8 operaciones cerradas en total (2 ganadoras, 6
+perdedoras), neto levemente negativo -- pero cero desfasajes de
+reconciliación en cientos de chequeos, y más de 300 rate limits/errores
+de conexión reales absorbidos sin que ninguna sesión se cayera.
+
+117/117 tests pasando.
+
 
 ## Notas importantes (leer antes de avanzar)
 

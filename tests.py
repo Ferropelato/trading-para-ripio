@@ -2434,6 +2434,97 @@ def test_pair_trades_and_tax_export_consume_real_trade_history():
     print("OK: pair_trades conecta el historial persistente real con tax_export.py de punta a punta")
 
 
+def test_real_results_report_summarizes_sessions_from_directory():
+    """
+    real_results_report.py arma el informe consolidado a partir de
+    sesiones reales (mismo criterio que status_report.py) -- se prueba
+    con dos sesiones sintéticas en una carpeta temporal, una con
+    operaciones cerradas y log real, otra sin nada todavía.
+    """
+    import os
+    import shutil
+    import tempfile
+    from state_store import StateStore
+    from trade_history import TradeHistoryLog
+    from real_results_report import generate_report
+
+    tmp_dir = tempfile.mkdtemp(prefix="real_results_report_test_")
+    try:
+        # Sesión A: con historial y log real (con eventos para contar).
+        StateStore(path=os.path.join(tmp_dir, "live_state_a.json")).save({}, capital=1010.0, extra={})
+        history_a = TradeHistoryLog(os.path.join(tmp_dir, "trades_a.csv"))
+        history_a.append(symbol="A_USDC", side="buy", motivo="apertura", units=1.0,
+                          price=100.0, pnl=None, balance_resultante=900.0)
+        history_a.append(symbol="A_USDC", side="sell", motivo="take_profit", units=1.0,
+                          price=110.0, pnl=10.0, balance_resultante=1010.0)
+        with open(os.path.join(tmp_dir, "live_log_a.txt"), "w", encoding="utf-8") as f:
+            f.write("2026-01-01 00:00:00 | INFO | live_runner | Iniciando runner\n")
+            f.write("2026-01-01 00:01:00 | ERROR | live_runner | No se pudo obtener el precio (429): rate limited\n")
+            f.write("2026-01-01 00:02:00 | WARNING | news_monitor | Pausa automática de entradas nuevas activada hasta X\n")
+            f.write("2026-01-01 00:03:00 | INFO | reconciliation | Reconciliación OK: el estado interno coincide con el del bróker\n")
+
+        # Sesión B: recién arrancada, sin operaciones ni log todavía.
+        StateStore(path=os.path.join(tmp_dir, "live_state_b.json")).save({}, capital=1000.0, extra={})
+
+        report = generate_report(tmp_dir)
+
+        assert "Sesión: a" in report and "Sesión: b" in report
+        assert "USDC +10.00" in report, "Debe mostrar el resultado neto de la sesión A"
+        assert "Sin operaciones cerradas todavía" in report, "La sesión B no tiene historial"
+        assert "Rate limits (429) absorbidos sin caerse: 1" in report
+        assert "Pausas automáticas por noticias reales activadas: 1" in report
+        assert "Reconciliaciones internas OK: 1" in report
+        assert "Operaciones cerradas en total: 1 (1 ganadoras, 0 perdedoras)" in report
+        assert "no rentabilidad" in report, "Debe aclarar que esto mide fiabilidad, no rentabilidad"
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    print("OK: real_results_report.py consolida sesiones reales (resultado + fiabilidad de ejecución) correctamente")
+
+
+def test_real_results_report_output_file_is_valid_utf8():
+    """
+    Bug real: la primera versión solo imprimía el informe por stdout, y
+    guardarlo con `python real_results_report.py > archivo.md` en Windows
+    lo dejaba codificado con el codepage de la consola (cp1252), no
+    UTF-8 -- el archivo resultante fallaba al leerse como UTF-8 estricto
+    (justo lo que se esperaría de un .md con tildes). Se agregó --output
+    para que el script mismo escriba el archivo con UTF-8 explícito, sin
+    depender de cómo la consola redirija stdout. Este test reproduce el
+    escenario exacto: un informe con texto acentuado (nombres de sesión,
+    "Reconciliación", "días") debe poder leerse de vuelta como UTF-8
+    estricto sin UnicodeDecodeError.
+    """
+    import os
+    import sys
+    import tempfile
+    import real_results_report
+    from state_store import StateStore
+
+    tmp_dir = tempfile.mkdtemp(prefix="real_results_report_utf8_test_")
+    fd, output_path = tempfile.mkstemp(suffix="_informe_utf8_test.md")
+    os.close(fd)
+    os.remove(output_path)
+    old_argv = sys.argv
+    try:
+        StateStore(path=os.path.join(tmp_dir, "live_state_test.json")).save({}, capital=1000.0, extra={})
+
+        sys.argv = ["real_results_report.py", "--dir", tmp_dir, "--output", output_path]
+        real_results_report.main()
+
+        assert os.path.exists(output_path)
+        with open(output_path, encoding="utf-8") as f:
+            content = f.read()  # debe leerse sin UnicodeDecodeError
+        assert "Informe de resultados reales" in content
+        assert "fiabilidad de ejecución" in content, "El acento de 'ejecución' debe sobrevivir intacto"
+    finally:
+        sys.argv = old_argv
+        import shutil
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        if os.path.exists(output_path):
+            os.remove(output_path)
+    print("OK: real_results_report.py --output escribe un archivo UTF-8 válido, sin depender del codepage de la consola")
+
+
 def test_kill_switch_cli_respects_custom_control_file():
     """
     Bug real encontrado auditando el código: kill_switch.py (el comando
@@ -3394,6 +3485,8 @@ if __name__ == "__main__":
         test_trade_history_log_persists_across_process_restarts,
         test_live_engine_records_buy_and_sell_in_trade_history,
         test_status_report_reflects_state_and_history,
+        test_real_results_report_summarizes_sessions_from_directory,
+        test_real_results_report_output_file_is_valid_utf8,
         test_kill_switch_cli_respects_custom_control_file,
         test_manual_order_queue_persists_and_consumes_once,
         test_manual_order_cli_queues_and_reports_orders,
