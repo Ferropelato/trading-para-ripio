@@ -41,6 +41,7 @@ from health import Heartbeat
 from state_store import StateStore
 from trade_history import TradeHistoryLog
 from manual_trading import ManualOrderQueue
+from position_ranking import symbol_expectancy, pick_weakest_open_position
 from reconciliation import reconcile
 from regime import apply_regime_filter
 from multi_timeframe import apply_multi_timeframe_filter
@@ -268,6 +269,58 @@ class _LiveEngine:
             # gatillo, e incluso menor al piso anterior.
             self.profit_lock.lock_in(self._mark_to_market())
 
+    def _rotate_for_better_candidate(self, candidate_symbol, price):
+        """Con el cupo compartido de posiciones lleno, evalúa si vale la
+        pena CERRAR la posición abierta con peor historial probado para
+        abrir `candidate_symbol` en su lugar -- para que "el sistema
+        elige automáticamente las posiciones más rentables" sea real, no
+        solo primero-que-llega (ver auditoría de multi-par, README).
+
+        Deliberadamente conservador en dos sentidos:
+        - Solo entra en juego para entradas AUTOMÁTICAS (nunca se llama
+          para una compra manual) -- una persona pidiendo un símbolo
+          puntual es una decisión explícita, no necesita "ganarse" el
+          cupo compitiendo con lo ya abierto.
+        - Solo rota si la propia candidata TAMBIÉN tiene historial
+          suficiente y mejor que el símbolo más débil abierto. Sin eso no
+          hay evidencia de que sea mejor, solo que llegó ahora -- un
+          símbolo nuevo se gana su lugar por la vía normal (cupo libre),
+          no desplazando a uno con historial probado por conjetura.
+
+        Devuelve True si rotó (dejó un cupo libre), False si no hizo nada.
+        """
+        if self.trade_history is None:
+            return False
+        rows = self.trade_history.load_all()
+        weakest = pick_weakest_open_position(list(self.broker.get_open_positions().keys()), rows)
+        if weakest is None:
+            return False
+        candidate_score = symbol_expectancy(candidate_symbol, rows)
+        if candidate_score is None:
+            return False
+        weakest_score = symbol_expectancy(weakest, rows)
+        if candidate_score <= weakest_score:
+            return False
+
+        pos = self.broker.get_open_positions()[weakest]
+        client_order_id = f"{weakest}-sell-rotacion-{self.ticks_processed}"
+        order = self.broker.place_order(weakest, "sell", pos["unidades"], client_order_id=client_order_id)
+        if order["status"] == "open":
+            # No se completó de inmediato -- no forzamos un estado a medio
+            # camino solo para ganar este tick. Se reintenta más adelante,
+            # con datos frescos (esta candidata puede seguir señalando, o
+            # no, en el próximo tick).
+            self.log.info("Rotación por rentabilidad: la venta de %s quedó abierta, no se completa este tick", weakest)
+            return False
+
+        filled_units = order.get("units") or 0
+        self._apply_sell_fill(weakest, filled_units, price_filled=order.get("price"), motivo="rotacion_rentabilidad")
+        self.log.warning(
+            "Rotación por rentabilidad: se cerró %s (expectancy $%.2f/operación) para abrir %s (expectancy $%.2f/operación)",
+            weakest, weakest_score, candidate_symbol, candidate_score,
+        )
+        return True
+
     def _resolve_pending_order(self):
         """
         Si quedó una orden "open" de un tick anterior, la vuelve a
@@ -440,7 +493,10 @@ class _LiveEngine:
                         self.log.warning("Orden manual de compra en %s rechazada -- ATR inválido, no se puede calcular el tamaño de la posición", symbol)
                 else:
                     total_open = len(self.broker.get_open_positions())
-                    if self.max_positions is not None and total_open >= self.max_positions:
+                    cupo_lleno = self.max_positions is not None and total_open >= self.max_positions
+                    if cupo_lleno and not manual_entry:
+                        cupo_lleno = not self._rotate_for_better_candidate(symbol, price)
+                    if cupo_lleno:
                         self.log.info("Cupo de posiciones simultáneas alcanzado (%d/%d) -- no se abre %s%s",
                                       total_open, self.max_positions, symbol,
                                       " (orden manual)" if manual_entry else " pese a la señal")

@@ -556,6 +556,263 @@ def test_live_engine_multi_symbol_shares_broker_without_artificial_limit():
     print("OK: varios símbolos bajo un mismo motor comparten capital y pueden operar en simultáneo sin un cupo artificial")
 
 
+def test_symbol_expectancy_requires_minimum_trades_and_averages_pnl():
+    from position_ranking import symbol_expectancy, MIN_TRADES_FOR_SCORE
+
+    rows = [
+        {"symbol": "A", "side": "sell", "pnl": "10.0"},
+        {"symbol": "A", "side": "sell", "pnl": "-4.0"},
+    ]
+    assert symbol_expectancy("A", rows) is None, "Con menos de MIN_TRADES_FOR_SCORE operaciones, el score debe ser desconocido"
+
+    rows.append({"symbol": "A", "side": "sell", "pnl": "2.0"})
+    assert len(rows) >= MIN_TRADES_FOR_SCORE
+    assert abs(symbol_expectancy("A", rows) - (10.0 - 4.0 + 2.0) / 3) < 1e-9
+
+    # Filas de otro símbolo o de compras (sin pnl) no deben mezclarse en el promedio.
+    rows_mixed = rows + [
+        {"symbol": "B", "side": "sell", "pnl": "1000.0"},
+        {"symbol": "A", "side": "buy", "pnl": ""},
+    ]
+    assert abs(symbol_expectancy("A", rows_mixed) - (10.0 - 4.0 + 2.0) / 3) < 1e-9
+    print("OK: symbol_expectancy exige historia mínima y promedia solo las ventas del símbolo correcto")
+
+
+def test_pick_weakest_open_position_ignores_unknown_and_picks_lowest():
+    from position_ranking import pick_weakest_open_position
+
+    rows = [
+        {"symbol": "BAD", "side": "sell", "pnl": "-5.0"},
+        {"symbol": "BAD", "side": "sell", "pnl": "-3.0"},
+        {"symbol": "BAD", "side": "sell", "pnl": "-4.0"},
+        {"symbol": "GOOD", "side": "sell", "pnl": "5.0"},
+        {"symbol": "GOOD", "side": "sell", "pnl": "6.0"},
+        {"symbol": "GOOD", "side": "sell", "pnl": "7.0"},
+    ]
+    assert pick_weakest_open_position(["BAD", "GOOD"], rows) == "BAD"
+    # NEW no tiene historia suficiente todavía -- se ignora, pero eso NO
+    # vuelve el resultado "desconocido" en general: entre lo que sí se
+    # conoce (BAD, GOOD), sigue eligiendo el peor probado.
+    assert pick_weakest_open_position(["NEW", "BAD", "GOOD"], rows) == "BAD"
+    # Si NINGÚN símbolo abierto tiene historia suficiente todavía, ahí sí
+    # no hay nada de qué elegir.
+    assert pick_weakest_open_position(["NEW", "OTHER_NEW"], rows) is None
+    print("OK: pick_weakest_open_position ignora símbolos sin historia y elige el de menor expectancy")
+
+
+def test_live_engine_rotates_weakest_position_for_better_automatic_candidate():
+    """
+    Con el cupo compartido lleno, una señal AUTOMÁTICA en un símbolo con
+    mejor historial probado debe poder cerrar la posición abierta con
+    peor historial para abrir la candidata -- "el sistema elige
+    automáticamente las más rentables" tiene que ser real, no solo
+    primero-que-llega (ver auditoría de multi-par, README).
+    """
+    import os
+    import tempfile
+    from datetime import datetime, timezone
+    from live_runner import _LiveEngine
+    from broker import PaperBroker
+    from risk_profiles import get_profile
+    from safety import CircuitBreaker, ManualKillSwitch
+    from health import Heartbeat
+    from state_store import StateStore
+    from trade_history import TradeHistoryLog
+    from alerts import ConsoleAlertChannel
+    from app_logger import get_logger
+
+    fd, state_path = tempfile.mkstemp(suffix="_live_engine_rotation.json")
+    os.close(fd)
+    os.remove(state_path)
+    fd2, trades_path = tempfile.mkstemp(suffix="_live_engine_rotation_trades.csv")
+    os.close(fd2)
+    os.remove(trades_path)
+    kill_switch_path = ".KILL_SWITCH_test_live_engine_rotation"
+
+    try:
+        broker = PaperBroker(initial_balance=1000.0)
+        trade_history = TradeHistoryLog(trades_path)
+        # Historial ya probado: SYM_BAD perdedor, SYM_GOOD ganador.
+        for pnl in (-5.0, -4.0, -3.0):
+            trade_history.append(symbol="SYM_BAD", side="sell", motivo="señal_estrategia",
+                                  units=1.0, price=100.0, pnl=pnl, balance_resultante=1000.0)
+        for pnl in (5.0, 6.0, 7.0):
+            trade_history.append(symbol="SYM_GOOD", side="sell", motivo="señal_estrategia",
+                                  units=1.0, price=100.0, pnl=pnl, balance_resultante=1000.0)
+
+        engine = _LiveEngine(
+            broker, ["SYM_BAD", "SYM_GOOD"], get_profile("moderado"), "momentum", "moderado",
+            ConsoleAlertChannel(), ManualKillSwitch(control_file=kill_switch_path),
+            CircuitBreaker(), Heartbeat(max_staleness_seconds=99999),
+            StateStore(path=state_path), reconcile_every=1000, log=get_logger("test_live_engine_rotation"),
+            trade_history=trade_history, max_positions=1,
+        )
+        now = datetime.now(timezone.utc)
+
+        broker.set_price("SYM_BAD", 100.0)
+        engine.process_tick(now, 100.0, current_atr=2.0, sig=1, symbol="SYM_BAD")
+        assert "SYM_BAD" in engine.internal_positions, "Debe poder abrir la primera posición sin problema (cupo libre)"
+
+        broker.set_price("SYM_GOOD", 50.0)
+        engine.process_tick(now, 50.0, current_atr=1.0, sig=1, symbol="SYM_GOOD")
+
+        assert "SYM_BAD" not in engine.internal_positions, "Debe rotar: cerrar el símbolo con peor historial probado"
+        assert "SYM_GOOD" in engine.internal_positions, "Debe abrir la candidata con mejor historial probado"
+        assert len(broker.get_open_positions()) == 1, "El cupo compartido nunca debe superarse durante la rotación"
+
+        rows = trade_history.load_all()
+        rotation_rows = [r for r in rows if r["motivo"] == "rotacion_rentabilidad"]
+        assert len(rotation_rows) == 1 and rotation_rows[0]["symbol"] == "SYM_BAD", (
+            "El cierre por rotación debe quedar registrado en el historial con su propio motivo"
+        )
+    finally:
+        if os.path.exists(state_path):
+            os.remove(state_path)
+        if os.path.exists(trades_path):
+            os.remove(trades_path)
+        if os.path.exists(kill_switch_path):
+            os.remove(kill_switch_path)
+    print("OK: con el cupo lleno, una señal automática con mejor historial probado rota la posición más débil")
+
+
+def test_live_engine_does_not_rotate_for_unproven_candidate():
+    """
+    Sin historial propio, una candidata nueva NO debe poder desplazar una
+    posición ya abierta -- aunque el símbolo abierto tenga mal historial,
+    no hay evidencia de que la candidata sea mejor, solo que llegó ahora.
+    Un símbolo se gana su lugar por la vía normal (cupo libre), no
+    desplazando a otro por conjetura.
+    """
+    import os
+    import tempfile
+    from datetime import datetime, timezone
+    from live_runner import _LiveEngine
+    from broker import PaperBroker
+    from risk_profiles import get_profile
+    from safety import CircuitBreaker, ManualKillSwitch
+    from health import Heartbeat
+    from state_store import StateStore
+    from trade_history import TradeHistoryLog
+    from alerts import ConsoleAlertChannel
+    from app_logger import get_logger
+
+    fd, state_path = tempfile.mkstemp(suffix="_live_engine_no_rotation.json")
+    os.close(fd)
+    os.remove(state_path)
+    fd2, trades_path = tempfile.mkstemp(suffix="_live_engine_no_rotation_trades.csv")
+    os.close(fd2)
+    os.remove(trades_path)
+    kill_switch_path = ".KILL_SWITCH_test_live_engine_no_rotation"
+
+    try:
+        broker = PaperBroker(initial_balance=1000.0)
+        trade_history = TradeHistoryLog(trades_path)
+        for pnl in (-5.0, -4.0, -3.0):
+            trade_history.append(symbol="SYM_BAD", side="sell", motivo="señal_estrategia",
+                                  units=1.0, price=100.0, pnl=pnl, balance_resultante=1000.0)
+        # SYM_NEW no tiene NINGÚN historial todavía.
+
+        engine = _LiveEngine(
+            broker, ["SYM_BAD", "SYM_NEW"], get_profile("moderado"), "momentum", "moderado",
+            ConsoleAlertChannel(), ManualKillSwitch(control_file=kill_switch_path),
+            CircuitBreaker(), Heartbeat(max_staleness_seconds=99999),
+            StateStore(path=state_path), reconcile_every=1000, log=get_logger("test_live_engine_no_rotation"),
+            trade_history=trade_history, max_positions=1,
+        )
+        now = datetime.now(timezone.utc)
+
+        broker.set_price("SYM_BAD", 100.0)
+        engine.process_tick(now, 100.0, current_atr=2.0, sig=1, symbol="SYM_BAD")
+        assert "SYM_BAD" in engine.internal_positions
+
+        broker.set_price("SYM_NEW", 50.0)
+        engine.process_tick(now, 50.0, current_atr=1.0, sig=1, symbol="SYM_NEW")
+
+        assert "SYM_BAD" in engine.internal_positions, "No debe rotar: la candidata no tiene historial propio todavía"
+        assert "SYM_NEW" not in engine.internal_positions
+    finally:
+        if os.path.exists(state_path):
+            os.remove(state_path)
+        if os.path.exists(trades_path):
+            os.remove(trades_path)
+        if os.path.exists(kill_switch_path):
+            os.remove(kill_switch_path)
+    print("OK: una candidata sin historial propio no puede rotar una posición ya abierta, aunque esa tenga mal historial")
+
+
+def test_live_engine_manual_entry_never_triggers_rotation():
+    """
+    La rotación por rentabilidad es SOLO para entradas automáticas -- una
+    compra manual es una decisión explícita de la persona, no debería
+    poder cerrar otra posición sola por competir en el ranking. Con el
+    cupo lleno, una compra manual se rechaza igual que siempre (sin rotar),
+    aunque el símbolo pedido tenga mejor historial probado que lo abierto.
+    """
+    import os
+    import tempfile
+    from datetime import datetime, timezone
+    from live_runner import _LiveEngine
+    from broker import PaperBroker
+    from risk_profiles import get_profile
+    from safety import CircuitBreaker, ManualKillSwitch
+    from health import Heartbeat
+    from state_store import StateStore
+    from trade_history import TradeHistoryLog
+    from manual_trading import ManualOrderQueue
+    from alerts import ConsoleAlertChannel
+    from app_logger import get_logger
+
+    fd, state_path = tempfile.mkstemp(suffix="_live_engine_manual_no_rotation.json")
+    os.close(fd)
+    os.remove(state_path)
+    fd2, trades_path = tempfile.mkstemp(suffix="_live_engine_manual_no_rotation_trades.csv")
+    os.close(fd2)
+    os.remove(trades_path)
+    kill_switch_path = ".KILL_SWITCH_test_live_engine_manual_no_rotation"
+    manual_orders_path = ".MANUAL_ORDERS_test_live_engine_manual_no_rotation"
+
+    try:
+        broker = PaperBroker(initial_balance=1000.0)
+        trade_history = TradeHistoryLog(trades_path)
+        for pnl in (-5.0, -4.0, -3.0):
+            trade_history.append(symbol="SYM_BAD", side="sell", motivo="señal_estrategia",
+                                  units=1.0, price=100.0, pnl=pnl, balance_resultante=1000.0)
+        for pnl in (5.0, 6.0, 7.0):
+            trade_history.append(symbol="SYM_GOOD", side="sell", motivo="señal_estrategia",
+                                  units=1.0, price=100.0, pnl=pnl, balance_resultante=1000.0)
+        manual_orders = ManualOrderQueue(manual_orders_path)
+
+        engine = _LiveEngine(
+            broker, ["SYM_BAD", "SYM_GOOD"], get_profile("moderado"), "momentum", "moderado",
+            ConsoleAlertChannel(), ManualKillSwitch(control_file=kill_switch_path),
+            CircuitBreaker(), Heartbeat(max_staleness_seconds=99999),
+            StateStore(path=state_path), reconcile_every=1000, log=get_logger("test_live_engine_manual_no_rotation"),
+            trade_history=trade_history, max_positions=1, manual_orders=manual_orders,
+        )
+        now = datetime.now(timezone.utc)
+
+        broker.set_price("SYM_BAD", 100.0)
+        engine.process_tick(now, 100.0, current_atr=2.0, sig=1, symbol="SYM_BAD")
+        assert "SYM_BAD" in engine.internal_positions
+
+        broker.set_price("SYM_GOOD", 50.0)
+        manual_orders.queue_order("SYM_GOOD", "buy")
+        engine.process_tick(now, 50.0, current_atr=1.0, sig=0, symbol="SYM_GOOD")
+
+        assert "SYM_BAD" in engine.internal_positions, "No debe rotar por una compra manual, aunque SYM_GOOD tenga mejor historial"
+        assert "SYM_GOOD" not in engine.internal_positions, "La compra manual debe rechazarse por cupo lleno, no forzar una rotación"
+    finally:
+        if os.path.exists(state_path):
+            os.remove(state_path)
+        if os.path.exists(trades_path):
+            os.remove(trades_path)
+        if os.path.exists(kill_switch_path):
+            os.remove(kill_switch_path)
+        if os.path.exists(manual_orders_path):
+            os.remove(manual_orders_path)
+    print("OK: una compra manual con el cupo lleno se rechaza igual que siempre, nunca dispara una rotación")
+
+
 def test_run_live_polling_multi_symbol_smoke_test():
     """
     Test de humo de run_live_polling con VARIOS símbolos a la vez (ver
@@ -3631,6 +3888,11 @@ if __name__ == "__main__":
         test_live_polling_runs_with_stub_price_feed,
         test_live_engine_enforces_shared_position_cap_across_symbols,
         test_live_engine_multi_symbol_shares_broker_without_artificial_limit,
+        test_symbol_expectancy_requires_minimum_trades_and_averages_pnl,
+        test_pick_weakest_open_position_ignores_unknown_and_picks_lowest,
+        test_live_engine_rotates_weakest_position_for_better_automatic_candidate,
+        test_live_engine_does_not_rotate_for_unproven_candidate,
+        test_live_engine_manual_entry_never_triggers_rotation,
         test_run_live_polling_multi_symbol_smoke_test,
         test_broker_adapters_dont_leak_into_each_other,
         test_state_survives_simulated_restart,

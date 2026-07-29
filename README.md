@@ -1764,7 +1764,70 @@ sumar también la ganancia no realizada de las posiciones que siguen
 abiertas, y republicado el Artifact.
 
 
-## Notas importantes (leer antes de avanzar)
+## Trigésima segunda ronda: rotación por rentabilidad + 6 pares nuevos en vivo
+
+Pregunta real que motivó esta ronda: ¿cuántos pares están operando hoy y
+cuántos más se pueden sumar? Se consultó `/trade/public/pairs` de Ripio
+en vivo (no research viejo): **15 pares habilitados para Argentina**, de
+los cuales 10 son cripto-cripto genuinamente volátiles (aptos para las
+estrategias) y 5 son pares de "estacionamiento" (USDC_ARS, USDT_ARS,
+USDC_USDT, EURC_USDC, PYUSD_USDC) donde el research de la Novena ronda ya
+mostró que comprar y mantener le gana al trading activo. De los 10
+volátiles, solo 2 (BTC_USDC, ETH_USDC) tenían sesión en vivo -- quedaban
+8 sin usar.
+
+Esto expuso una brecha real de diseño: `max_positions` era un cupo
+"primero que llega, ocupa el lugar", no un ranking real por rentabilidad
+-- con más pares candidatos que cupo, el orden de llegada decidía, no qué
+tan bueno era cada uno. Se construyó `position_ranking.py`: expectancy
+(ganancia promedio por operación cerrada) por símbolo, a partir del
+historial REAL de `trade_history.py` -- no de la fuerza de la señal del
+momento, que mide momentum, no rentabilidad comprobada. Con el cupo
+lleno, una señal automática con mejor expectancy probada que el símbolo
+más débil abierto ahora puede ROTAR (cerrar el débil, abrir la
+candidata). Deliberadamente conservador en dos sentidos: (1) solo aplica
+a entradas automáticas, nunca a una compra manual -- una decisión
+explícita de una persona no necesita "ganarse" el cupo compitiendo; (2)
+la candidata también necesita historial propio suficiente y mejor -- un
+símbolo nuevo se gana su lugar por la vía normal (cupo libre), nunca
+desplazando a uno probado por conjetura. `MIN_TRADES_FOR_SCORE = 3`: con
+menos operaciones cerradas, el score es "desconocido", no "malo". 5 tests
+nuevos (unitarios del scoring + integración con el motor, incluyendo el
+caso "candidata sin historial no rota" y "compra manual nunca rota").
+125/125 tests pasando.
+
+**Datasets reales para los pares nuevos.** De los 8 pares sin usar, se
+verificaron contra Yahoo Finance (mismo criterio sin API key que
+`build_ars_datasets.py`, y con el nombre completo de cada activo
+confirmado contra la respuesta -- no asumido por el ticker): 6 tienen
+historial real (`build_new_pairs_datasets.py`): LINK_USDC, LTC_USDC,
+UNI_USDC, WLD_USDC, RPC_USDC, RIF_USDC. **HYPE_USDC y LAC_USDC quedan
+afuera de esta ronda** -- Yahoo Finance devuelve 0 velas para esos dos
+tickers, y no se inventó un dataset para no romper la política de datos
+reales del proyecto. Se pueden operar igual en modo manual (no necesita
+historial para calentar indicadores).
+
+Se lanzó una cuarta sesión en vivo (`new_pairs`, cuenta y capital propios,
+separada de `btc_usdc`/`eth_usdc`/`multi` para no tocar su historial ya
+acumulado) con los 6 pares nuevos bajo un cupo compartido de 5 -- primera
+prueba real de la rotación por rentabilidad con más candidatos que cupo.
+
+**Hallazgo operativo real (no un bug del motor): stdout bufferizado
+ocultaba actividad real.** Al lanzar la sesión nueva redirigiendo la
+salida a un archivo (`> live_log_new_pairs.txt`), el log pareció
+"congelado" más de 3 horas -- pero el proceso seguía vivo y consumiendo
+CPU (confirmado por su estado real, no supuesto). La causa: el
+`StreamHandler` de `app_logger.py` escribe a `sys.stdout`, que Python
+bufferiza por bloques cuando la salida no es una terminal (el caso de
+cualquier redirección `>` a archivo) -- con poco volumen de log
+generado, el buffer todavía no se había llenado lo suficiente como para
+volcarse a disco. El motor nunca estuvo colgado; el archivo que se
+estaba mirando sí mentía sobre cuán reciente era la actividad real. Esto
+importa porque `status_report.py` y `real_results_report.py` miden salud
+por el timestamp del log -- un log bufferizado puede hacer parecer
+muerta una sesión que está perfectamente viva. Se resolvió relanzando con
+`python -u` (salida sin buffer); vale para cualquier sesión nueva que se
+lance redirigiendo a archivo de acá en adelante.
 
 1. **Este backtest usa datos sintéticos por defecto.** Los resultados que
    viste recién no dicen nada sobre si la estrategia funciona en el
