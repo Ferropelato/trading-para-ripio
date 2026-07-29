@@ -1670,6 +1670,15 @@ de conexión reales absorbidos sin que ninguna sesión se cayera.
 
 117/117 tests pasando.
 
+**De paso, se actualizó el mockup** (`ripio_trading_mockup.html`, fuera de
+este repo) para que refleje lo que el motor real ya hace: un panel de
+"Operar manualmente" en el dashboard (comprar un par nuevo respetando el
+cupo compartido, vender cualquier posición en cualquier momento), y un
+card de "Seguro de ganancias" en Ajustes (activar, ver el piso actual y
+cuántas veces se aseguró, y una simulación del cierre+ratchet). Hasta
+esta ronda el mockup mostraba visualmente 3 posiciones simultáneas pero
+no explicaba estas dos piezas del motor real -- ahora sí.
+
 
 ## Notas importantes (leer antes de avanzar)
 
