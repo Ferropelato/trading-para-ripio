@@ -1750,6 +1750,19 @@ SYM_B, no solo el efectivo resultante de esa venta puntual.
 
 120/120 tests pasando.
 
+**Se revisó el mockup contra ambos hallazgos.** El botón "Vender" del
+modo manual solo existe en las filas de posiciones que ya están
+renderizadas -- no hay forma de pedir desde la UI una venta de algo que
+no está abierto, y el mockup tampoco cierra posiciones solo en segundo
+plano (su `tick()` solo mueve precios), así que el primer bug no tenía
+equivalente ahí. El segundo sí: la simulación de "Simular: se alcanzó la
+meta" calculaba el nuevo piso como `piso anterior + ganancia de la
+posición cerrada`, ignorando la ganancia no realizada de cualquier otra
+posición que quedara abierta en simultáneo -- el mismo patrón de bug
+recién corregido en el motor real, esta vez en la demo. Corregido para
+sumar también la ganancia no realizada de las posiciones que siguen
+abiertas, y republicado el Artifact.
+
 
 ## Notas importantes (leer antes de avanzar)
 
