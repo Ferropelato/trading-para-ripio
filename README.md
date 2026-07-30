@@ -2106,6 +2106,50 @@ ejecutarse de verdad, un resultado matemáticamente fijo y verificable a
 mano. 137/137 tests pasando.
 
 
+## Cuadragésima ronda: el sistema de reintentos con backoff nunca estuvo activo en vivo
+
+El hallazgo más importante de toda esta pasada de auditoría continua.
+Auditando `broker.py` contra `resilience.py` (el módulo de reintentos
+con backoff exponencial -- construido, testeado en aislamiento, y
+documentado desde la "Sexta ronda: confiabilidad y robustez"): el
+decorador `@retry_with_backoff` **nunca se había aplicado a ningún
+método real del bróker**. Ni `RipioBrokerAdapter._request` ni
+`AlpacaBrokerAdapter._request` lo tenían -- el único mecanismo que
+absorbía errores de red en las sesiones en vivo era el catch-and-skip
+del loop de polling en `live_runner.py` (esperar hasta el próximo tick
+completo, 45-90 segundos), no el backoff rápido (1s, 2s, 4s dentro del
+mismo tick) que este módulo estaba pensado para dar. El módulo existía,
+tenía su propio test, y el README lo mencionaba como parte de la
+resiliencia del sistema -- pero jamás estuvo conectado a nada real.
+
+**Segundo hallazgo, peor todavía**: incluso si el decorador hubiera
+estado aplicado, no habría ayudado con el error más común de todas las
+sesiones en vivo de este proyecto. Un 429 (rate limit) caía en el
+catch-all genérico "código de respuesta >= 400 -> `PermanentBrokerError`"
+-- y `retry_with_backoff` deliberadamente NO reintenta errores
+permanentes (por diseño: no tiene sentido reintentar credenciales
+inválidas o fondos insuficientes). Un 429 es exactamente el caso de
+libro de "esperá un poco y volvé a intentar", no "esto nunca va a
+funcionar" -- estaba mal clasificado desde el día en que se escribió
+`_request`.
+
+**Fix**: `@retry_with_backoff(max_attempts=3, base_delay_seconds=1.0,
+max_delay_seconds=10.0)` aplicado a `_request` en ambos adaptadores, y
+un chequeo explícito de `status_code == 429` ANTES del catch-all
+genérico, clasificándolo como `TransientBrokerError` en los dos. De
+paso, se limpiaron varios imports locales de `resilience` que quedaron
+redundantes al importar todo a nivel de módulo. 2 tests nuevos: uno de
+punta a punta (un 429 seguido de una respuesta exitosa, verificando que
+`_request` reintenta sola y el llamador nunca ve el error) y uno de
+introspección (confirma que el decorador sigue aplicado en los dos
+adaptadores reales, para no volver a perderlo en silencio en un
+refactor futuro). 139/139 tests pasando. Se reiniciaron las 4 sesiones
+en vivo con el fix -- dado lo seguido que este proyecto absorbió 429 en
+sus propias sesiones (cientos de veces, documentado en rondas
+anteriores), este cambio debería reducir cuántos ticks se saltean
+esperando el próximo poll en vez de reintentar en el momento.
+
+
 ## Notas importantes (leer antes de avanzar)
 
 1. **Este backtest usa datos sintéticos por defecto.** Los resultados que

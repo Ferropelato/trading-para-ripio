@@ -2592,6 +2592,56 @@ def test_alpaca_get_current_price_parses_latest_trade():
     print("OK: AlpacaBrokerAdapter obtiene el último precio de una acción real (AAPL)")
 
 
+def test_alpaca_429_is_retried_and_succeeds():
+    """
+    Bug real encontrado en auditoría: un 429 (rate limit) caía en el
+    catch-all de "código >= 400 -> error permanente", así que ni siquiera
+    con el decorador de retry aplicado se hubiera reintentado -- el caso
+    de libro de "esperá un poco y reintentá" quedaba tratado como "esto
+    nunca va a funcionar". Acá se prueba de punta a punta: la primera
+    respuesta es 429, la segunda ya es exitosa -- `_request` debe
+    reintentar sola (gracias a `@retry_with_backoff`, recién ahora
+    aplicado de verdad -- ver README, ronda de auditoría de resiliencia)
+    y devolver el resultado bueno, sin que el llamador vea nada.
+    """
+    from broker import AlpacaBrokerAdapter
+
+    calls = []
+
+    def fake_transport(method, url, headers, json_body, timeout):
+        calls.append(1)
+        if len(calls) == 1:
+            return _FakeAlpacaResponse(429, {"message": "rate limited"})
+        return _FakeAlpacaResponse(200, {"trade": {"p": 100.0}})
+
+    broker = AlpacaBrokerAdapter(api_key_id="k", secret_key="s", transport=fake_transport)
+    price = broker.get_current_price("AAPL")
+    assert price == 100.0, "Debe reintentar sola y devolver el precio bueno, sin propagar el 429"
+    assert len(calls) == 2, "Debe haber reintentado exactamente una vez tras el 429"
+    print("OK: un 429 se reintenta automáticamente en vez de cortar como error permanente")
+
+
+def test_broker_request_methods_have_retry_decorator_applied():
+    """
+    Bug real: @retry_with_backoff existía hace tiempo (construido,
+    testeado, documentado en resilience.py) pero nunca se había aplicado
+    a ningún método real del bróker -- nunca estuvo activo en las
+    sesiones en vivo, pese a que el README lo mencionaba como parte de
+    la resiliencia del sistema. Chequeo liviano de que el decorador
+    sigue aplicado en los dos adaptadores reales, para no perderlo en
+    silencio en un refactor futuro.
+    """
+    from broker import RipioBrokerAdapter, AlpacaBrokerAdapter
+
+    assert hasattr(RipioBrokerAdapter._request, "__wrapped__"), (
+        "RipioBrokerAdapter._request debe tener @retry_with_backoff aplicado"
+    )
+    assert hasattr(AlpacaBrokerAdapter._request, "__wrapped__"), (
+        "AlpacaBrokerAdapter._request debe tener @retry_with_backoff aplicado"
+    )
+    print("OK: @retry_with_backoff sigue aplicado a los métodos reales del bróker")
+
+
 def test_alpaca_get_balance_reads_cash_from_account():
     from broker import AlpacaBrokerAdapter
 
@@ -4401,6 +4451,8 @@ if __name__ == "__main__":
         test_start_session_fails_cleanly_without_enough_wallet_balance,
         test_user_session_manager_uses_one_shared_db_not_one_file_per_user,
         test_alpaca_get_current_price_parses_latest_trade,
+        test_alpaca_429_is_retried_and_succeeds,
+        test_broker_request_methods_have_retry_decorator_applied,
         test_alpaca_get_balance_reads_cash_from_account,
         test_alpaca_get_open_positions_maps_fields,
         test_alpaca_place_order_blocked_without_allow_trading,

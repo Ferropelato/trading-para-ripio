@@ -16,6 +16,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 
 from app_logger import get_logger
+from resilience import retry_with_backoff, TransientBrokerError, PermanentBrokerError
 
 log = get_logger(__name__)
 
@@ -364,7 +365,6 @@ class RipioBrokerAdapter(BrokerBase):
         return base64.b64encode(digest).decode("utf-8")
 
     def _require_credentials(self):
-        from resilience import PermanentBrokerError
         if not self.api_token or not self.api_secret:
             raise PermanentBrokerError(
                 "Faltan RIPIO_API_TOKEN / RIPIO_API_SECRET -- no se puede llamar a endpoints privados."
@@ -444,15 +444,24 @@ class RipioBrokerAdapter(BrokerBase):
             "Signature": signature,
         }
 
+    @retry_with_backoff(max_attempts=3, base_delay_seconds=1.0, max_delay_seconds=10.0)
     def _request(self, method: str, path: str, body_obj: dict = None, signed: bool = True) -> dict:
         """
         path debe empezar con /trade/... (como en los ejemplos oficiales).
         body_obj se serializa con separators compactos para que el body firmado
         coincida byte-a-byte con el enviado.
+
+        OJO: decorado con `@retry_with_backoff` -- bug real encontrado en
+        auditoría: este decorador existía desde hace tiempo (construido,
+        testeado, documentado) pero nunca se había aplicado a ningún
+        método real del bróker, así que nunca estuvo activo en las
+        sesiones en vivo. El único mecanismo que absorbía errores de red
+        era el catch-and-skip del loop de polling en `live_runner.py`
+        (esperar hasta el próximo tick, 45-90s), no el backoff rápido
+        (1s, 2s, 4s) que este módulo estaba pensado para dar.
         """
         import json
         import requests
-        from resilience import TransientBrokerError, PermanentBrokerError
 
         body = ""
         if body_obj is not None:
@@ -488,6 +497,16 @@ class RipioBrokerAdapter(BrokerBase):
             raise TransientBrokerError(
                 f"Ripio respondió {response.status_code}: {response.text[:200]}"
             )
+        if response.status_code == 429:
+            # Bug real encontrado en auditoría: 429 caía en el catch-all
+            # de "código >= 400 -> permanente" de más abajo, así que ni
+            # siquiera aplicando el retry hubiera reintentado el error
+            # más común de todas las sesiones en vivo de este proyecto
+            # (rate limit -- justo el caso de libro de "esperá un poco y
+            # reintentá", no "esto nunca va a funcionar").
+            raise TransientBrokerError(
+                f"Ripio rechazó la request (429, rate limit): {response.text[:200]}"
+            )
         if response.status_code in (401, 403):
             raise PermanentBrokerError(
                 f"Auth Ripio falló ({response.status_code}): {response.text[:300]}"
@@ -515,7 +534,6 @@ class RipioBrokerAdapter(BrokerBase):
         data = payload.get("data") or {}
         last = data.get("last")
         if last is None:
-            from resilience import PermanentBrokerError
             raise PermanentBrokerError(f"Ticker de {pair} sin campo 'last': {payload}")
         return float(last)
 
@@ -773,15 +791,16 @@ class AlpacaBrokerAdapter(BrokerBase):
         }
 
     def _require_credentials(self):
-        from resilience import PermanentBrokerError
         if not self.api_key_id or not self.secret_key:
             raise PermanentBrokerError(
                 "Faltan ALPACA_API_KEY_ID / ALPACA_SECRET_KEY -- no se puede llamar a ningún endpoint de Alpaca."
             )
 
+    @retry_with_backoff(max_attempts=3, base_delay_seconds=1.0, max_delay_seconds=10.0)
     def _request(self, method: str, url: str, json_body: dict = None) -> dict:
-        from resilience import TransientBrokerError, PermanentBrokerError
-
+        """OJO: decorado con `@retry_with_backoff` -- ver la misma nota en
+        RipioBrokerAdapter._request (bug real de auditoría: el decorador
+        nunca estaba aplicado a ningún método real)."""
         self._require_credentials()
         try:
             response = self._transport(method.upper(), url, self._headers(), json_body, self.timeout)
@@ -792,6 +811,9 @@ class AlpacaBrokerAdapter(BrokerBase):
 
         if response.status_code >= 500:
             raise TransientBrokerError(f"Alpaca respondió {response.status_code}: {response.text[:200]}")
+        if response.status_code == 429:
+            # Mismo bug de clasificación que en Ripio -- ver nota ahí.
+            raise TransientBrokerError(f"Alpaca rechazó la request (429, rate limit): {response.text[:200]}")
         if response.status_code in (401, 403):
             raise PermanentBrokerError(f"Auth Alpaca falló ({response.status_code}): {response.text[:300]}")
         if response.status_code >= 400:
@@ -811,7 +833,6 @@ class AlpacaBrokerAdapter(BrokerBase):
         trade = data.get("trade") or {}
         price = trade.get("p")
         if price is None:
-            from resilience import PermanentBrokerError
             raise PermanentBrokerError(f"Respuesta de Alpaca sin precio para {symbol}: {data}")
         return float(price)
 
