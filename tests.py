@@ -2474,6 +2474,55 @@ def test_ops_monitor_detects_reconciliation_mismatch():
     print("OK: OperationsMonitor detecta un desfasaje de reconciliación entre el estado interno y el bróker")
 
 
+def test_ops_monitor_detects_concentration_issue():
+    """
+    Laguna real encontrada en auditoría: OperationsMonitor (el monitoreo
+    centralizado para miles de usuarios, ver README) chequeaba circuit
+    breaker, kill-switch, heartbeat y reconciliación, pero NO
+    concentración -- el mismo aviso que ya se agregó a
+    status_report.py/real_results_report.py (ver ronda de auditoría de
+    concentración) faltaba justo en el único lugar donde un problema de
+    concentración generalizado se vería como patrón agregado entre
+    muchos usuarios, no como un caso aislado que nadie nota.
+    """
+    from ops_monitor import OperationsMonitor
+    from safety import CircuitBreaker, ManualKillSwitch
+    from state_store import SQLiteStateStore
+    import os
+    import tempfile
+
+    fd, db_path = tempfile.mkstemp(suffix="_ops_concentration.db")
+    os.close(fd)
+    os.remove(db_path)
+
+    try:
+        state_store = SQLiteStateStore(db_path=db_path, key="user-concentrado")
+        # Mismo escenario real que LINK_USDC: casi todo el capital en un solo símbolo.
+        state_store.save(
+            {"LINK_USDC": {"unidades": 114.767004, "precio_entrada": 8.4271}}, capital=3.41,
+        )
+
+        alert_channel = _CollectingAlertChannel()
+        monitor = OperationsMonitor(alert_channel)
+        monitor.register("user-concentrado", _FakeSession(
+            circuit_breaker=CircuitBreaker(), kill_switch=ManualKillSwitch(control_file=".KILL_SWITCH_test_ops_conc"),
+            state_store=state_store,
+        ))
+
+        report = monitor.check_all()
+        assert any(p["tipo"] == "concentracion" and "LINK_USDC" in p["detalle"] for p in report["problemas_individuales"]), (
+            "Debe detectar la posición sobre-concentrada como un problema individual"
+        )
+        assert any("concentraci" in msg.lower() and "LINK_USDC" in msg for msg in alert_channel.sent), (
+            "Debe alertar por el mismo canal que el resto de los problemas"
+        )
+        state_store.close()
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+    print("OK: OperationsMonitor detecta posiciones sobre-concentradas, igual que los otros reportes")
+
+
 class _FakeAlpacaResponse:
     """Respuesta HTTP falsa para inyectar en AlpacaBrokerAdapter sin red real."""
 
@@ -4330,6 +4379,7 @@ if __name__ == "__main__":
         test_ops_monitor_escalates_to_systemic_alert_when_threshold_crossed,
         test_ops_monitor_does_not_escalate_with_too_few_users,
         test_ops_monitor_detects_reconciliation_mismatch,
+        test_ops_monitor_detects_concentration_issue,
         test_paper_broker_partial_fill_reports_actual_units,
         test_paper_broker_zero_fill_ratio_leaves_order_open_with_no_position,
         test_paper_broker_simulate_additional_fill_completes_open_order,

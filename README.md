@@ -2055,6 +2055,27 @@ mismo titular, confirmando que no se re-alerta ni se re-pausa. 135/135
 tests pasando. Se reiniciaron las 4 sesiones en vivo con el fix.
 
 
+## Trigésima octava ronda: OperationsMonitor no chequeaba concentración
+
+Auditando `ops_monitor.py` (el monitoreo centralizado para miles de
+usuarios, Fase 3b): chequeaba circuit breaker, kill-switch, heartbeat y
+reconciliación, pero no concentración -- justo el único de los avisos ya
+agregados a `status_report.py`/`real_results_report.py` que faltaba acá.
+Es una laguna real y no menor: `OperationsMonitor` es exactamente el
+lugar donde un problema de concentración generalizado (el mismo tipo de
+bug que causó el caso de LINK_USDC, si volviera a pasar por cualquier
+otro motivo en el futuro) se vería como un patrón agregado entre muchos
+usuarios -- sin este chequeo, quedaría invisible ahí, aunque los otros
+dos reportes sí lo mostraran individualmente.
+
+Agregado con el mismo `concentration_warnings()` ya existente, dentro
+del mismo chequeo que ya cargaba el estado para reconciliación (sin
+duplicar la lectura). Un usuario sobre-concentrado ahora también puede
+disparar la alerta sistémica agregada si supera el umbral configurado,
+igual que circuit breaker o kill-switch. Test de regresión con el mismo
+escenario real de LINK_USDC. 136/136 tests pasando.
+
+
 ## Notas importantes (leer antes de avanzar)
 
 1. **Este backtest usa datos sintéticos por defecto.** Los resultados que

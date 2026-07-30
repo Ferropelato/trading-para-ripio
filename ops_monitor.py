@@ -19,6 +19,7 @@ from dataclasses import dataclass
 
 from app_logger import get_logger
 from reconciliation import reconcile
+from risk_manager import concentration_warnings
 
 log = get_logger(__name__)
 
@@ -26,7 +27,7 @@ log = get_logger(__name__)
 @dataclass
 class _Issue:
     user_id: str
-    tipo: str  # "circuit_breaker", "kill_switch", "heartbeat_stale", "reconciliacion"
+    tipo: str  # "circuit_breaker", "kill_switch", "heartbeat_stale", "reconciliacion", "concentracion"
     detalle: str
 
 
@@ -72,11 +73,24 @@ class OperationsMonitor:
 
         state_store = getattr(session, "state_store", None)
         broker = getattr(session, "broker", None)
-        if state_store is not None and broker is not None:
-            internal_positions = state_store.load().get("positions", {})
-            report = reconcile(internal_positions, broker.get_open_positions())
-            if not report["coincide"]:
-                issues.append(_Issue(user_id, "reconciliacion", str(report)))
+        if state_store is not None:
+            state = state_store.load()
+            internal_positions = state.get("positions", {})
+
+            if broker is not None:
+                report = reconcile(internal_positions, broker.get_open_positions())
+                if not report["coincide"]:
+                    issues.append(_Issue(user_id, "reconciliacion", str(report)))
+
+            # Mismo chequeo que status_report.py/real_results_report.py
+            # (ver README, ronda de auditoría de concentración) -- acá
+            # importa más todavía: con miles de usuarios, este es el
+            # único lugar donde un problema de concentración generalizado
+            # (ej. el mismo bug de ATR que causó esto en LINK_USDC, si
+            # volviera a pasar por otro motivo) se vería como alerta
+            # SISTÉMICA agregada, no como un caso aislado que nadie nota.
+            for aviso in concentration_warnings(state.get("capital"), internal_positions):
+                issues.append(_Issue(user_id, "concentracion", aviso))
 
         return issues
 
