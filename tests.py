@@ -201,6 +201,32 @@ def test_min_trade_value_rejects_tiny_trades():
     print("OK: el mínimo operable rechaza operaciones demasiado chicas")
 
 
+def test_concentration_warnings_flags_only_positions_above_threshold():
+    """
+    concentration_warnings() -- usado por status_report.py y
+    real_results_report.py para avisar sin depender de mirar el JSON a
+    mano (ver README, ronda de auditoría de concentración). Con el
+    threshold por defecto (45%, por encima del tope de cualquier perfil),
+    una posición que concentra ~97% del capital (el escenario real visto
+    con LINK_USDC) debe generar un aviso; una posición normal (~15%) no."""
+    from risk_manager import concentration_warnings
+
+    # Escenario real: casi todo el capital en un solo símbolo.
+    avisos = concentration_warnings(
+        capital=3.41, positions={"LINK_USDC": {"unidades": 114.767004, "precio_entrada": 8.4271}},
+    )
+    assert len(avisos) == 1 and "LINK_USDC" in avisos[0], "Debe avisar sobre la posición sobre-concentrada"
+
+    # Posición normal, dentro de cualquier perfil -- no debe avisar nada.
+    avisos_normales = concentration_warnings(
+        capital=850.0, positions={"TEST_SYM": {"unidades": 1.5, "precio_entrada": 100.0}},
+    )
+    assert avisos_normales == [], "Una posición normal no debería disparar ningún aviso"
+
+    assert concentration_warnings(capital=1000.0, positions={}) == [], "Sin posiciones abiertas, no hay nada que avisar"
+    print("OK: concentration_warnings avisa solo sobre posiciones realmente fuera de lo esperado")
+
+
 def test_adx_bounded_and_regime_classifies():
     from data_utils import generate_synthetic_data
     from regime import compute_adx, classify_regime
@@ -3017,6 +3043,32 @@ def test_real_results_report_summarizes_sessions_from_directory():
     print("OK: real_results_report.py consolida sesiones reales (resultado + fiabilidad de ejecución) correctamente")
 
 
+def test_real_results_report_warns_about_concentrated_position():
+    """
+    Mismo aviso que status_report.py, acá en el informe consolidado --
+    una sesión con una posición sobre-concentrada debe quedar marcada
+    explícitamente, no solo con el número de capital pelado.
+    """
+    import os
+    import shutil
+    import tempfile
+    from state_store import StateStore
+    from real_results_report import generate_report
+
+    tmp_dir = tempfile.mkdtemp(prefix="real_results_report_concentration_test_")
+    try:
+        StateStore(path=os.path.join(tmp_dir, "live_state_new_pairs.json")).save(
+            {"LINK_USDC": {"unidades": 114.767004, "precio_entrada": 8.4271}}, capital=3.41, extra={},
+        )
+        report = generate_report(tmp_dir)
+        assert "[!] Concentraci" in report and "LINK_USDC" in report, (
+            "El informe consolidado debe avisar sobre la posición sobre-concentrada"
+        )
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    print("OK: real_results_report.py también avisa sobre posiciones sobre-concentradas")
+
+
 def test_real_results_report_output_file_is_valid_utf8():
     """
     Bug real: la primera versión solo imprimía el informe por stdout, y
@@ -3395,6 +3447,42 @@ def test_status_report_reflects_state_and_history():
         if os.path.exists(kill_switch_path):
             os.remove(kill_switch_path)
     print("OK: status_report.py refleja fielmente el estado y el historial ya persistidos")
+
+
+def test_status_report_warns_about_concentrated_position():
+    """
+    status_report.py debe avisar de forma explícita cuando una posición
+    persistida concentra una porción anormal del capital -- sin esto, el
+    único jeito de notarlo era mirar el JSON a mano (así se encontró el
+    bug real de LINK_USDC). Con una posición normal, no debe avisar nada.
+    """
+    import os
+    import tempfile
+    from state_store import StateStore
+    from status_report import build_status_report
+
+    fd, state_path = tempfile.mkstemp(suffix="_status_report_concentration.json")
+    os.close(fd)
+    os.remove(state_path)
+
+    try:
+        StateStore(path=state_path).save(
+            {"LINK_USDC": {"unidades": 114.767004, "precio_entrada": 8.4271}}, capital=3.41, extra={},
+        )
+        report = build_status_report("LINK_USDC", state_path)
+        assert "[!] Concentraci" in report and "LINK_USDC" in report, (
+            "Debe avisar sobre la posición sobre-concentrada, no solo listarla"
+        )
+
+        StateStore(path=state_path).save(
+            {"TEST_SYM": {"unidades": 1.5, "precio_entrada": 100.0}}, capital=850.0, extra={},
+        )
+        report_normal = build_status_report("TEST_SYM", state_path)
+        assert "[!] Concentraci" not in report_normal, "Una posición normal no debería disparar el aviso"
+    finally:
+        if os.path.exists(state_path):
+            os.remove(state_path)
+    print("OK: status_report.py avisa cuando una posición concentra el capital fuera de lo esperado")
 
 
 def test_trade_history_log_persists_across_process_restarts():
@@ -4001,6 +4089,7 @@ if __name__ == "__main__":
         test_profit_lock_lock_in_ratchets_and_keeps_operating,
         test_profit_lock_rejects_invalid_params,
         test_min_trade_value_rejects_tiny_trades,
+        test_concentration_warnings_flags_only_positions_above_threshold,
         test_adx_bounded_and_regime_classifies,
         test_heartbeat_detects_staleness,
         test_data_gap_detection,
@@ -4092,7 +4181,9 @@ if __name__ == "__main__":
         test_trade_history_log_persists_across_process_restarts,
         test_live_engine_records_buy_and_sell_in_trade_history,
         test_status_report_reflects_state_and_history,
+        test_status_report_warns_about_concentrated_position,
         test_real_results_report_summarizes_sessions_from_directory,
+        test_real_results_report_warns_about_concentrated_position,
         test_real_results_report_output_file_is_valid_utf8,
         test_kill_switch_cli_respects_custom_control_file,
         test_manual_order_queue_persists_and_consumes_once,

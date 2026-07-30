@@ -24,6 +24,7 @@ import os
 
 from state_store import StateStore
 from trade_history import TradeHistoryLog
+from risk_manager import concentration_warnings
 
 
 def build_status_report(symbol: str, state_path: str, trades_path: str = None,
@@ -40,6 +41,8 @@ def build_status_report(symbol: str, state_path: str, trades_path: str = None,
             lines.append("Posiciones abiertas:")
             for sym, pos in state["positions"].items():
                 lines.append(f"  - {sym}: {pos.get('unidades')} unidades @ {pos.get('precio_entrada')}")
+            for aviso in concentration_warnings(state["capital"], state["positions"]):
+                lines.append(f"  [!] Concentración: {aviso}")
         else:
             lines.append("Posiciones abiertas: ninguna")
         pending = (state.get("extra") or {}).get("pending_order")

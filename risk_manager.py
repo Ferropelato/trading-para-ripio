@@ -92,6 +92,46 @@ def position_size(capital: float, entry_price: float, atr: float,
     }
 
 
+def concentration_warnings(capital: float, positions: dict, threshold_pct: float = 45.0) -> list:
+    """
+    Avisos para cualquier posición ABIERTA cuyo costo de entrada
+    (unidades * precio_entrada) supere `threshold_pct` del capital total
+    aproximado (efectivo + costo de entrada de TODAS las posiciones
+    abiertas). Aproximado con el precio de ENTRADA, no mark-to-market en
+    vivo -- alcanza para una alerta de atención al mirar el estado
+    persistido, no hace falta pegarle a la red para tener el precio
+    actual.
+
+    threshold_pct=45.0 por defecto: por encima del tope más permisivo de
+    cualquier perfil (agresivo, 40% -- ver risk_profiles.py), así que en
+    operación normal esto nunca debería dispararse -- si dispara, es una
+    señal real de que algo quedó fuera de lo esperado (ej. una posición
+    abierta antes de que el tope de concentración existiera). Visto en
+    vivo con LINK_USDC, ~97% de concentración -- ver README, ronda de
+    auditoría de concentración.
+    """
+    if not positions:
+        return []
+    costo_por_simbolo = {
+        sym: pos.get("unidades", 0) * pos.get("precio_entrada", 0)
+        for sym, pos in positions.items()
+    }
+    capital_total_aprox = (capital or 0) + sum(costo_por_simbolo.values())
+    if capital_total_aprox <= 0:
+        return []
+
+    warnings = []
+    for sym, costo in costo_por_simbolo.items():
+        pct = costo / capital_total_aprox * 100
+        if pct > threshold_pct:
+            warnings.append(
+                f"{sym} concentra ~{pct:.1f}% del capital (${costo:.2f} de ${capital_total_aprox:.2f} "
+                f"aprox., a precio de entrada) -- por encima del {threshold_pct:.0f}% esperado incluso "
+                f"para el perfil más agresivo."
+            )
+    return warnings
+
+
 def effective_commission(trade_value: float, commission_pct: float,
                           min_commission: float = 0.0) -> float:
     """

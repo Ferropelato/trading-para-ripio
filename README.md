@@ -1924,6 +1924,32 @@ y seguir la discrepancia hasta la causa real en vez de conformarse con
 "el número no es lo que esperaba, pero bueno".
 
 
+## Trigésima quinta ronda: alertas de concentración en los reportes
+
+Cierre del ciclo de la auditoría de concentración: hasta ahora, notar que
+una posición concentraba demasiado capital requería mirar el JSON de
+estado a mano (así se encontró el bug de LINK_USDC en primer lugar). Se
+agregó `risk_manager.concentration_warnings()` -- compara el costo de
+entrada de cada posición abierta (unidades × precio de entrada) contra el
+capital total aproximado (efectivo + costo de entrada de todas las
+posiciones), y avisa si alguna supera 45% -- a propósito por encima del
+tope más permisivo de cualquier perfil (agresivo, 40%), así que en
+operación normal nunca debería dispararse. Usa el precio de ENTRADA, no
+mark-to-market en vivo -- alcanza para una alerta de atención sin que
+estos reportes (pensados para leerse sin depender de la red) tengan que
+pegarle a la API por un precio actual.
+
+Integrado en los dos lugares donde ya se mira el estado de las sesiones:
+`status_report.py` (una línea `[!] Concentración: ...` junto a la
+posición) y `real_results_report.py` (misma línea, en el informe
+consolidado). 4 tests nuevos: el cálculo en sí (con el escenario real de
+LINK_USDC como caso positivo, y una posición normal como caso negativo),
+más uno de integración por cada reporte. 132/132 tests pasando.
+Verificado contra la sesión `new_pairs` real (posición de UNI_USDC al
+~30%, dentro de lo esperado): no aparece ningún aviso, cero falsos
+positivos.
+
+
 ## Notas importantes (leer antes de avanzar)
 
 1. **Este backtest usa datos sintéticos por defecto.** Los resultados que

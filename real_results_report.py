@@ -76,6 +76,7 @@ def generate_report(directory: str = ".") -> str:
     from state_store import StateStore
     from trade_history import TradeHistoryLog, pair_trades
     from tax_export import tax_summary
+    from risk_manager import concentration_warnings
 
     sessions = _discover_sessions(directory)
     lines = ["# Informe de resultados reales -- paper trading en vivo", ""]
@@ -99,6 +100,8 @@ def generate_report(directory: str = ".") -> str:
         lines.append("")
         if state["saved_at"] and state.get("capital") is not None:
             lines.append(f"- Capital actual: USDC {state['capital']:.2f}")
+        for aviso in concentration_warnings(state.get("capital"), state.get("positions") or {}):
+            lines.append(f"- [!] Concentración: {aviso}")
         if summary:
             wins = summary["cantidad_operaciones_ganadoras"]
             losses = summary["cantidad_operaciones_perdedoras"]
