@@ -118,6 +118,18 @@ class NewsMonitor:
         self._http_get = http_get or _default_http_get
         self._seen_links = set()
 
+    def get_seen_links(self) -> set:
+        """Para persistir el deduplicado entre reinicios (ver NewsGuard /
+        _LiveEngine) -- sin esto, cada reinicio del proceso arranca con
+        este set vacío y vuelve a alertar (y, en modo automático, vuelve a
+        PAUSAR entradas nuevas) sobre titulares que ya se habían visto y
+        alertado antes del reinicio -- un feed RSS típico mantiene varios
+        días de titulares, así que esto no es un caso raro."""
+        return self._seen_links
+
+    def restore_seen_links(self, links) -> None:
+        self._seen_links = set(links or [])
+
     def fetch_high_impact_news(self) -> list:
         """Devuelve una lista de NewsItem nuevos y de alto impacto detectados en esta llamada."""
         new_high_impact = []
@@ -242,3 +254,9 @@ class NewsGuard:
 
     def restore_paused_until(self, paused_until) -> None:
         self._paused_until = paused_until
+
+    def get_seen_links(self) -> set:
+        return self.monitor.get_seen_links()
+
+    def restore_seen_links(self, links) -> None:
+        self.monitor.restore_seen_links(links)

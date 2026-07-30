@@ -231,6 +231,15 @@ class _LiveEngine:
             paused_until_str = extra.get("news_paused_until")
             if paused_until_str:
                 self.news_guard.restore_paused_until(datetime.fromisoformat(paused_until_str))
+            # Restaurar el deduplicado de titulares ya vistos -- sin esto,
+            # cada reinicio re-alertaba (y en modo automático, re-pausaba
+            # entradas) sobre las mismas noticias ya alertadas antes de
+            # reiniciar. Confirmado en vivo: el mismo titular apareció
+            # repetido varias veces en un mismo log, una vez por cada
+            # reinicio del día (ver README, ronda del deduplicado de noticias).
+            seen_links = extra.get("news_seen_links")
+            if seen_links:
+                self.news_guard.restore_seen_links(seen_links)
 
         # Restaurar la referencia de pérdida diaria -- mismo problema, un
         # tercer lugar: si el proceso se reinicia a mitad de un día que ya
@@ -579,6 +588,7 @@ class _LiveEngine:
     def force_persist(self):
         peak_equity = max(self.equity_curve) if self.equity_curve else None
         news_paused_until = self.news_guard.get_paused_until() if self.news_guard is not None else None
+        news_seen_links = sorted(self.news_guard.get_seen_links()) if self.news_guard is not None else None
         self.state_store.save(self.internal_positions, capital=self.broker.get_balance(),
                                extra={"stop_loss": self.stop_loss, "take_profit": self.take_profit,
                                       "pending_order": self.pending_order,
@@ -586,6 +596,7 @@ class _LiveEngine:
                                       "circuit_breaker_trip_reason": self.circuit_breaker.trip_reason,
                                       "peak_equity": peak_equity,
                                       "news_paused_until": news_paused_until.isoformat() if news_paused_until else None,
+                                      "news_seen_links": news_seen_links,
                                       "current_day": self.current_day.isoformat() if self.current_day else None,
                                       "day_start_equity": self.day_start_equity,
                                       "profit_lock_times_locked": self.profit_lock.times_locked if self.profit_lock else None,

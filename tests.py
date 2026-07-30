@@ -1303,6 +1303,76 @@ def test_live_engine_restores_news_pause_on_restart():
     print("OK: _LiveEngine restaura la pausa automática por noticias tras un reinicio")
 
 
+def test_live_engine_restores_news_seen_links_on_restart():
+    """
+    Mismo bug, de punta a punta a través de _LiveEngine: sin restaurar el
+    deduplicado de noticias, un reinicio del proceso mientras el feed RSS
+    todavía tiene el mismo titular de alto impacto lo vuelve a alertar Y
+    vuelve a disparar una pausa automática nueva -- aunque no haya pasado
+    nada nuevo de verdad.
+    """
+    import os
+    import tempfile
+    from live_runner import _LiveEngine
+    from broker import PaperBroker
+    from risk_profiles import get_profile
+    from safety import CircuitBreaker, ManualKillSwitch
+    from health import Heartbeat
+    from state_store import StateStore
+    from alerts import ConsoleAlertChannel
+    from app_logger import get_logger
+    from news_monitor import NewsGuard, NewsMonitor, NewsAutomationSchedule, AutomationWindow
+
+    def fake_http_get(url, timeout):
+        return _SAMPLE_RSS
+
+    fd, state_path = tempfile.mkstemp(suffix="_live_engine_news_seen_restart.json")
+    os.close(fd)
+    os.remove(state_path)
+    kill_switch_path = ".KILL_SWITCH_test_live_engine_news_seen"
+
+    try:
+        guard = NewsGuard(NewsMonitor(feeds=["https://fake.feed/rss"], http_get=fake_http_get),
+                           NewsAutomationSchedule([AutomationWindow(0, 24)], cooldown_minutes=60),
+                           ConsoleAlertChannel())
+        found = guard.check()
+        assert len(found) == 2, "Debe alertar los 2 titulares de alto impacto del feed de prueba"
+        assert guard.entries_paused() is True, "Modo automático: debe pausar entradas ante la primera alerta"
+
+        broker = PaperBroker(initial_balance=1000.0)
+        engine = _LiveEngine(
+            broker, "TEST_SYM", get_profile("moderado"), "momentum", "moderado",
+            ConsoleAlertChannel(), ManualKillSwitch(control_file=kill_switch_path),
+            CircuitBreaker(), Heartbeat(max_staleness_seconds=99999),
+            StateStore(path=state_path), reconcile_every=1000, log=get_logger("test_live_engine_news_seen"),
+            news_guard=guard,
+        )
+        engine.force_persist()
+
+        # "Reinicio": un NewsGuard/NewsMonitor completamente nuevos, pero el
+        # feed (simulado) SIGUE devolviendo los mismos titulares -- como
+        # pasaría de verdad, un feed RSS real mantiene varios días de historia.
+        guard2 = NewsGuard(NewsMonitor(feeds=["https://fake.feed/rss"], http_get=fake_http_get),
+                            NewsAutomationSchedule([AutomationWindow(0, 24)], cooldown_minutes=60),
+                            ConsoleAlertChannel())
+        engine2 = _LiveEngine(
+            broker, "TEST_SYM", get_profile("moderado"), "momentum", "moderado",
+            ConsoleAlertChannel(), ManualKillSwitch(control_file=kill_switch_path),
+            CircuitBreaker(), Heartbeat(max_staleness_seconds=99999),
+            StateStore(path=state_path), reconcile_every=1000, log=get_logger("test_live_engine_news_seen2"),
+            news_guard=guard2,
+        )
+
+        found_again = guard2.check()
+        assert found_again == [], "Tras el reinicio, no debe re-alertar titulares que ya se habían visto"
+    finally:
+        if os.path.exists(state_path):
+            os.remove(state_path)
+        if os.path.exists(kill_switch_path):
+            os.remove(kill_switch_path)
+    print("OK: _LiveEngine restaura el deduplicado de noticias tras un reinicio, evitando re-alertas")
+
+
 def test_live_engine_restores_daily_loss_reference_on_restart():
     """
     Cierre de la línea de auditoría de reinicios: la referencia de
@@ -1888,6 +1958,38 @@ def test_news_monitor_dedup_and_filters_low_impact():
     second = monitor.fetch_high_impact_news()
     assert second == [], "No debería re-alertar el mismo titular ya visto"
     print("OK: el monitor de noticias filtra por impacto y no duplica alertas ya vistas")
+
+
+def test_news_monitor_get_and_restore_seen_links():
+    """
+    Bug real encontrado en auditoría: `_seen_links` solo vivía en memoria
+    -- cada reinicio del proceso arrancaba con el deduplicado vacío y
+    volvía a alertar (y en modo automático, a PAUSAR entradas) sobre
+    titulares que ya se habían visto antes de reiniciar. Confirmado en
+    vivo: el mismo titular apareció repetido varias veces en un mismo
+    log, una por cada reinicio del día. Acá se prueba el mecanismo de
+    persistencia en sí (get/restore_seen_links), no todavía el reinicio
+    completo del motor (ver test_live_engine_restores_news_seen_links_on_restart)."""
+    from news_monitor import NewsMonitor
+
+    def fake_http_get(url, timeout):
+        return _SAMPLE_RSS
+
+    monitor = NewsMonitor(feeds=["https://fake.feed/rss"], http_get=fake_http_get)
+    first = monitor.fetch_high_impact_news()
+    assert len(first) == 2
+    seen = monitor.get_seen_links()
+
+    # "Reinicio": un monitor completamente nuevo, sin el estado en memoria del anterior.
+    monitor2 = NewsMonitor(feeds=["https://fake.feed/rss"], http_get=fake_http_get)
+    without_restore = monitor2.fetch_high_impact_news()
+    assert len(without_restore) == 2, "Sin restaurar, un monitor nuevo vuelve a ver los mismos titulares (el bug)"
+
+    monitor3 = NewsMonitor(feeds=["https://fake.feed/rss"], http_get=fake_http_get)
+    monitor3.restore_seen_links(seen)
+    with_restore = monitor3.fetch_high_impact_news()
+    assert with_restore == [], "Con el deduplicado restaurado, no debe re-alertar titulares ya vistos"
+    print("OK: get_seen_links/restore_seen_links evitan re-alertar titulares ya vistos antes de un reinicio")
 
 
 def test_news_monitor_empty_feeds_list_makes_no_requests():
@@ -4176,6 +4278,7 @@ if __name__ == "__main__":
         test_live_engine_restores_open_position_in_broker_on_restart,
         test_live_engine_restores_circuit_breaker_state_on_restart,
         test_live_engine_restores_news_pause_on_restart,
+        test_live_engine_restores_news_seen_links_on_restart,
         test_live_engine_restores_daily_loss_reference_on_restart,
         test_live_engine_closes_position_to_lock_profit_and_keeps_operating,
         test_live_engine_profit_lock_multi_symbol_banks_full_equity_not_just_cash,
@@ -4194,6 +4297,7 @@ if __name__ == "__main__":
         test_ripio_public_ticker_live,
         test_classify_impact_matches_keywords,
         test_news_monitor_dedup_and_filters_low_impact,
+        test_news_monitor_get_and_restore_seen_links,
         test_news_monitor_empty_feeds_list_makes_no_requests,
         test_automation_window_handles_midnight_crossing,
         test_news_guard_pauses_entries_only_in_automatic_window,

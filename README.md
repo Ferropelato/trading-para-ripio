@@ -2016,7 +2016,43 @@ anterior):
 de riesgo automática" en Ajustes (tope de concentración por posición +
 priorización por historial probado al elegir entre varios pares) --
 hasta esta ronda el mockup no reflejaba ninguna de las dos piezas nuevas
-de gestión de riesgo construidas hoy.
+de gestión de riesgo construidas hoy. También se aclaró que el cupo de
+posiciones es un techo, no un objetivo -- el sistema nunca "llena" el
+cupo por tener saldo asignado sin usar, solo abre cuando hay una señal
+real (duda real del usuario mirando el mockup: solo 3 de 5 posiciones
+abiertas en el ejemplo, comportamiento esperado, no un bug).
+
+
+## Trigésima séptima ronda: el deduplicado de noticias no sobrevivía a un reinicio
+
+Auditando `news_monitor.py`/`reconciliation.py` a pedido, por no
+haberlos revisado en detalle esta sesión. `reconciliation.py` y la
+lógica de emparejamiento de operaciones (`pair_trades`, usada en el
+informe impositivo) resultaron sólidas -- sin hallazgos. Pero
+`NewsMonitor._seen_links` (el set que evita re-alertar el mismo
+titular) solo vivía en memoria del proceso, sin persistir -- mismo
+patrón de bug ya visto varias veces este proyecto (circuit breaker,
+posiciones, capital, referencia de pérdida diaria, seguro de ganancias),
+esta vez en una cuarta pieza de estado que se había pasado por alto.
+
+**Confirmado con evidencia real, no solo con lectura de código**: el
+mismo titular de noticia apareció repetido 6-8 veces en un mismo archivo
+de log -- una vez por cada reinicio de esa sesión durante el día. Con
+`--news-auto-window 0-24` (modo automático permanente, como corren las
+4 sesiones en vivo), cada reinicio no solo re-alertaba de forma
+redundante: también volvía a **pausar la apertura de posiciones
+nuevas** durante otra hora entera, aunque no hubiera pasado nada nuevo
+de verdad. Con la cantidad de reinicios de hoy, esto le costó tiempo de
+operación real a las sesiones sin ningún motivo genuino.
+
+**Fix**: `NewsMonitor.get_seen_links()`/`restore_seen_links()`, expuesto
+a través de `NewsGuard`, persistido en `force_persist()` (nuevo campo
+`news_seen_links`) y restaurado en `_LiveEngine.__init__` -- mismo
+patrón que ya se usa para la pausa por noticias, el circuit breaker, etc.
+2 tests nuevos: el mecanismo de persistencia en sí, y un reinicio
+completo de `_LiveEngine` con un feed simulado que sigue devolviendo el
+mismo titular, confirmando que no se re-alerta ni se re-pausa. 135/135
+tests pasando. Se reiniciaron las 4 sesiones en vivo con el fix.
 
 
 ## Notas importantes (leer antes de avanzar)
