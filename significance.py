@@ -34,16 +34,41 @@ def _run_random_strategy(df: pd.DataFrame, profile: dict, initial_capital: float
     stop loss/take profit por ATR) que la estrategia real, y sostiene
     cada posición hasta que toque el stop o el take profit (o se acabe el
     historial). Devuelve el retorno total en %.
+
+    Igual que la estrategia real (`Backtester.run()`): UNA sola posición
+    a la vez -- un candidato de entrada que caería dentro de una posición
+    todavía abierta se descarta, y se prueba con el siguiente candidato
+    del orden aleatorio, hasta juntar `n_trades_target` operaciones
+    realmente NO superpuestas. Bug real encontrado en auditoría: la
+    versión anterior procesaba cada fecha de entrada elegida al azar
+    como si se resolviera al instante (calculaba de una su precio de
+    salida futuro y sumaba las ganancias antes de considerar la
+    siguiente entrada) -- eso le permitía a la simulación aleatoria
+    "reutilizar" capital que en una cronología real todavía seguiría
+    atado a una posición sin cerrar, algo que la estrategia real nunca
+    puede hacer. Sin este descarte, la comparación no era pareja.
     """
     atr = _atr(df)
-    valid_days = df.index[atr.notna() & (atr > 0)]
+    valid_days = list(df.index[atr.notna() & (atr > 0)])
     if len(valid_days) < n_trades_target:
         n_trades_target = len(valid_days)
 
-    entry_days = rng.choice(valid_days, size=n_trades_target, replace=False)
+    candidatos = rng.permutation(valid_days)  # orden aleatorio, sin reemplazo
     capital = initial_capital
+    libre_desde = None  # fecha desde la que ya no hay una posición abierta
 
-    for entry_date in sorted(entry_days):
+    trades_hechos = 0
+    for entry_date in candidatos:
+        if trades_hechos >= n_trades_target:
+            break
+        # <=, no <: el mismo día que una posición se resuelve, la
+        # estrategia real tampoco abre una nueva -- el chequeo de entrada
+        # y el de salida son ramas excluyentes del mismo día en
+        # Backtester.run(), la próxima entrada posible es recién al día
+        # siguiente.
+        if libre_desde is not None and entry_date <= libre_desde:
+            continue  # se superpondría con una posición todavía abierta -- se descarta
+
         entry_price = df.loc[entry_date, "close"]
         current_atr = atr.loc[entry_date]
         sizing = position_size(capital, entry_price, current_atr, profile)
@@ -60,13 +85,17 @@ def _run_random_strategy(df: pd.DataFrame, profile: dict, initial_capital: float
 
         future = df.loc[entry_date:, "close"]
         exit_price = future.iloc[-1]  # si nunca toca stop/take, cierra al último precio disponible
+        exit_date = future.index[-1]
         for date, price in future.items():
             if price <= stop_loss or price >= take_profit:
                 exit_price = price
+                exit_date = date
                 break
 
         proceeds = units * exit_price * (1 - commission_pct)
         capital += proceeds
+        libre_desde = exit_date
+        trades_hechos += 1
 
     return (capital / initial_capital - 1) * 100
 

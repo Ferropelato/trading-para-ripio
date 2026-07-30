@@ -2076,6 +2076,36 @@ igual que circuit breaker o kill-switch. Test de regresión con el mismo
 escenario real de LINK_USDC. 136/136 tests pasando.
 
 
+## Trigésima novena ronda: la simulación de significancia estadística permitía posiciones superpuestas
+
+Auditando `significance.py` (el módulo que compara la estrategia real
+contra cientos de estrategias "de mentira" con entradas al azar, para
+saber si el resultado es una ventaja real o pudo salir por casualidad):
+`_run_random_strategy` procesaba cada fecha de entrada elegida al azar
+como si se resolviera al instante -- calculaba de una su precio de
+salida futuro y sumaba la ganancia/pérdida ANTES de considerar la
+siguiente entrada elegida. Eso le permitía a la línea de base aleatoria
+"reutilizar" capital que, en una cronología real, todavía seguiría atado
+a una posición sin cerrar -- algo que la estrategia real nunca puede
+hacer (`Backtester.run()` sostiene una sola posición a la vez, de
+punta a punta). Comparar contra una línea de base que puede hacer trampa
+no es una comparación justa, y sesga sistemáticamente el percentil
+reportado.
+
+**Fix**: la simulación aleatoria ahora también sostiene una sola
+posición a la vez -- un candidato de entrada que caería dentro de una
+posición todavía abierta (incluyendo el mismo día que esa posición se
+resuelve, para calzar exactamente con las ramas excluyentes de
+entrada/salida del día en `Backtester.run()`) se descarta, y se prueba
+con el siguiente candidato del orden aleatorio hasta juntar la cantidad
+de operaciones pedida. Test de regresión: con precio constante y un ATR
+que nunca toca stop/take profit, cualquier posición se sostiene hasta el
+último día del dataset -- así que sin importar el seed ni cuántas
+operaciones se pidan, con el freno correcto SOLO la primera puede
+ejecutarse de verdad, un resultado matemáticamente fijo y verificable a
+mano. 137/137 tests pasando.
+
+
 ## Notas importantes (leer antes de avanzar)
 
 1. **Este backtest usa datos sintéticos por defecto.** Los resultados que

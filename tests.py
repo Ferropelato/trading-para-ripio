@@ -1819,6 +1819,46 @@ def test_significance_module_runs_and_bounds_percentile():
     print("OK: el módulo de significancia corre y devuelve un percentil acotado correctamente")
 
 
+def test_significance_random_strategy_never_overlaps_positions():
+    """
+    Bug metodológico real encontrado en auditoría: la simulación aleatoria
+    de significancia procesaba cada fecha de entrada elegida al azar como
+    si se resolviera al instante -- eso le permitía "reutilizar" capital
+    que en una cronología real todavía seguiría atado a una posición sin
+    cerrar, algo que la estrategia real (Backtester.run(), una sola
+    posición a la vez) nunca puede hacer. Una comparación contra una línea
+    de base que puede hacer trampa no es una comparación justa.
+
+    Con precio CONSTANTE y un ATR chico que nunca toca stop/take profit,
+    cualquier posición que se abra se sostiene hasta el último día del
+    dataset -- así que, con el freno de una sola posición a la vez, NO
+    IMPORTA cuántas operaciones se pidan (acá 5): solo la primera puede
+    ejecutarse de verdad, sin importar el seed. El resultado queda fijo
+    (una sola operación paga comisión de ida y vuelta sobre el mismo
+    precio) -- antes del fix, pedir 5 operaciones ejecutaba las 5,
+    multiplicando esa pérdida de comisión por 5.
+    """
+    import numpy as np
+    from significance import _run_random_strategy
+    from risk_profiles import get_profile
+
+    dates = pd.bdate_range("2024-01-01", periods=15)
+    df = pd.DataFrame({
+        "open": [100.0] * 15, "high": [101.0] * 15, "low": [99.0] * 15,
+        "close": [100.0] * 15, "volume": [1000] * 15,
+    }, index=dates)
+    profile = get_profile("moderado")
+
+    for seed in (1, 2, 3, 42, 7, 100):
+        ret = _run_random_strategy(df, profile, initial_capital=1000.0,
+                                    n_trades_target=5, rng=np.random.default_rng(seed))
+        assert abs(ret - (-0.05)) < 1e-6, (
+            f"seed={seed}: esperaba el resultado de UNA sola operación (-0.05%), dio {ret} -- "
+            f"parece estar ejecutando más de una operación superpuesta"
+        )
+    print("OK: la simulación aleatoria de significancia nunca superpone posiciones, igual que la estrategia real")
+
+
 def test_parameter_sensitivity_detects_sign_flip():
     from data_utils import generate_synthetic_data
     from sensitivity import parameter_sensitivity
@@ -4338,6 +4378,7 @@ if __name__ == "__main__":
         test_retry_with_backoff_retries_transient_not_permanent,
         test_paper_broker_order_idempotency,
         test_significance_module_runs_and_bounds_percentile,
+        test_significance_random_strategy_never_overlaps_positions,
         test_parameter_sensitivity_detects_sign_flip,
         test_ripio_signature_matches_official_scheme,
         test_ripio_normalize_pair,
