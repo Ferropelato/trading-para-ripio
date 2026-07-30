@@ -55,6 +55,48 @@ def _atr(df, period=14):
     return tr.rolling(period).mean()
 
 
+def _append_live_tick(df_sym, now, price, last_close):
+    """
+    Agrega un tick en vivo a la serie de velas -- DENTRO de la vela del
+    día calendario actual (misma semántica que el dataset diario real que
+    la sembró), no como una vela nueva por cada tick.
+
+    Bug real encontrado en auditoría: la versión anterior hacía
+    `df_sym.loc[now] = {...}` con `now` la marca de tiempo exacta del
+    poll, agregando una fila nueva cada 45-90 segundos. Con una ventana
+    rodante de 14 períodos para el ATR, en apenas 10-15 minutos esas 14
+    "velas" dejaban de ser 14 días reales y pasaban a ser 14 ticks de
+    segundos entre sí -- el ATR terminaba midiendo el rango de precio
+    típico de 45 segundos, no de un día, y ese ATR artificialmente
+    diminuto es lo que disparó el bug de concentración visto con
+    LINK_USDC (ver README, rondas de auditoría de concentración y de
+    agregación de ticks). El backtest sobre datos diarios reales nunca lo
+    vio porque ahí el ATR siempre se calculó sobre días de verdad.
+
+    Devuelve el DataFrame actualizado (mismo objeto si se actualizó la
+    vela de hoy in-place; uno nuevo, ordenado, si se agregó un día).
+    """
+    today_key = pd.Timestamp(now.date())
+    open_ = float(last_close)
+    close_ = float(price)
+
+    if len(df_sym) and df_sym.index[-1] == today_key:
+        # Ya hay una vela de HOY en curso -- se actualiza in-place, no se
+        # agrega una fila nueva.
+        df_sym.loc[today_key, "high"] = max(df_sym.loc[today_key, "high"], close_)
+        df_sym.loc[today_key, "low"] = min(df_sym.loc[today_key, "low"], close_)
+        df_sym.loc[today_key, "close"] = close_
+    else:
+        # Primer tick del día -- abre una vela nueva, con el open = el
+        # último cierre conocido (mismo criterio que un dataset diario real).
+        df_sym.loc[today_key] = {
+            "open": open_, "high": max(open_, close_), "low": min(open_, close_),
+            "close": close_, "volume": 0,
+        }
+        df_sym = df_sym.sort_index()
+    return df_sym
+
+
 class _LiveEngine:
     """
     Lógica de decisión por-tick (heartbeat, kill-switch, circuit breaker,
@@ -734,18 +776,13 @@ def run_live_polling(price_source, symbol, strategy_name: str, profile_name: str
                               sym, e)
                     continue
 
-                df_sym = dfs[sym]
                 now = pd.Timestamp.now(tz="UTC").tz_localize(None)
-                open_ = float(last_close[sym])
-                close_ = float(price)
-                df_sym.loc[now] = {
-                    "open": open_, "high": max(open_, close_), "low": min(open_, close_),
-                    "close": close_, "volume": 0,
-                }
+                df_sym = _append_live_tick(dfs[sym], now, price, last_close[sym])
+                dfs[sym] = df_sym
                 if len(df_sym) > max_history_rows:
                     df_sym = df_sym.iloc[-max_history_rows:]
                     dfs[sym] = df_sym
-                last_close[sym] = close_
+                last_close[sym] = float(price)
 
                 signal = strategy_fn(df_sym)
                 if regime_filter:
@@ -756,7 +793,7 @@ def run_live_polling(price_source, symbol, strategy_name: str, profile_name: str
                 current_atr = _atr(df_sym).iloc[-1]
                 sig = signal.iloc[-1]
 
-                engine.process_tick(now, close_, current_atr, sig, symbol=sym)
+                engine.process_tick(now, float(price), current_atr, sig, symbol=sym)
 
             if poll_interval_seconds > 0:
                 time.sleep(poll_interval_seconds)

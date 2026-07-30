@@ -1876,6 +1876,54 @@ stop, take-profit o el seguro de ganancias; no hace falta (ni conviene)
 tocarla manualmente solo por esto.
 
 
+## Trigésima cuarta ronda: la causa raíz del bug de concentración -- ticks en vivo corrompían el ATR
+
+Se pidió medir con un backtest qué tan seguido el tope de concentración
+nuevo (ronda anterior) importa de verdad -- para eso se armó
+`backtest_concentration_report.py`, corriendo la misma estrategia/perfil
+de la sesión `new_pairs` sobre los 6 pares nuevos con datos diarios
+reales. Resultado: **0 de 148 operaciones** activaron el tope. Un
+contraste total contra el ~97% de concentración que se vio en vivo con
+LINK_USDC -- suficiente para desconfiar del backtest, no del hallazgo
+anterior.
+
+La causa: en `run_live_polling` (`live_runner.py`), cada tick en vivo se
+agregaba como una vela NUEVA a la misma serie sembrada con velas diarias
+reales (`df_sym.loc[now] = {...}`, con `now` la marca de tiempo exacta
+del poll). El ATR se calcula con una ventana rodante de 14 períodos --
+con `poll-interval` de 45-90 segundos, en apenas 10-15 minutos esas 14
+"velas" dejan de ser 14 días reales y pasan a ser 14 ticks de segundos
+entre sí. El ATR termina midiendo el rango de precio típico de 45
+segundos, no de un día -- y ese ATR artificialmente diminuto es
+exactamente lo que disparó el bug de concentración con LINK_USDC. El
+backtest nunca lo vio porque ahí el ATR siempre se calculó sobre días
+reales, de punta a punta -- este bug es *exclusivo* del modo en vivo.
+
+**Fix de raíz**: nueva función `_append_live_tick()` -- los ticks del
+MISMO día calendario actualizan la vela de hoy en curso in-place (high =
+máximo de todos los ticks del día, low = mínimo, close = último precio),
+en vez de agregar una fila por tick. Un tick de un día calendario nuevo
+sí abre una vela propia, con el open = último cierre conocido -- mismo
+criterio que un dataset diario real. La ventana rodante del ATR vuelve a
+estar dominada por días reales, con a lo sumo una vela "en formación"
+(la de hoy), igual que cualquier sistema de trading que mide un ATR
+diario contra un día todavía no cerrado.
+
+3 tests nuevos: dos unitarios sobre `_append_live_tick` (varios ticks del
+mismo día no agregan filas; un día nuevo sí abre una vela propia) y uno
+de punta a punta que simula 40 ticks del mismo día sobre datos reales de
+BTC y confirma que el ATR no colapsa (bajo el bug viejo, esos mismos 40
+ticks hubieran reemplazado toda la ventana de 14 y colapsado el ATR a
+casi cero). 129/129 tests pasando. Se reiniciaron las 4 sesiones en vivo
+con el fix aplicado.
+
+**Por qué el backtest de concentración igual valió la pena, aunque diera
+0%**: encontró un bug más importante que el que se estaba buscando medir.
+Es la misma disciplina de todo este proyecto -- medir antes de asumir,
+y seguir la discrepancia hasta la causa real en vez de conformarse con
+"el número no es lo que esperaba, pero bueno".
+
+
 ## Notas importantes (leer antes de avanzar)
 
 1. **Este backtest usa datos sintéticos por defecto.** Los resultados que

@@ -17,17 +17,24 @@ def position_size(capital: float, entry_price: float, atr: float,
                    capital_safety_margin_pct: float = 0.005) -> dict:
     """
     Devuelve un dict con: unidades, riesgo_monetario, stop_loss, take_profit,
-    y viable (False si la operación no alcanza el mínimo operable).
+    viable (False si la operación no alcanza el mínimo operable), y
+    limitado_por -- cuál de los tres frenos terminó definiendo las
+    unidades ("riesgo" el caso normal, "capital" o "concentracion" cuando
+    alguno de los topes de seguridad es más chico que lo que pedía el
+    cálculo de riesgo puro. Sirve para medir, no solo para frenar --
+    ver `backtest_concentration_report.py`).
     """
     if atr <= 0 or entry_price <= 0:
         return {"unidades": 0, "riesgo_monetario": 0, "stop_loss": None,
-                "take_profit": None, "viable": False, "motivo_no_viable": "ATR o precio inválido"}
+                "take_profit": None, "viable": False, "motivo_no_viable": "ATR o precio inválido",
+                "limitado_por": None}
 
     risk_amount = capital * profile["risk_per_trade"]
     stop_distance = atr * profile["stop_loss_atr_mult"]
     take_profit_distance = atr * profile["take_profit_atr_mult"]
 
     units = risk_amount / stop_distance
+    limitado_por = "riesgo"
     stop_loss = entry_price - stop_distance
     take_profit = entry_price + take_profit_distance
 
@@ -38,7 +45,9 @@ def position_size(capital: float, entry_price: float, atr: float,
     # la orden queda garantizada al rechazo por saldo insuficiente en la
     # ejecución real (visto en vivo con ETH_USDC).
     max_units_by_capital = (capital * (1 - capital_safety_margin_pct)) / entry_price
-    units = min(units, max_units_by_capital)
+    if max_units_by_capital < units:
+        units = max_units_by_capital
+        limitado_por = "capital"
 
     # Tope de CONCENTRACIÓN, independiente del tope de capital de arriba.
     # Cuando el ATR es muy chico en relación al precio (activo calmo, o
@@ -53,7 +62,9 @@ def position_size(capital: float, entry_price: float, atr: float,
     # auditoría de concentración) -- no es hipotético.
     max_position_pct = profile.get("max_position_pct_of_capital", 1.0)
     max_units_by_concentration = (capital * max_position_pct) / entry_price
-    units = min(units, max_units_by_concentration)
+    if max_units_by_concentration < units:
+        units = max_units_by_concentration
+        limitado_por = "concentracion"
 
     # Redondear al step de lote del instrumento/bróker (ej. 0.001 BTC, 1 acción)
     if lot_step and lot_step > 0:
@@ -77,6 +88,7 @@ def position_size(capital: float, entry_price: float, atr: float,
         "take_profit": round(take_profit, 4),
         "viable": viable,
         "motivo_no_viable": motivo_no_viable,
+        "limitado_por": limitado_por,
     }
 
 

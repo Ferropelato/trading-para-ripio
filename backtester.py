@@ -81,6 +81,8 @@ class Backtester:
         entry_date = None
         stop_loss = None
         take_profit = None
+        entry_limitado_por = None
+        entry_pct_capital = None
 
         day_start_capital = capital
         current_day = None
@@ -117,7 +119,9 @@ class Backtester:
                     entry_date = date
                     stop_loss = sizing["stop_loss"]
                     take_profit = sizing["take_profit"]
+                    entry_limitado_por = sizing["limitado_por"]
                     trade_value = units * buy_price
+                    entry_pct_capital = (trade_value / capital * 100) if capital > 0 else 0.0
                     commission = effective_commission(trade_value, self.commission_pct, self.min_commission)
                     capital -= (trade_value + commission)
                     in_position = True
@@ -146,9 +150,13 @@ class Backtester:
                         "unidades": round(units, 6),
                         "pnl": round(pnl, 2),
                         "motivo": motivo,
+                        "limitado_por": entry_limitado_por,
+                        "pct_capital_al_entrar": round(entry_pct_capital, 2) if entry_pct_capital is not None else None,
                     })
                     in_position = False
                     units = 0.0
+                    entry_limitado_por = None
+                    entry_pct_capital = None
 
             mark_to_market = capital + (units * price if in_position else 0)
             equity_curve.append(mark_to_market)
@@ -189,6 +197,16 @@ class Backtester:
         buy_hold_final = buy_hold_units * self.df["close"].iloc[-1]
         buy_hold_return_pct = (buy_hold_final / self.initial_capital - 1) * 100
 
+        # Cuántas veces el tope de CONCENTRACIÓN (no el de capital
+        # disponible) terminó definiendo el tamaño de una entrada -- ver
+        # README, ronda de auditoría de concentración. Sin este tope
+        # (max_position_pct_of_capital=1.0), estas mismas operaciones
+        # hubieran quedado definidas por el tope de capital disponible, es
+        # decir ~99.5% del capital (1 - capital_safety_margin_pct) en vez
+        # del % del perfil.
+        limitadas_por_concentracion = [t for t in trades if t["limitado_por"] == "concentracion"]
+        pct_maximo_concentrado = max((t["pct_capital_al_entrar"] for t in limitadas_por_concentracion), default=0.0)
+
         return {
             "estrategia": self.strategy_name,
             "perfil_riesgo": self.profile_name,
@@ -209,4 +227,6 @@ class Backtester:
             "circuit_breaker_activado": bool(breaker_events),
             "eventos_circuit_breaker": breaker_events or [],
             "operaciones_rechazadas_por_minimo": self.trades_rejected_by_minimum,
+            "operaciones_limitadas_por_concentracion": len(limitadas_por_concentracion),
+            "pct_capital_maximo_concentrado": round(pct_maximo_concentrado, 1),
         }

@@ -482,6 +482,103 @@ def test_live_polling_runs_with_stub_price_feed():
     print("OK: el modo de paper trading con precios en vivo corre de punta a punta con un feed de prueba")
 
 
+def test_append_live_tick_same_day_updates_in_place():
+    """
+    Bug real encontrado en auditoría (ver README, ronda de agregación de
+    ticks): varios ticks del MISMO día calendario deben actualizar la
+    vela de hoy en curso, no agregar una fila nueva cada vez -- si no, la
+    ventana rodante del ATR se llena de ticks de segundos en vez de días
+    reales, y el ATR termina midiendo el rango típico de 45 segundos, no
+    de un día (esto fue lo que disparó el bug de concentración con
+    LINK_USDC).
+    """
+    import pandas as pd
+    from live_runner import _append_live_tick
+
+    dates = pd.bdate_range("2024-01-01", periods=5)
+    df = pd.DataFrame({
+        "open": [100, 101, 102, 103, 104],
+        "high": [101, 102, 103, 104, 105],
+        "low": [99, 100, 101, 102, 103],
+        "close": [100.5, 101.5, 102.5, 103.5, 104.5],
+        "volume": [1000] * 5,
+    }, index=dates)
+    original_len = len(df)
+
+    today = pd.Timestamp("2024-01-10")  # un día nuevo, después del seed
+    df = _append_live_tick(df, today, 105.0, last_close=104.5)
+    assert len(df) == original_len + 1, "El primer tick del día debe abrir una vela nueva"
+    assert df.loc[pd.Timestamp(today.date()), "open"] == 104.5
+
+    # Varios ticks más, MISMO día -- no deben agregar filas nuevas.
+    df = _append_live_tick(df, pd.Timestamp("2024-01-10 10:15:00"), 106.0, last_close=105.0)
+    assert len(df) == original_len + 1, "Un segundo tick del mismo día no debe agregar una fila nueva"
+
+    df = _append_live_tick(df, pd.Timestamp("2024-01-10 10:16:30"), 103.0, last_close=106.0)
+    assert len(df) == original_len + 1, "Un tercer tick del mismo día tampoco debe agregar una fila"
+
+    hoy = df.loc[pd.Timestamp(today.date())]
+    assert hoy["high"] == 106.0, "El high del día debe reflejar el máximo de TODOS los ticks del día"
+    assert hoy["low"] == 103.0, "El low del día debe reflejar el mínimo de TODOS los ticks del día"
+    assert hoy["close"] == 103.0, "El close debe ser el último precio del día"
+    print("OK: varios ticks del mismo día calendario actualizan una sola vela, no una por tick")
+
+
+def test_append_live_tick_new_day_opens_new_candle():
+    import pandas as pd
+    from live_runner import _append_live_tick
+
+    dates = pd.bdate_range("2024-01-01", periods=3)
+    df = pd.DataFrame({
+        "open": [100, 101, 102], "high": [101, 102, 103],
+        "low": [99, 100, 101], "close": [100.5, 101.5, 102.5],
+        "volume": [1000] * 3,
+    }, index=dates)
+
+    df = _append_live_tick(df, pd.Timestamp("2024-01-10 09:00:00"), 103.0, last_close=102.5)
+    df = _append_live_tick(df, pd.Timestamp("2024-01-11 09:00:00"), 104.0, last_close=103.0)  # día calendario distinto
+
+    assert len(df) == 3 + 2, "Cada día calendario nuevo debe abrir su propia vela"
+    assert df.loc[pd.Timestamp("2024-01-11"), "open"] == 103.0, "El open del día nuevo debe ser el cierre del día anterior"
+    print("OK: un tick de un nuevo día calendario abre una vela propia")
+
+
+def test_live_polling_atr_stays_realistic_across_many_same_day_ticks():
+    """
+    Regresión de punta a punta del bug real: antes de este fix, con
+    poll_interval chico y varios ticks del mismo día, la ventana rodante
+    de 14 velas del ATR terminaba llena de ticks de segundos en vez de
+    días reales, y el ATR colapsaba a casi cero -- eso fue lo que
+    disparó el bug de concentración visto con LINK_USDC. Simula 40 ticks
+    del MISMO día calendario y verifica que el ATR sigue reflejando la
+    volatilidad diaria real del dataset, no colapsa.
+    """
+    from live_runner import _append_live_tick, _atr
+    from data_utils import load_csv
+    import pandas as pd
+
+    df = load_csv("real_data/btc_daily.csv")
+    atr_real_historico = _atr(df).iloc[-1]
+    precio = float(df["close"].iloc[-1])
+
+    hoy = pd.Timestamp("2030-01-01")  # bien después del seed, un solo día calendario
+    for i in range(40):  # simula 40 ticks del MISMO día (ej. poll cada 45s durante media hora)
+        precio_anterior = precio
+        precio += 0.5
+        df = _append_live_tick(df, hoy + pd.Timedelta(seconds=i * 45), precio, last_close=precio_anterior)
+
+    atr_post_ticks = _atr(df).iloc[-1]
+    # Bajo el bug viejo, esto hubiera reemplazado las 14 velas de la
+    # ventana por ticks de segundos -- el ATR hubiera colapsado a casi
+    # cero. Con el fix, como mucho se agregó UNA vela nueva (la de hoy),
+    # así que el ATR debe seguir cerca de su valor histórico real.
+    assert atr_post_ticks > atr_real_historico * 0.5, (
+        f"El ATR colapsó tras varios ticks del mismo día ({atr_real_historico:.2f} -> "
+        f"{atr_post_ticks:.2f}) -- la ventana rodante debería seguir dominada por días reales"
+    )
+    print("OK: varios ticks del mismo día no corrompen el ATR -- sigue reflejando la volatilidad diaria real")
+
+
 def test_live_engine_enforces_shared_position_cap_across_symbols():
     """
     El cupo de posiciones simultáneas (`max_positions`) es COMPARTIDO
@@ -3920,6 +4017,9 @@ if __name__ == "__main__":
         test_multi_timeframe_no_lookahead,
         test_live_runner_smoke_test,
         test_live_polling_runs_with_stub_price_feed,
+        test_append_live_tick_same_day_updates_in_place,
+        test_append_live_tick_new_day_opens_new_candle,
+        test_live_polling_atr_stays_realistic_across_many_same_day_ticks,
         test_live_engine_enforces_shared_position_cap_across_symbols,
         test_live_engine_multi_symbol_shares_broker_without_artificial_limit,
         test_symbol_expectancy_requires_minimum_trades_and_averages_pnl,
