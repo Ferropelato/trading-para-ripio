@@ -1987,6 +1987,37 @@ del corte, verificando que el informe las separe y explique la causa.
 133/133 tests pasando. Informe regenerado
 (`informe_resultados_reales.md/.pdf`) con la separación real aplicada.
 
+**Cierre de la investigación -- auditoría de los sistemas relacionados.**
+Con el alcance real del bug de ATR ya confirmado, se revisó qué más
+podía haber quedado afectado por el mismo problema de fondo (ver ronda
+anterior):
+
+- **`regime.py` (filtro ADX)** usa una media exponencial (`.ewm()`), no
+  una ventana rodante de filas fijas -- misma familia de riesgo que el
+  ATR (le da más peso a lo reciente, y "lo reciente" durante el bug
+  también eran ticks de segundos), pero se corrige con el mismo fix ya
+  aplicado, sin necesitar un cambio propio.
+- **`multi_timeframe.py`** resulta estructuralmente inmune: usa
+  `df.resample("W")`, que agrupa por tiempo CALENDARIO real, no por
+  cantidad de filas -- así que aunque hubiera cientos de ticks de
+  segundos mezclados con velas diarias reales, cada semana calendario
+  seguía agregándose correctamente. No hacía falta tocar nada acá.
+- **El circuit breaker funcionó como corresponde incluso durante el
+  bug**: se encontró un solo evento real de activación
+  (`eth_usdc`, 29-jul, "Pérdida diaria máxima alcanzada: 5.1%") --
+  exactamente la respuesta esperada ante una seguidilla de stop-loss
+  rápidos como los que causaba el ATR corrompido. El freno de seguridad
+  no falló; hizo su trabajo mientras otra pieza del sistema estaba rota,
+  y frenó el día antes de que el daño fuera mayor. Vale la pena
+  señalarlo como evidencia de que las capas de seguridad son
+  independientes entre sí -- una falla en una no tira abajo a las demás.
+
+**De paso, se actualizó el mockup** con una card informativa de "Gestión
+de riesgo automática" en Ajustes (tope de concentración por posición +
+priorización por historial probado al elegir entre varios pares) --
+hasta esta ronda el mockup no reflejaba ninguna de las dos piezas nuevas
+de gestión de riesgo construidas hoy.
+
 
 ## Notas importantes (leer antes de avanzar)
 
