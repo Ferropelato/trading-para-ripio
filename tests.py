@@ -4143,6 +4143,52 @@ def test_support_snapshot_flags_reconciliation_mismatch():
     print("OK: el snapshot de soporte detecta un desfasaje de reconciliación y advierte al agente antes de confirmar nada")
 
 
+def test_support_snapshot_flags_concentrated_position():
+    """
+    Laguna real encontrada en auditoría: generate_user_support_snapshot ya
+    armaba advertencias para el agente sobre reconciliación, circuit
+    breaker y kill-switch -- pero no sobre concentración, el mismo aviso
+    ya agregado a status_report.py/real_results_report.py/ops_monitor.py.
+    Un agente de soporte respondiendo "¿por qué mi cuenta perdió tanto de
+    golpe?" se beneficia de ver esto marcado de una, no calculado a mano.
+    """
+    import os
+    import tempfile
+    from wallet_integration import SimulatedWalletBalanceProvider
+    from multi_user import UserSessionManager
+    from support_tools import generate_user_support_snapshot
+
+    fd, db_path = tempfile.mkstemp(suffix="_support_concentration.db")
+    os.close(fd)
+    os.remove(db_path)
+    kill_switch_path = ".KILL_SWITCH_user-support-4"
+
+    try:
+        wallet = SimulatedWalletBalanceProvider()
+        wallet.deposit("user-support-4", "USDC", 1000.0)
+        manager = UserSessionManager(wallet, db_path=db_path)
+        session = manager.start_session("user-support-4", "USDC", 1000.0)
+
+        # Casi todo el saldo asignado en una sola posición -- mismo escenario real de LINK_USDC.
+        session.broker.set_price("LINK_USDC", 8.4271)
+        session.broker.place_order("LINK_USDC", "buy", 115.0)
+
+        snapshot = generate_user_support_snapshot("user-support-4", session, wallet=wallet, currency="USDC")
+
+        assert any("concentraci" in w.lower() and "LINK_USDC" in w for w in snapshot.advertencias), (
+            "Debe avisar sobre la posición sobre-concentrada al agente de soporte"
+        )
+        assert "Concentración" in snapshot.to_text()
+
+        manager.stop_session("user-support-4")
+    finally:
+        if os.path.exists(kill_switch_path):
+            os.remove(kill_switch_path)
+        if os.path.exists(db_path):
+            os.remove(db_path)
+    print("OK: el snapshot de soporte también avisa sobre posiciones sobre-concentradas")
+
+
 def test_all_strategies_return_valid_binary_signal_on_real_data():
     """
     strategies.py no tenía ningún test directo (solo se ejercitaba
@@ -4499,6 +4545,7 @@ if __name__ == "__main__":
         test_support_snapshot_reports_healthy_session_with_no_warnings,
         test_support_snapshot_flags_tripped_circuit_breaker_and_active_kill_switch,
         test_support_snapshot_flags_reconciliation_mismatch,
+        test_support_snapshot_flags_concentrated_position,
         test_all_strategies_return_valid_binary_signal_on_real_data,
         test_get_strategy_raises_for_unknown_name,
         test_trend_following_signal_matches_ma_crossover,

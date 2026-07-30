@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from reconciliation import reconcile
+from risk_manager import concentration_warnings
 
 
 @dataclass
@@ -117,6 +118,13 @@ def generate_user_support_snapshot(user_id: str, session, wallet=None, currency:
             "El kill-switch de este usuario está activo -- probablemente lo pausó él mismo o un agente "
             "de soporte anterior. Confirmar con el usuario antes de reactivar nada."
         )
+    # Mismo chequeo que status_report.py/real_results_report.py/ops_monitor.py
+    # (ver README, ronda de auditoría de concentración) -- acá importa para
+    # que un agente de soporte entienda de una si un reclamo de "perdí
+    # mucho de golpe" tiene que ver con una posición fuera de lo esperado,
+    # sin tener que ir a calcularlo a mano.
+    for aviso in concentration_warnings(session.broker.get_balance(), broker_positions):
+        advertencias.append(f"Concentración: {aviso}")
 
     saldo_disponible = wallet.get_available_balance(user_id, currency) if wallet is not None else None
     asignado = wallet.get_trading_allocation(user_id, currency) if wallet is not None else session.broker.get_balance()

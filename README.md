@@ -2150,6 +2150,32 @@ anteriores), este cambio debería reducir cuántos ticks se saltean
 esperando el próximo poll en vez de reintentar en el momento.
 
 
+## Cuadragésima primera ronda: cierre de la auditoría continua -- cuarto lugar sin chequeo de concentración, resto sólido
+
+Última pasada de la auditoría continua de esta sesión, revisando lo que
+quedaba: `strategies.py` (las 4 estrategias, línea por línea, buscando
+look-ahead bias -- `momentum_breakout` y `volatility_contraction` usan
+correctamente `.iloc[i-1]` para comparar contra el máximo/mínimo de
+AYER, no de hoy), `safety.py` (CircuitBreaker, ManualKillSwitch,
+validate_ohlcv), `validation.py`, `monte_carlo.py`, `portfolio.py`
+(hereda automáticamente el tope de concentración por compartir
+`risk_manager.position_size()` -- buena señal de que centralizar ese fix
+ahí fue la decisión correcta), `kill_switch.py`, `ripio_smoke.py`: todo
+sólido, sin hallazgos.
+
+`support_tools.py` sí tenía la misma laguna ya encontrada tres veces
+esta sesión: `generate_user_support_snapshot` arma advertencias para un
+agente de soporte (reconciliación, circuit breaker, kill-switch) pero le
+faltaba concentración -- el cuarto lugar, después de
+`status_report.py`/`real_results_report.py`/`ops_monitor.py`, que
+necesitaba el mismo aviso. Agregado con el mismo `concentration_warnings()`
+ya existente. Test de regresión con el mismo escenario real de
+LINK_USDC. 140/140 tests pasando.
+
+Con esto, la auditoría continua de esta sesión cubrió la totalidad del
+código del proyecto.
+
+
 ## Notas importantes (leer antes de avanzar)
 
 1. **Este backtest usa datos sintéticos por defecto.** Los resultados que
