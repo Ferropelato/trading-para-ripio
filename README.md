@@ -1950,6 +1950,44 @@ Verificado contra la sesión `new_pairs` real (posición de UNI_USDC al
 positivos.
 
 
+## Trigésima sexta ronda: el bug de ATR también corrompió resultados YA reportados -- corregido en el informe
+
+Revisando la duración real de cada operación cerrada (ver ronda
+anterior) para confirmar el alcance del bug de agregación de ticks,
+apareció algo que no era solo técnico: **btc_usdc, eth_usdc y multi**
+llevaban corriendo mucho más tiempo que `new_pairs` cuando se aplicó el
+fix -- así que el bug de ATR corrompido no fue un incidente aislado de
+un par nuevo, fue el estado normal de las 3 sesiones más viejas durante
+casi toda su historia. Separando las operaciones cerradas por fecha
+contra el momento exacto del fix (2026-07-30T10:21:00 UTC):
+
+- **eth_usdc**: 24/24 operaciones, neto -32.88, TODAS antes del fix.
+- **multi**: 13/13 operaciones, neto -33.92, TODAS antes del fix.
+- **new_pairs**: 13/15 antes del fix (neto -6.47), 2/15 después (neto +4.83).
+- **Total**: de -68.44 USDC de resultado neto consolidado, -73.27
+  corresponden a operaciones antes del fix -- las 2 operaciones después
+  del fix ya dieron positivo (+4.83, muestra todavía muy chica para
+  sacar conclusiones, pero la dirección es la correcta).
+
+Es decir: **el número negativo que ya estaba en
+`informe_resultados_reales.pdf`** (documento ya preparado como evidencia
+para la propuesta) **no medía la estrategia -- medía el bug**. No
+corregirlo hubiera sido presentar como "resultado real de la estrategia"
+algo que en realidad era el efecto de datos corrompidos.
+
+`real_results_report.py` ahora separa esto automáticamente: cada sesión
+muestra cuántas de sus operaciones cerraron antes del fix (con su neto,
+marcado explícitamente como no representativo) y el total consolidado
+hace lo mismo, agregando un bloque "Después del fix" con el resultado
+que sí refleja el motor corregido. La fecha de corte
+(`ATR_FIX_DEPLOYED_AT`) queda fija en el código como un hecho histórico
+de este pilot, no como un parámetro a ajustar. Test de regresión
+reproduce el escenario con una operación sintética antes y otra después
+del corte, verificando que el informe las separe y explique la causa.
+133/133 tests pasando. Informe regenerado
+(`informe_resultados_reales.md/.pdf`) con la separación real aplicada.
+
+
 ## Notas importantes (leer antes de avanzar)
 
 1. **Este backtest usa datos sintéticos por defecto.** Los resultados que

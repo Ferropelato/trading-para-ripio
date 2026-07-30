@@ -24,6 +24,21 @@ from datetime import datetime, timezone
 
 from app_logger import setup_logging
 
+# Momento real en que se relanzaron las 4 sesiones en vivo con el fix de
+# agregación de ticks (ver README, ronda de la causa raíz del bug de
+# concentración). Antes de este momento, el ATR de CUALQUIER sesión que
+# llevara más de ~10-15 minutos corriendo estaba corrompido -- medía el
+# rango de precio entre polls de 45-90 segundos, no la volatilidad
+# diaria real -- y eso producía stop loss/take profit artificialmente
+# ajustados. No es una sospecha: se confirmó mirando la duración real de
+# las operaciones (muchas cerraban en menos de 2 minutos, con perfiles
+# pensados para un horizonte de días/semanas). El resultado neto de
+# CUALQUIER operación cerrada antes de este momento no refleja la
+# estrategia -- refleja el bug. Se deja como una fecha fija, no
+# recalculada, porque es un hecho histórico de este pilot, no un
+# parámetro que deba ajustarse.
+ATR_FIX_DEPLOYED_AT = datetime(2026, 7, 30, 10, 21, 0, tzinfo=timezone.utc)
+
 # state_store/trade_history/tax_export se importan DENTRO de
 # generate_report(), no acá arriba -- get_logger() (que esos módulos
 # llaman a nivel de módulo) auto-configura el logging la primera vez que
@@ -72,6 +87,11 @@ def _log_stats(log_path: str) -> dict:
     }
 
 
+def _parse_ts(value: str) -> datetime:
+    dt = datetime.fromisoformat(value)
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
 def generate_report(directory: str = ".") -> str:
     from state_store import StateStore
     from trade_history import TradeHistoryLog, pair_trades
@@ -88,6 +108,8 @@ def generate_report(directory: str = ".") -> str:
         return "\n".join(lines)
 
     total_trades, total_wins, total_losses, total_net = 0, 0, 0, 0.0
+    pre_fix_trades, pre_fix_net = 0, 0.0
+    hubo_operaciones_afectadas = False
 
     for s in sessions:
         state = StateStore(path=s["state_path"]).load()
@@ -112,6 +134,18 @@ def generate_report(directory: str = ".") -> str:
             total_wins += wins
             total_losses += losses
             total_net += net
+
+            pre = [t for t in trades if t["fecha_salida"] and _parse_ts(t["fecha_salida"]) < ATR_FIX_DEPLOYED_AT]
+            if pre:
+                hubo_operaciones_afectadas = True
+                pre_net_sesion = sum(t["pnl"] for t in pre)
+                pre_fix_trades += len(pre)
+                pre_fix_net += pre_net_sesion
+                lines.append(
+                    f"  - De esas, {len(pre)} se cerraron ANTES del fix del bug de agregación de "
+                    f"ticks (ver nota al final) -- neto de esas: USDC {pre_net_sesion:+.2f}, "
+                    f"no representativo de la estrategia."
+                )
         else:
             lines.append("- Sin operaciones cerradas todavía.")
         if log_stats:
@@ -127,6 +161,17 @@ def generate_report(directory: str = ".") -> str:
     lines.append("")
     lines.append(f"- Operaciones cerradas en total: {total_trades} ({total_wins} ganadoras, {total_losses} perdedoras)")
     lines.append(f"- Resultado neto consolidado: USDC {total_net:+.2f}")
+    if hubo_operaciones_afectadas:
+        post_fix_trades = total_trades - pre_fix_trades
+        post_fix_net = total_net - pre_fix_net
+        lines.append(
+            f"  - De ese total, {pre_fix_trades} operaciones (neto USDC {pre_fix_net:+.2f}) se cerraron "
+            f"ANTES del fix del bug de agregación de ticks -- ver nota abajo, no representativas."
+        )
+        lines.append(
+            f"  - Después del fix: {post_fix_trades} operaciones, neto USDC {post_fix_net:+.2f} "
+            f"-- esto sí refleja la estrategia con el motor corregido (muestra todavía chica)."
+        )
     lines.append("")
     lines.append(
         "**Nota:** este informe mide fiabilidad de ejecución (el motor corre, "
@@ -135,6 +180,19 @@ def generate_report(directory: str = ".") -> str:
         "de paper trading no dicen nada sobre si una estrategia funciona a "
         "largo plazo, y nunca se presentó como tal."
     )
+    if hubo_operaciones_afectadas:
+        lines.append("")
+        lines.append(
+            f"**Nota sobre el bug de agregación de ticks (corregido {ATR_FIX_DEPLOYED_AT.isoformat()}):** "
+            "hasta ese momento, los ticks en vivo se agregaban como una vela diaria nueva cada "
+            "45-90 segundos -- con la ventana rodante de 14 períodos del ATR, en 10-15 minutos de "
+            "sesión corrida el ATR terminaba midiendo el rango de precio típico entre polls, no de un "
+            "día real, y eso producía stop loss/take profit artificialmente ajustados (confirmado "
+            "mirando la duración real de las operaciones: muchas cerraban en menos de 2 minutos, con "
+            "perfiles pensados para un horizonte de días/semanas). El resultado neto de las operaciones "
+            "marcadas arriba como \"antes del fix\" refleja ese bug, no la estrategia -- se muestra "
+            "igual, sin ocultarlo, por la misma política de honestidad del resto de este informe."
+        )
     return "\n".join(lines)
 
 

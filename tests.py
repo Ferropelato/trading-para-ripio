@@ -3069,6 +3069,59 @@ def test_real_results_report_warns_about_concentrated_position():
     print("OK: real_results_report.py también avisa sobre posiciones sobre-concentradas")
 
 
+def test_real_results_report_flags_trades_closed_before_atr_fix():
+    """
+    Hallazgo real (ver README): TODAS las pérdidas históricas de
+    btc_usdc/eth_usdc/multi resultaron ser de operaciones cerradas antes
+    del fix del bug de agregación de ticks -- confirmado mirando que
+    cerraban en minutos, no en el horizonte de días/semanas del perfil.
+    El informe debe separar explícitamente esas operaciones (no
+    representativas) de las cerradas después del fix (sí representativas),
+    en vez de mezclarlas en un solo número.
+    """
+    import csv
+    import os
+    import shutil
+    import tempfile
+    from datetime import timedelta
+    from state_store import StateStore
+    from real_results_report import generate_report, ATR_FIX_DEPLOYED_AT
+    from trade_history import FIELDNAMES
+
+    tmp_dir = tempfile.mkdtemp(prefix="real_results_report_atr_fix_test_")
+    try:
+        StateStore(path=os.path.join(tmp_dir, "live_state_x.json")).save({}, capital=1000.0, extra={})
+
+        antes = (ATR_FIX_DEPLOYED_AT - timedelta(minutes=5)).isoformat().replace("+00:00", "")
+        despues = (ATR_FIX_DEPLOYED_AT + timedelta(hours=1)).isoformat().replace("+00:00", "")
+        trades_path = os.path.join(tmp_dir, "trades_x.csv")
+        with open(trades_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
+            writer.writeheader()
+            # Operación cerrada ANTES del fix -- perdedora, artefacto del bug.
+            writer.writerow({"timestamp": antes, "symbol": "X_USDC", "side": "buy", "motivo": "apertura",
+                              "units": 1.0, "price": 100.0, "pnl": "", "balance_resultante": 1000.0})
+            writer.writerow({"timestamp": antes, "symbol": "X_USDC", "side": "sell", "motivo": "stop_loss",
+                              "units": 1.0, "price": 95.0, "pnl": -5.0, "balance_resultante": 995.0})
+            # Operación cerrada DESPUÉS del fix -- ganadora, representativa.
+            writer.writerow({"timestamp": despues, "symbol": "X_USDC", "side": "buy", "motivo": "apertura",
+                              "units": 1.0, "price": 100.0, "pnl": "", "balance_resultante": 995.0})
+            writer.writerow({"timestamp": despues, "symbol": "X_USDC", "side": "sell", "motivo": "take_profit",
+                              "units": 1.0, "price": 108.0, "pnl": 8.0, "balance_resultante": 1003.0})
+
+        report = generate_report(tmp_dir)
+
+        assert "1 se cerraron ANTES del fix" in report, "Debe marcar la operación anterior al fix como no representativa"
+        assert "USDC -5.00" in report, "El neto de la operación anterior al fix debe quedar visible, no oculto"
+        assert "Después del fix: 1 operaciones, neto USDC +8.00" in report, (
+            "Debe mostrar por separado el resultado posterior al fix, que sí representa la estrategia"
+        )
+        assert "bug de agregación de ticks" in report, "Debe explicar la causa, no solo marcar los números"
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    print("OK: real_results_report.py separa las operaciones afectadas por el bug de ATR de las representativas")
+
+
 def test_real_results_report_output_file_is_valid_utf8():
     """
     Bug real: la primera versión solo imprimía el informe por stdout, y
@@ -4184,6 +4237,7 @@ if __name__ == "__main__":
         test_status_report_warns_about_concentrated_position,
         test_real_results_report_summarizes_sessions_from_directory,
         test_real_results_report_warns_about_concentrated_position,
+        test_real_results_report_flags_trades_closed_before_atr_fix,
         test_real_results_report_output_file_is_valid_utf8,
         test_kill_switch_cli_respects_custom_control_file,
         test_manual_order_queue_persists_and_consumes_once,
