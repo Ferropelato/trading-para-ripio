@@ -69,6 +69,39 @@ def test_position_size_capped_by_capital_survives_slippage_and_commission():
     print("OK: el tope de capital deja margen y la orden no se rechaza por slippage/comisión")
 
 
+def test_position_size_caps_concentration_when_atr_is_tiny_relative_to_price():
+    """
+    Bug real visto en vivo con LINK_USDC (ver README, ronda de auditoría
+    de concentración): con un ATR muy chico en relación al precio (activo
+    calmo, o poca historia todavía para calcularlo bien), `risk_amount /
+    stop_distance` pedía una cantidad de unidades enorme -- tan grande que
+    el único freno que terminaba actuando era el tope de capital
+    disponible, no el % de riesgo del perfil. El resultado real: una
+    posición de casi el 97% del capital en un solo símbolo, cuando el
+    perfil "moderado" solo debería arriesgar el 1% por operación. Estos
+    números reproducen ese escenario real (entrada ~$8.40, ATR ~0.0045).
+    """
+    profile = get_profile("moderado")  # max_position_pct_of_capital = 0.30
+    capital = 1000.0
+    entry_price = 8.40
+    atr = 0.0045  # a propósito diminuto en relación al precio, como se vio en vivo
+
+    sizing = position_size(capital, entry_price, atr, profile)
+    trade_value = sizing["unidades"] * entry_price
+
+    max_permitido = capital * profile["max_position_pct_of_capital"]
+    assert trade_value <= max_permitido + 0.01, (
+        f"La posición (${trade_value:.2f}) supera el tope de concentración del perfil (${max_permitido:.2f})"
+    )
+    # Sin el tope de concentración, el único freno hubiera sido el de
+    # capital disponible (casi el 100% del capital) -- confirma que ACÁ
+    # es el tope nuevo el que está actuando, no una coincidencia.
+    assert trade_value < capital * 0.5, (
+        "La posición sigue concentrando casi todo el capital -- el tope de concentración no está frenando nada"
+    )
+    print("OK: un ATR diminuto en relación al precio no convierte 'arriesgar 1%' en 'apostar casi todo el capital'")
+
+
 def test_zero_atr_returns_zero_units():
     profile = get_profile("moderado")
     sizing = position_size(1000.0, 50.0, 0.0, profile)
@@ -3862,6 +3895,7 @@ if __name__ == "__main__":
         test_risk_never_exceeds_profile,
         test_position_size_never_exceeds_capital,
         test_position_size_capped_by_capital_survives_slippage_and_commission,
+        test_position_size_caps_concentration_when_atr_is_tiny_relative_to_price,
         test_zero_atr_returns_zero_units,
         test_validation_detects_corrupt_data,
         test_validation_passes_clean_data,

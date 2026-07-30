@@ -1829,6 +1829,55 @@ muerta una sesión que está perfectamente viva. Se resolvió relanzando con
 `python -u` (salida sin buffer); vale para cualquier sesión nueva que se
 lance redirigiendo a archivo de acá en adelante.
 
+
+## Trigésima tercera ronda: bug real de concentración -- un ATR chico convertía "arriesgar 1%" en "apostar el 97% del capital"
+
+Chequeo de rutina de las 4 sesiones en vivo tras otra suspensión de
+máquina (mismo patrón ya visto antes: procesos vivos hasta que la máquina
+se suspende, ninguno crashea por su cuenta). Al revisar el estado de
+`new_pairs` con `status_report.py`, algo saltó a la vista: capital en
+efectivo de apenas USDC 3.41, con **el 97% del capital metido en una
+sola posición** de LINK_USDC (114.77 unidades a $8.4271).
+
+Antes de asumir que era un bug, se verificó con los números reales del
+propio log: stop loss a $8.3879 contra una entrada de $8.3969 -- una
+distancia de apenas $0.009, es decir un ATR de práctica ~$0.0045 (0.05%
+del precio). Con el perfil "moderado" (arriesgar 1% del capital por
+operación), `risk_amount / stop_distance` pedía sizing para ~1111
+unidades -- muy por encima de lo que el capital disponible permitía. El
+único freno que terminaba actuando era el tope de capital (pensado para
+evitar rechazo por slippage/comisión, no para controlar concentración),
+que redondeaba hacia abajo hasta "todo lo que el bolsillo permite", no
+hasta "el 1% que el perfil dice que hay que arriesgar".
+
+La matemática de "arriesgar 1%" sigue siendo correcta *si el stop se
+toca limpio*: unidades × distancia_al_stop = 1% del capital, sin importar
+cuántas unidades sean. El problema real es otro: con una posición que
+concentra ~97% del capital, cualquier salto de precio que NO respete el
+stop de forma prolija (un gap, una noticia, un tick perdido -- todas
+cosas que ya se vieron pasar en las sesiones reales de este proyecto)
+puede dejar una pérdida muchísimo mayor al 1% pensado, porque la
+exposición nominal real no tiene nada que ver con el riesgo teórico.
+
+**Fix**: nuevo tope de concentración en `risk_manager.position_size()`
+(`max_position_pct_of_capital`), independiente del tope de capital
+existente -- ninguna posición puede pesar más que este % del capital, sin
+importar qué tan chico sea el ATR. Valores por perfil (`risk_profiles.py`):
+20% conservador, 30% moderado, 40% agresivo. Test de regresión
+reproduce el escenario real de LINK_USDC (entrada ~$8.40, ATR ~0.0045) y
+confirma que ahora la posición queda topeada al % del perfil, no al
+límite de capital disponible. 126/126 tests pasando.
+
+**Ojo con esto al reiniciar `new_pairs`**: el fix aplica a partir de la
+próxima entrada -- no resize una posición ya abierta. La posición de
+LINK_USDC que quedó abierta con el sizing viejo sigue como está (con su
+propio stop/take-profit ya fijados) hasta que se cierre sola por señal,
+stop, take-profit o el seguro de ganancias; no hace falta (ni conviene)
+tocarla manualmente solo por esto.
+
+
+## Notas importantes (leer antes de avanzar)
+
 1. **Este backtest usa datos sintéticos por defecto.** Los resultados que
    viste recién no dicen nada sobre si la estrategia funciona en el
    mercado real — son solo para confirmar que el motor calcula bien. El

@@ -40,6 +40,21 @@ def position_size(capital: float, entry_price: float, atr: float,
     max_units_by_capital = (capital * (1 - capital_safety_margin_pct)) / entry_price
     units = min(units, max_units_by_capital)
 
+    # Tope de CONCENTRACIÓN, independiente del tope de capital de arriba.
+    # Cuando el ATR es muy chico en relación al precio (activo calmo, o
+    # poca historia todavía para calcularlo bien), `risk_amount /
+    # stop_distance` pide una cantidad de unidades enorme -- el tope de
+    # capital de arriba termina siendo el que define la orden, y sin este
+    # freno adicional "arriesgar el 1% del capital" se convierte en la
+    # práctica en "apostar el 99% del capital a un solo símbolo": si el
+    # precio saltea el stop (gap, noticia, un tick perdido) en vez de
+    # tocarlo limpio, la pérdida real puede ser mucho mayor al 1%
+    # pensado. Visto en vivo con LINK_USDC (ver README, ronda de
+    # auditoría de concentración) -- no es hipotético.
+    max_position_pct = profile.get("max_position_pct_of_capital", 1.0)
+    max_units_by_concentration = (capital * max_position_pct) / entry_price
+    units = min(units, max_units_by_concentration)
+
     # Redondear al step de lote del instrumento/bróker (ej. 0.001 BTC, 1 acción)
     if lot_step and lot_step > 0:
         units = (units // lot_step) * lot_step
