@@ -2406,6 +2406,34 @@ mismo archivo, autoreset, fail-open, desactivación, y que el adapter
 pida turno). 148/148 tests pasando.
 
 
+## Cuadragésima octava ronda: guardias operativas -- que los dos modos de falla silenciosos dejen de serlo
+
+Dos agujeros con historia real en este proyecto, ahora cerrados:
+
+1. **Dataset semilla desactualizado**: `btc_daily.csv` estuvo casi dos
+   años viejo y ninguna sesión dijo nada al arrancar -- los indicadores
+   calentaban con historial antiguo en silencio (pasó dos veces antes de
+   notarse, rondas 44 y 46). Ahora `run_live_polling` mide la edad de la
+   última vela del CSV semilla al arrancar y loguea una advertencia
+   explícita si tiene más de 3 días (umbral que tolera el fin de semana
+   de los datasets de tipo de cambio), con la instrucción concreta:
+   correr `refresh_datasets.py` y reiniciar.
+
+2. **Sesión muerta indistinguible de una sana**: si el proceso de una
+   sesión se cae (crash, reinicio de la máquina), su state file queda
+   congelado -- y `status_report.py` lo mostraba igual que una sesión
+   viva, con un timestamp que nadie leía con atención. Ahora si el
+   estado no se actualiza hace más de 30 minutos, el reporte marca
+   "SESIÓN POSIBLEMENTE MUERTA" con la edad exacta. El umbral es
+   generoso a propósito (las sesiones de poll lento persisten cada
+   varios minutos): una falsa alarma constante entrena a ignorar la
+   alerta, que es peor que no tenerla.
+
+2 tests nuevos (CSV de 45 días dispara la advertencia con la edad
+exacta / CSV al día no molesta; estado congelado hace horas alerta /
+estado fresco no). 150/150 tests pasando.
+
+
 ## Notas importantes (leer antes de avanzar)
 
 1. **Este backtest usa datos sintéticos por defecto.** Los resultados que
