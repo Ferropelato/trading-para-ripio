@@ -2365,6 +2365,47 @@ arrancar -- tomará el dataset al día en su próximo reinicio natural.
 146/146 tests pasando.
 
 
+## Cuadragésima séptima ronda: rate gate global entre procesos -- la pieza que faltaba contra los 429
+
+El jitter de la ronda 45 mejoró los reintentos, pero la medición
+posterior mostró que los 429 seguían (46-66 por sesión en una hora):
+el problema de fondo es que NADA limitaba el ritmo global -- el
+`SharedPriceFeed` de Fase 2 deduplica dentro de un proceso, pero las 7
+sesiones son procesos separados, y cuando varias tickean a la vez sale
+una ráfaga contra la API aunque cada una respete su propio ritmo.
+
+`rate_gate.py` (`SharedRateGate`): un archivo SQLite compartido por
+todos los procesos de la máquina guarda "cuándo es el próximo turno
+libre". Antes de cada request, cada proceso reserva atómicamente su
+turno (`BEGIN IMMEDIATE` -- SQLite ya resuelve el locking entre
+procesos, no hace falta inventar nada), commitea enseguida y duerme
+hasta su turno. Nadie retiene el lock mientras duerme.
+
+Decisiones deliberadas, documentadas en el módulo:
+
+- **Sin proceso demonio**: la alternativa (un poller central que sirva
+  precios a todos) agrega una pieza que vigilar y un modo de falla
+  nuevo -- el demonio se cae y todas las sesiones quedan ciegas. Con el
+  gate, cada sesión sigue autónoma; solo se espacia.
+- **Fail-open**: si el gate falla (disco, DB corrupta), se loguea UNA
+  vez y se deja pasar sin esperar. Mejor arriesgar un 429 (que ya se
+  maneja con retry) que bloquear el fetch de precios por el propio gate.
+- **Autodefensa**: un turno guardado absurdamente en el futuro (salto
+  de reloj, dato corrupto) se resetea en vez de colgar a todos.
+- El `acquire()` está DENTRO del método con retry: cada reintento
+  también pide turno, no solo el primer intento.
+
+Integrado como parámetro opcional de `RipioBrokerAdapter` (los tests y
+usos existentes no cambian) y activo por defecto en `live_runner` con
+`--ripio-min-request-interval` (default 1.0s; 0 desactiva). Se
+reiniciaron las 5 sesiones sin posiciones; `brl` (ETH_BRL abierta) y
+`new_pairs` (UNI_USDC abierta) siguen con el código anterior hasta su
+próximo reinicio natural -- la regla de no matar sesiones con posición
+se mantuvo. 2 tests nuevos (espaciado real entre dos gates sobre el
+mismo archivo, autoreset, fail-open, desactivación, y que el adapter
+pida turno). 148/148 tests pasando.
+
+
 ## Notas importantes (leer antes de avanzar)
 
 1. **Este backtest usa datos sintéticos por defecto.** Los resultados que
