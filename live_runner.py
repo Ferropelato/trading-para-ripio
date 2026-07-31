@@ -121,7 +121,7 @@ class _LiveEngine:
     def __init__(self, broker, symbol, profile, strategy_name, profile_name,
                  alert_channel, kill_switch, circuit_breaker, heartbeat,
                  state_store, reconcile_every, log, news_guard=None, trade_history=None,
-                 profit_lock=None, max_positions=None, manual_orders=None):
+                 profit_lock=None, max_positions=None, manual_orders=None, monitor_only=False):
         self.broker = broker
         # Acepta un símbolo suelto (uso de siempre, un motor = un par) o
         # una lista (varios pares bajo el mismo motor) -- normalizado acá
@@ -162,6 +162,18 @@ class _LiveEngine:
         # venta manual siempre se deja pasar, igual que el stop
         # loss/take profit -- salir nunca está bloqueado.
         self.manual_orders = manual_orders
+        # Opcional: modo "solo monitoreo" -- sigue el precio, las noticias
+        # y persiste el estado igual que una sesión normal, pero NUNCA
+        # abre una posición (ni automática ni manual). Pensado para pares
+        # donde vale la pena tener el pulso real (precio, noticias) antes
+        # de comprometer capital, o donde el research previo ya mostró que
+        # el trading activo pierde contra simplemente sostener la posición
+        # (ver README, caso USDC_ARS -- comprar y mantener dólares le ganó
+        # por lejos a las 4 estrategias activas en un contexto de
+        # devaluación sostenida del peso). Una posición que ya estuviera
+        # abierta ANTES de activar este modo se sigue pudiendo cerrar con
+        # normalidad -- este modo bloquea aperturas nuevas, no salidas.
+        self.monitor_only = monitor_only
 
         saved_state = state_store.load()
         extra_saved = saved_state["extra"] if saved_state["saved_at"] else {}
@@ -526,6 +538,14 @@ class _LiveEngine:
         elif manual_side == "sell":
             self.log.warning("Orden manual de venta en %s rechazada -- no hay posición abierta para vender", symbol)
 
+        # 4c) Modo "solo monitoreo": nunca abre posiciones nuevas (ni
+        # automáticas ni manuales), pero todo lo demás de este tick ya
+        # corrió con normalidad arriba (precio, noticias, salidas de una
+        # posición que ya estuviera abierta, persistencia).
+        elif self.monitor_only:
+            if manual_side == "buy":
+                self.log.warning("Orden manual de compra en %s rechazada -- esta sesión está en modo solo monitoreo, no opera", symbol)
+
         # 5) Lógica de entrada (si no hay posición abierta en este símbolo,
         # el breaker no está activo, y no hay una pausa automática por
         # noticias en curso -- una compra manual respeta los mismos
@@ -688,7 +708,8 @@ def run_live_polling(price_source, symbol, strategy_name: str, profile_name: str
                       regime_filter: bool = True, multi_timeframe_filter: bool = True,
                       max_history_rows: int = 5000, news_guard=None, trade_history_path: str = None,
                       kill_switch_path: str = ".KILL_SWITCH", profit_lock_pct: float = None,
-                      max_positions: int = None, manual_orders_path: str = None):
+                      max_positions: int = None, manual_orders_path: str = None,
+                      monitor_only: bool = False):
     """
     Paper trading contra un feed de precios REAL (no replay histórico): en
     cada intervalo de `poll_interval_seconds` pide el precio actual a
@@ -736,6 +757,13 @@ def run_live_polling(price_source, symbol, strategy_name: str, profile_name: str
     manual de un símbolo. Una compra manual respeta los mismos frenos que
     una automática (breaker, pausa por noticias, cupo compartido); una
     venta manual siempre se deja pasar.
+
+    `monitor_only`: si es True, la sesión sigue el precio, las noticias y
+    persiste el estado con normalidad, pero NUNCA abre una posición
+    (automática ni manual) -- útil para un par donde vale la pena tener
+    el pulso real antes de comprometer capital, o donde ya se sabe que el
+    trading activo pierde contra sostener la posición (ver README, caso
+    USDC_ARS).
     """
     symbols = [symbol] if isinstance(symbol, str) else list(symbol)
     seed_csvs = {symbols[0]: seed_csv} if isinstance(seed_csv, str) else dict(seed_csv)
@@ -767,7 +795,7 @@ def run_live_polling(price_source, symbol, strategy_name: str, profile_name: str
         Heartbeat(max_staleness_seconds=max(poll_interval_seconds * 5, 300)),
         StateStore(path=state_path), reconcile_every, log,
         news_guard=news_guard, trade_history=trade_history, profit_lock=profit_lock,
-        max_positions=max_positions, manual_orders=manual_orders,
+        max_positions=max_positions, manual_orders=manual_orders, monitor_only=monitor_only,
     )
     shutdown_requested = _make_shutdown_flag(log)
 
@@ -862,6 +890,11 @@ def main():
                               "-- si se pasa, otro proceso (ej. manual_order.py) puede dejar pedida una compra o "
                               "venta manual de un símbolo, con los mismos frenos de seguridad que una orden "
                               "automática. Sin esta opción, desactivado (comportamiento de siempre).")
+    parser.add_argument("--monitor-only", action="store_true",
+                         help="La sesión sigue el precio, las noticias y persiste el estado con normalidad, "
+                              "pero NUNCA abre una posición (ni automática ni manual) -- útil para un par donde "
+                              "vale la pena tener el pulso real antes de comprometer capital, o donde ya se sabe "
+                              "que el trading activo pierde contra sostener la posición (ver README, caso USDC_ARS).")
     parser.add_argument("--max-drawdown", type=float, default=15.0)
     parser.add_argument("--max-daily-loss", type=float, default=5.0)
     parser.add_argument("--no-regime-filter", action="store_true",
@@ -937,6 +970,7 @@ def main():
             news_guard=news_guard, trade_history_path=args.trade_history_path,
             kill_switch_path=args.kill_switch_file, profit_lock_pct=args.profit_lock_pct,
             max_positions=args.max_positions, manual_orders_path=args.manual_orders_file,
+            monitor_only=args.monitor_only,
         )
     else:
         run_live(

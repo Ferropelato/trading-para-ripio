@@ -896,6 +896,136 @@ def test_live_engine_does_not_rotate_for_unproven_candidate():
     print("OK: una candidata sin historial propio no puede rotar una posición ya abierta, aunque esa tenga mal historial")
 
 
+def test_live_engine_monitor_only_never_opens_automatic_position():
+    """
+    Modo "solo monitoreo" (ver README, cobertura multi-país -- caso
+    USDC_ARS: el research ya mostró que el trading activo pierde contra
+    sostener la posición ahí). Con `monitor_only=True`, una señal
+    automática fuerte (sig=1) NUNCA debe abrir una posición -- el resto
+    del tick (heartbeat, persistencia) sigue funcionando con normalidad.
+    """
+    import os
+    import tempfile
+    from datetime import datetime, timezone
+    from live_runner import _LiveEngine
+    from broker import PaperBroker
+    from risk_profiles import get_profile
+    from safety import CircuitBreaker, ManualKillSwitch
+    from health import Heartbeat
+    from state_store import StateStore
+    from alerts import ConsoleAlertChannel
+    from app_logger import get_logger
+
+    fd, state_path = tempfile.mkstemp(suffix="_live_engine_monitor_only.json")
+    os.close(fd)
+    os.remove(state_path)
+    kill_switch_path = ".KILL_SWITCH_test_live_engine_monitor_only"
+
+    try:
+        broker = PaperBroker(initial_balance=1000.0)
+        engine = _LiveEngine(
+            broker, "TEST_SYM", get_profile("moderado"), "momentum", "moderado",
+            ConsoleAlertChannel(), ManualKillSwitch(control_file=kill_switch_path),
+            CircuitBreaker(), Heartbeat(max_staleness_seconds=99999),
+            StateStore(path=state_path), reconcile_every=1000, log=get_logger("test_live_engine_monitor_only"),
+            monitor_only=True,
+        )
+        now = datetime.now(timezone.utc)
+        broker.set_price("TEST_SYM", 100.0)
+
+        engine.process_tick(now, 100.0, current_atr=2.0, sig=1)  # señal fuerte, se ignora igual
+
+        assert "TEST_SYM" not in engine.internal_positions, "monitor_only nunca debe abrir una posición automática"
+        assert engine.heartbeat.is_stale() is False, "El resto del tick (heartbeat) debe seguir funcionando con normalidad"
+    finally:
+        if os.path.exists(state_path):
+            os.remove(state_path)
+        if os.path.exists(kill_switch_path):
+            os.remove(kill_switch_path)
+    print("OK: monitor_only nunca abre una posición automática, aunque haya señal")
+
+
+def test_live_engine_monitor_only_rejects_manual_buy_but_allows_exit():
+    """
+    monitor_only también bloquea una compra MANUAL -- "no opera" es "no
+    opera", no solo "no opera automáticamente". Pero una posición que ya
+    estuviera abierta ANTES de pasar a este modo se tiene que poder
+    seguir cerrando con normalidad (por stop loss/take profit) -- este
+    modo bloquea aperturas nuevas, nunca salidas.
+    """
+    import os
+    import tempfile
+    from datetime import datetime, timezone
+    from live_runner import _LiveEngine
+    from broker import PaperBroker
+    from risk_profiles import get_profile
+    from safety import CircuitBreaker, ManualKillSwitch
+    from health import Heartbeat
+    from state_store import StateStore
+    from manual_trading import ManualOrderQueue
+    from alerts import ConsoleAlertChannel
+    from app_logger import get_logger
+
+    fd, state_path = tempfile.mkstemp(suffix="_live_engine_monitor_only_manual.json")
+    os.close(fd)
+    os.remove(state_path)
+    kill_switch_path = ".KILL_SWITCH_test_live_engine_monitor_only_manual"
+    manual_orders_path = ".MANUAL_ORDERS_test_live_engine_monitor_only_manual"
+
+    try:
+        broker = PaperBroker(initial_balance=1000.0)
+        manual_orders = ManualOrderQueue(manual_orders_path)
+        engine = _LiveEngine(
+            broker, "TEST_SYM", get_profile("moderado"), "momentum", "moderado",
+            ConsoleAlertChannel(), ManualKillSwitch(control_file=kill_switch_path),
+            CircuitBreaker(), Heartbeat(max_staleness_seconds=99999),
+            StateStore(path=state_path), reconcile_every=1000, log=get_logger("test_live_engine_monitor_only_manual"),
+            manual_orders=manual_orders, monitor_only=True,
+        )
+        now = datetime.now(timezone.utc)
+        broker.set_price("TEST_SYM", 100.0)
+
+        manual_orders.queue_order("TEST_SYM", "buy")
+        engine.process_tick(now, 100.0, current_atr=2.0, sig=0)
+        assert "TEST_SYM" not in engine.internal_positions, "monitor_only debe rechazar también una compra manual"
+        assert manual_orders.pending() == {}, "La orden rechazada se descarta, no queda reintentando sola"
+
+        # Abrir una posición SIN pasar por monitor_only (simula que ya
+        # estaba abierta antes de activarlo), después construir un motor
+        # NUEVO en monitor_only=True sobre el mismo bróker/estado -- una
+        # salida real (stop loss) debe seguir funcionando igual.
+        engine2 = _LiveEngine(
+            broker, "TEST_SYM", get_profile("moderado"), "momentum", "moderado",
+            ConsoleAlertChannel(), ManualKillSwitch(control_file=kill_switch_path),
+            CircuitBreaker(), Heartbeat(max_staleness_seconds=99999),
+            StateStore(path=state_path), reconcile_every=1000, log=get_logger("test_live_engine_monitor_only_manual2"),
+            monitor_only=False,
+        )
+        engine2.process_tick(now, 100.0, current_atr=2.0, sig=1)  # abre normal, sin monitor_only
+        assert "TEST_SYM" in engine2.internal_positions
+        stop_loss = engine2.stop_loss["TEST_SYM"]
+        engine2.force_persist()  # reconcile_every=1000 no se cumple con un solo tick -- persistir a mano
+
+        engine3 = _LiveEngine(
+            broker, "TEST_SYM", get_profile("moderado"), "momentum", "moderado",
+            ConsoleAlertChannel(), ManualKillSwitch(control_file=kill_switch_path),
+            CircuitBreaker(), Heartbeat(max_staleness_seconds=99999),
+            StateStore(path=state_path), reconcile_every=1000, log=get_logger("test_live_engine_monitor_only_manual3"),
+            monitor_only=True,
+        )
+        assert "TEST_SYM" in engine3.internal_positions, "Debe restaurar la posición ya abierta al arrancar"
+        engine3.process_tick(now, stop_loss - 1.0, current_atr=2.0, sig=1)  # precio cruza el stop loss
+        assert "TEST_SYM" not in engine3.internal_positions, "monitor_only debe seguir cerrando posiciones ya abiertas"
+    finally:
+        if os.path.exists(state_path):
+            os.remove(state_path)
+        if os.path.exists(kill_switch_path):
+            os.remove(kill_switch_path)
+        if os.path.exists(manual_orders_path):
+            os.remove(manual_orders_path)
+    print("OK: monitor_only rechaza compras manuales pero deja cerrar posiciones ya abiertas")
+
+
 def test_live_engine_manual_entry_never_triggers_rotation():
     """
     La rotación por rentabilidad es SOLO para entradas automáticas -- una
@@ -4518,6 +4648,8 @@ if __name__ == "__main__":
         test_pick_weakest_open_position_ignores_unknown_and_picks_lowest,
         test_live_engine_rotates_weakest_position_for_better_automatic_candidate,
         test_live_engine_does_not_rotate_for_unproven_candidate,
+        test_live_engine_monitor_only_never_opens_automatic_position,
+        test_live_engine_monitor_only_rejects_manual_buy_but_allows_exit,
         test_live_engine_manual_entry_never_triggers_rotation,
         test_run_live_polling_multi_symbol_smoke_test,
         test_broker_adapters_dont_leak_into_each_other,

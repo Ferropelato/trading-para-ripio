@@ -2228,6 +2228,35 @@ alcanzables de verdad) más el fix de User-Agent. 142/142 tests pasando.
 Se reiniciarán las 4 sesiones en vivo con la cobertura ampliada.
 
 
+## Cuadragésima tercera ronda: modo "solo monitoreo" -- USDC_ARS sin apostar contra el propio research
+
+Pedido de seguimiento directo: sumar USDC_ARS "junto con los otros"
+pares en vivo. Antes de hacerlo, se corrió de nuevo el backtest de las 4
+estrategias sobre el dataset actualizado (hasta hoy): comprar y mantener
+dólares dio **+1439%** en el período 2021-2026, contra apenas **+115%**
+de la mejor estrategia activa (momentum/moderado) -- **12 veces peor que
+no hacer nada**. Reconfirma con datos frescos el hallazgo de la Novena
+ronda. Lanzar esto como sesión activa hubiera sido apostar capital real
+(aunque sea de paper trading) contra la propia evidencia del proyecto.
+
+Se presentó la disyuntiva directamente en vez de decidir en silencio, y
+se optó por **modo "solo monitoreo"**: nueva opción `monitor_only` en
+`_LiveEngine`/`run_live_polling` (y `--monitor-only` en el CLI) -- la
+sesión sigue el precio, las noticias, y persiste el estado con total
+normalidad, pero nunca abre una posición, ni automática ni manual (la
+compra manual se rechaza explícitamente, con el mismo tipo de log que
+los demás rechazos). Una posición que ya estuviera abierta ANTES de
+activar este modo se sigue pudiendo cerrar con normalidad -- este modo
+bloquea aperturas nuevas, nunca salidas.
+
+Es una pieza genérica, no un parche de una sola vez: sirve para cualquier
+par donde valga la pena tener el pulso real antes de comprometer capital,
+no solo para USDC_ARS. 2 tests nuevos: nunca abre con una señal
+automática fuerte, y rechaza una compra manual pero deja cerrar una
+posición que ya estaba abierta de antes. 144/144 tests pasando. Se lanzó
+una quinta sesión en vivo, USDC_ARS en modo solo-monitoreo.
+
+
 ## Notas importantes (leer antes de avanzar)
 
 1. **Este backtest usa datos sintéticos por defecto.** Los resultados que
