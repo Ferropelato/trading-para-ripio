@@ -2434,6 +2434,32 @@ exacta / CSV al día no molesta; estado congelado hace horas alerta /
 estado fresco no). 150/150 tests pasando.
 
 
+## Cuadragésima novena ronda: calibración del rate gate con datos de producción -- 1s no alcanzaba, 5s sí
+
+Seguimiento medido de la ronda 47. Con el gate en 1s los 429 bajaron
+pero no desaparecieron -- el límite real de la API pública de Ripio es
+bastante más estricto que 1 request/segundo (con un promedio de ~14
+requests/minuto entre todas las sesiones seguía habiendo rechazos). El
+costo no era cosmético: la guardia de "sesión posiblemente muerta"
+(ronda 48) cazó en su PRIMER uso real a USDC_ARS con 52 minutos sin
+persistir -- el proceso estaba vivo, pero los 429 le salteaban tantos
+ticks seguidos que la sesión quedaba hambreada.
+
+Se relanzó la flota completa con `--ripio-min-request-interval 5`
+(~12 requests/minuto globales) y se midió media hora: **9 eventos de
+429 en TODO el sistema, los 9 reabsorbidos por el retry, cero ticks
+perdidos** (contra 100+ cada 20 minutos antes del gate). El default del
+flag pasa de 1.0 a 5.0 -- el valor validado con datos, para que ningún
+lanzamiento futuro dependa de acordarse del flag.
+
+Además quedó demostrado en producción el camino de reinicio CON
+posiciones abiertas (antes se evitaba por precaución): las sesiones brl
+(ETH_BRL) y new_pairs (UNI_USDC) se reiniciaron dos veces con posición
+abierta y en ambas la restauraron intacta del state file, con
+reconciliación OK -- exactamente lo que el test de restauración de
+monitor_only ya cubría en frío.
+
+
 ## Notas importantes (leer antes de avanzar)
 
 1. **Este backtest usa datos sintéticos por defecto.** Los resultados que

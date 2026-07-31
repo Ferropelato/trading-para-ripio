@@ -912,10 +912,14 @@ def main():
                               "que el trading activo pierde contra sostener la posición (ver README, caso USDC_ARS).")
     parser.add_argument("--max-drawdown", type=float, default=15.0)
     parser.add_argument("--max-daily-loss", type=float, default=5.0)
-    parser.add_argument("--ripio-min-request-interval", type=float, default=1.0,
+    parser.add_argument("--ripio-min-request-interval", type=float, default=5.0,
                          help="Separación mínima (segundos) entre requests a Ripio compartida entre "
                               "TODAS las sesiones de esta máquina (rate gate global vía SQLite). "
-                              "0 la desactiva. Ver README, ronda del rate gate compartido.")
+                              "0 la desactiva. El default de 5s está validado con medición real: "
+                              "con 1s las 7 sesiones seguían recibiendo 429 (el límite real de "
+                              "Ripio es más estricto de lo aparente); con 5s quedaron en 9 eventos "
+                              "por media hora en todo el sistema, todos reabsorbidos por el retry. "
+                              "Ver README, rondas del rate gate compartido.")
     parser.add_argument("--no-regime-filter", action="store_true",
                          help="Desactiva el filtro de régimen de mercado")
     parser.add_argument("--no-mtf-filter", action="store_true",
