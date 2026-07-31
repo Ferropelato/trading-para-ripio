@@ -2965,6 +2965,101 @@ def test_broker_429_produces_rate_limit_error_with_retry_after():
     print("OK: el 429 del bróker viaja como RateLimitBrokerError con el Retry-After del servidor")
 
 
+def test_shared_rate_gate_spaces_requests_and_survives_failures():
+    """
+    Rate gate compartido entre procesos (ver rate_gate.py): con 7 sesiones
+    en paralelo, aunque cada una respete su propio ritmo, las ráfagas
+    sincronizadas contra la API de Ripio terminaban en 429. Acá se prueba
+    el contrato completo: (a) dos gates sobre el MISMO archivo (simulando
+    dos procesos) quedan espaciados globalmente, (b) un turno guardado
+    absurdamente en el futuro (reloj/dato corrupto) se resetea en vez de
+    colgar a todos, (c) si el archivo es inaccesible el gate se abre
+    (fail-open) en vez de bloquear el fetch de precios, (d) intervalo 0
+    lo desactiva.
+    """
+    import os
+    import sqlite3
+    import tempfile
+    import time as time_module
+
+    from rate_gate import SharedRateGate
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db = os.path.join(tmp, "gate.sqlite")
+        gate_a = SharedRateGate(db_path=db, min_interval_seconds=0.15)
+        gate_b = SharedRateGate(db_path=db, min_interval_seconds=0.15)  # otro "proceso"
+
+        t0 = time_module.time()
+        gate_a.acquire()
+        gate_b.acquire()
+        gate_a.acquire()
+        elapsed = time_module.time() - t0
+        assert elapsed >= 0.25, (
+            f"3 requests con intervalo global de 0.15s deben tardar ~0.30s en total, tardaron {elapsed:.3f}s "
+            "-- el espaciado debe valer ENTRE gates distintos (procesos), no solo dentro de uno"
+        )
+
+        conn = sqlite3.connect(db)
+        conn.execute("UPDATE gate SET next_slot = ? WHERE id = 1", (time_module.time() + 99999,))
+        conn.commit()
+        conn.close()
+        t1 = time_module.time()
+        gate_a.acquire()
+        assert time_module.time() - t1 < 5, "Un turno corrupto en el futuro debe resetearse, no esperarse"
+
+        # Ruta imposible (el 'directorio' padre es un archivo) -> fail-open
+        archivo_plano = os.path.join(tmp, "soy_un_archivo")
+        with open(archivo_plano, "w") as fh:
+            fh.write("x")
+        gate_roto = SharedRateGate(db_path=os.path.join(archivo_plano, "gate.sqlite"),
+                                   min_interval_seconds=0.15)
+        assert gate_roto.acquire() == 0.0, "Con el archivo inaccesible debe abrirse (fail-open), no lanzar"
+
+        gate_off = SharedRateGate(db_path=db, min_interval_seconds=0.0)
+        assert gate_off.acquire() == 0.0, "Intervalo 0 debe desactivar el gate"
+
+    print("OK: el rate gate espacia requests entre procesos, se autorepara y falla abierto")
+
+
+def test_ripio_adapter_asks_rate_gate_for_each_request():
+    """El adapter debe pedir turno al gate ANTES de cada request real
+    (incluidos los reintentos -- el acquire está adentro del método
+    decorado con retry, no afuera). Sin gate configurado, nada cambia."""
+    import requests as requests_module
+
+    from broker import RipioBrokerAdapter
+
+    class _GateEspia:
+        def __init__(self):
+            self.calls = 0
+
+        def acquire(self):
+            self.calls += 1
+            return 0.0
+
+    class _RespOk:
+        status_code = 200
+        text = '{"data": {"last": "123.0"}}'
+        headers = {}
+
+        def json(self):
+            return {"data": {"last": "123.0"}}
+
+    gate = _GateEspia()
+    broker = RipioBrokerAdapter(allow_trading=False, rate_gate=gate)
+
+    original_request = requests_module.request
+    requests_module.request = lambda *a, **k: _RespOk()
+    try:
+        price = broker.get_current_price("BTC_USDC")
+    finally:
+        requests_module.request = original_request
+
+    assert price == 123.0, f"Debe parsear el precio con normalidad a través del gate: {price}"
+    assert gate.calls == 1, f"Debe haber pedido turno exactamente una vez: {gate.calls}"
+    print("OK: el adapter de Ripio pide turno al rate gate antes de cada request")
+
+
 def test_broker_request_methods_have_retry_decorator_applied():
     """
     Bug real: @retry_with_backoff existía hace tiempo (construido,
@@ -4848,6 +4943,8 @@ if __name__ == "__main__":
         test_alpaca_429_is_retried_and_succeeds,
         test_rate_limit_backoff_waits_longer_and_honors_retry_after,
         test_broker_429_produces_rate_limit_error_with_retry_after,
+        test_shared_rate_gate_spaces_requests_and_survives_failures,
+        test_ripio_adapter_asks_rate_gate_for_each_request,
         test_broker_request_methods_have_retry_decorator_applied,
         test_alpaca_get_balance_reads_cash_from_account,
         test_alpaca_get_open_positions_maps_fields,

@@ -322,7 +322,15 @@ class RipioBrokerAdapter(BrokerBase):
 
     def __init__(self, api_token: str = None, api_secret: str = None,
                  quote_currency: str = "USDC", allow_trading: bool = False,
-                 timeout: float = None):
+                 timeout: float = None, rate_gate=None):
+        """
+        rate_gate: opcional, un objeto con .acquire() (ver
+        rate_gate.SharedRateGate) que espacia las requests GLOBALMENTE
+        entre todos los procesos de la máquina que compartan el mismo
+        archivo. Sin él, cada proceso limita solo su propio ritmo y con
+        varias sesiones en paralelo las ráfagas sincronizadas terminan en
+        429 (medido en producción -- ver README, rondas 45-47).
+        """
         import os
         try:
             from dotenv import load_dotenv
@@ -335,6 +343,7 @@ class RipioBrokerAdapter(BrokerBase):
         self.quote_currency = quote_currency.upper()
         self.allow_trading = allow_trading
         self.timeout = timeout if timeout is not None else self.DEFAULT_TIMEOUT
+        self.rate_gate = rate_gate
         self._processed_client_order_ids = {}
         self._server_time_offset_ms = None  # server_ms - local_ms
 
@@ -486,6 +495,12 @@ class RipioBrokerAdapter(BrokerBase):
         headers = {"Content-Type": "application/json"}
         if signed:
             headers = self._signed_headers(method, path, body)
+
+        # Espaciado global entre procesos (si está configurado). Va acá
+        # adentro y no antes del decorador de retry a propósito: así cada
+        # REINTENTO también pide turno, no solo el primer intento.
+        if self.rate_gate is not None:
+            self.rate_gate.acquire()
 
         try:
             response = requests.request(

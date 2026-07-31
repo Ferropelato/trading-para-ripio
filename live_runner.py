@@ -897,6 +897,10 @@ def main():
                               "que el trading activo pierde contra sostener la posición (ver README, caso USDC_ARS).")
     parser.add_argument("--max-drawdown", type=float, default=15.0)
     parser.add_argument("--max-daily-loss", type=float, default=5.0)
+    parser.add_argument("--ripio-min-request-interval", type=float, default=1.0,
+                         help="Separación mínima (segundos) entre requests a Ripio compartida entre "
+                              "TODAS las sesiones de esta máquina (rate gate global vía SQLite). "
+                              "0 la desactiva. Ver README, ronda del rate gate compartido.")
     parser.add_argument("--no-regime-filter", action="store_true",
                          help="Desactiva el filtro de régimen de mercado")
     parser.add_argument("--no-mtf-filter", action="store_true",
@@ -943,7 +947,13 @@ def main():
             price_source = AlpacaBrokerAdapter(allow_trading=False)
         else:
             from broker import RipioBrokerAdapter
-            price_source = RipioBrokerAdapter(allow_trading=False)
+            from rate_gate import SharedRateGate
+            # Espaciado GLOBAL de requests entre todas las sesiones de la
+            # máquina (comparten el mismo archivo SQLite) -- sin esto, con
+            # varias sesiones en paralelo las ráfagas sincronizadas
+            # terminan en 429 aunque cada una respete su propio ritmo.
+            gate = SharedRateGate(min_interval_seconds=args.ripio_min_request_interval)
+            price_source = RipioBrokerAdapter(allow_trading=False, rate_gate=gate)
 
         news_guard = None
         if args.news_alerts:

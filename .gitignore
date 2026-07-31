@@ -15,3 +15,4 @@ engine_state_*.json
 live_state_*.json
 live_log_*.txt
 trades_*.csv
+.ripio_rate_gate.sqlite
