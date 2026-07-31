@@ -2304,6 +2304,42 @@ tiene cobertura de noticias local, solo la cobertura global/regional que
 ya existe.
 
 
+## Cuadragésima quinta ronda: los reintentos de 429 chocaban sincronizados entre sesiones
+
+Al pasar a 7 sesiones en vivo en paralelo (con Brasil y Colombia), los
+logs mostraron 500+ líneas de 429 en un solo día, varias terminando en
+"falló tras 3 intentos" = tick perdido. La causa no era solo el volumen
+de requests: el backoff era **determinístico e igual para todo** -- un
+429 esperaba los mismos 1s y 2s exactos que un timeout de red, así que
+todos los procesos que chocaban con el rate limit al mismo tiempo
+reintentaban también al mismo tiempo, y volvían a chocar contra la misma
+ventana.
+
+Tres cambios en `resilience.py`/`broker.py`:
+
+1. **`RateLimitBrokerError`**, subclase de `TransientBrokerError` (nada
+   que ya tratara a los transitorios cambia de contrato): un 429 no es
+   un error de red cualquiera, es el servidor pidiendo explícitamente
+   bajar el ritmo. El retry usa una escala de espera propia y más larga
+   (5s base exponencial, tope 45s) en vez de la común (1s base).
+2. **Retry-After**: si el servidor manda ese header en el 429, se
+   respeta como espera mínima (parseo tolerante: si no vino, no es
+   numérico, o la respuesta ni tiene headers -- caso de los transportes
+   falsos de los tests -- simplemente se ignora).
+3. **Jitter de ±30% en TODOS los reintentos**: cada espera se multiplica
+   por un factor aleatorio, lo que descorrelaciona los procesos entre sí
+   (`jitter=False` disponible solo para tests determinísticos).
+
+Verificado en producción: tras reiniciar las sesiones (solo las 6 sin
+posiciones abiertas -- `new_pairs` tenía UNI_USDC abierta y se dejó
+corriendo con el código anterior, la regla de nunca matar una sesión
+con posición abierta se mantuvo), los logs muestran esperas variadas de
+3.6s a 11.9s en vez de los 1.0s/2.0s fijos. 2 tests nuevos y 1
+endurecido (el de 429 de punta a punta ahora también verifica que la
+espera use la escala larga, capturando el sleep en vez de dormir de
+verdad). 146/146 tests pasando.
+
+
 ## Notas importantes (leer antes de avanzar)
 
 1. **Este backtest usa datos sintéticos por defecto.** Los resultados que
