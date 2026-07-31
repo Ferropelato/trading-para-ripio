@@ -1950,6 +1950,43 @@ def test_ripio_public_ticker_live():
     print(f"OK: ticker público Ripio BTC_USDC = {price}")
 
 
+def test_news_feeds_are_reachable_live():
+    """
+    Humo real contra CADA feed configurado por defecto -- cada URL se
+    verificó a mano con curl antes de agregarla (ver README, ronda de
+    cobertura multi-país), pero un feed real puede caerse temporalmente
+    sin que eso sea un bug de este proyecto. Por eso no exige que TODOS
+    respondan -- exige que la MAYORÍA (80%+) lo hagan, para detectar si
+    una URL se rompió de verdad (cambió de lugar, dejó de existir) sin
+    ser tan frágil como para fallar por uno o dos feeds caídos en un
+    momento puntual. Usa `_default_http_get` (la función real que usa
+    NewsMonitor en producción), no un `requests.get` propio -- así el
+    test refleja el comportamiento real, incluido el User-Agent
+    explícito (varios de estos feeds devuelven 403 sin él, ver esa
+    función)."""
+    from news_monitor import _default_http_get, _parse_rss, DEFAULT_FEEDS
+
+    assert len(DEFAULT_FEEDS) >= 10, "La lista de feeds no debería haberse achicado por accidente"
+
+    ok, fallidos = 0, []
+    for url in DEFAULT_FEEDS:
+        try:
+            text = _default_http_get(url, timeout=10)
+            items = _parse_rss(text, source=url)
+            if items:
+                ok += 1
+            else:
+                fallidos.append(f"{url} (sin items)")
+        except Exception as e:
+            fallidos.append(f"{url} ({e})")
+
+    pct_ok = ok / len(DEFAULT_FEEDS) * 100
+    assert pct_ok >= 80, (
+        f"Solo {ok}/{len(DEFAULT_FEEDS)} feeds respondieron con contenido real -- fallidos: {fallidos}"
+    )
+    print(f"OK: {ok}/{len(DEFAULT_FEEDS)} feeds ({pct_ok:.0f}%) respondieron con contenido real")
+
+
 _SAMPLE_RSS = """<?xml version="1.0"?>
 <rss><channel>
   <item>
@@ -1976,6 +2013,32 @@ def test_classify_impact_matches_keywords():
     assert classify_impact("Exchange suffers major hack, millions stolen") != []
     assert classify_impact("Bitcoin price steady amid quiet trading day") == []
     print("OK: la clasificación por palabras clave detecta e ignora titulares correctamente")
+
+
+def test_classify_impact_detects_local_crisis_terms_without_over_triggering():
+    """
+    Ampliación real (ver README, ronda de cobertura multi-país): medios
+    locales de los países donde opera Ripio ahora también se monitorean.
+    Las palabras clave para esos medios tienen que ser genuinamente agudas
+    (devaluación, corralito, default) -- nunca vocabulario económico de
+    uso diario (inflación, dólar, BCRA solos), o la pausa automática
+    terminaría activa casi todo el tiempo en un país con inflación
+    crónica. Prueba las dos cosas: SÍ detecta un evento agudo real, y NO
+    dispara con una nota de rutina que solo menciona economía en general.
+    """
+    from news_monitor import classify_impact
+
+    # Eventos agudos reales -- deben detectarse.
+    assert classify_impact("El Gobierno anuncia una devaluación del peso del 20%") != []
+    assert classify_impact("Corrida bancaria obliga a un feriado bancario de emergencia") != []
+    assert classify_impact("Brasil impõe controle de capitais tras la fuga de divisas") != []
+
+    # Notas económicas de rutina -- NO deben disparar la pausa automática,
+    # aunque mencionen inflación, dólar o el banco central por su nombre.
+    assert classify_impact("La inflación de julio fue del 3,2% según el INDEC") == []
+    assert classify_impact("El dólar blue cerró estable esta semana") == []
+    assert classify_impact("El BCRA licitó letras por $500.000 millones") == []
+    print("OK: las palabras clave locales detectan eventos agudos sin dispararse con noticias económicas de rutina")
 
 
 def test_news_monitor_dedup_and_filters_low_impact():
@@ -4481,7 +4544,9 @@ if __name__ == "__main__":
         test_ripio_place_order_blocked_without_allow_trading,
         test_ripio_private_requires_credentials,
         test_ripio_public_ticker_live,
+        test_news_feeds_are_reachable_live,
         test_classify_impact_matches_keywords,
+        test_classify_impact_detects_local_crisis_terms_without_over_triggering,
         test_news_monitor_dedup_and_filters_low_impact,
         test_news_monitor_get_and_restore_seen_links,
         test_news_monitor_empty_feeds_list_makes_no_requests,

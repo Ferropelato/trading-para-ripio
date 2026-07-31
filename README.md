@@ -2176,6 +2176,58 @@ Con esto, la auditoría continua de esta sesión cubrió la totalidad del
 código del proyecto.
 
 
+## Cuadragésima segunda ronda: cobertura de noticias multi-país (Argentina, Brasil, México, Colombia, Uruguay, EEUU, China)
+
+Se preguntó específicamente si un anuncio económico del gobierno
+argentino había quedado registrado -- la respuesta honesta fue que no, y
+por diseño: `news_monitor.py` solo leía CoinDesk y Cointelegraph (medios
+cripto globales en inglés), con palabras clave específicas de crisis
+cripto (hack, quiebra, regulación) -- un anuncio macro local, por
+importante que sea, queda estructuralmente fuera de ese radar.
+
+Se amplió a propósito, no solo para Argentina: Ripio opera en Argentina,
+Brasil, México, Colombia, Uruguay, Chile y EEUU -- un evento LOCAL en
+cualquiera de esos países puede no aparecer nunca en la prensa cripto
+global, pero sí importar mucho para un usuario de ese país en particular.
+Se sumó EEUU (mueve el sentimiento cripto global más que casi cualquier
+otro país) y China (misma razón, con historial concreto de que su
+regulación cripto mueve el mercado entero).
+
+**Cada feed se verificó a mano con curl antes de agregarlo** -- varios
+candidatos obvios resultaron ser páginas HTML disfrazadas de RSS, no
+feeds reales (ej. la URL "genérica" de RSS de Ámbito). Fuentes finales,
+todas confirmadas reales: Ámbito, Cronista, Infobae (Argentina); G1,
+Valor Econômico (Brasil); La Jornada (México); La República (Colombia);
+El Observador (Uruguay); CNBC Economy, WSJ Markets (EEUU); South China
+Morning Post Business (China) -- 11 fuentes nuevas sobre las 2
+existentes.
+
+**Palabras clave locales, deliberadamente angostas.** Agregar términos
+como "inflación" o "dólar" a secas hubiera hecho que la pausa automática
+quedara activa casi todo el tiempo en un país con inflación crónica -- una
+alerta que suena siempre deja de servir de alerta. Se usaron solo
+términos de eventos agudos y puntuales: devaluación, corralito, corrida
+bancaria/cambiaria, default, control de capitales (español y sus
+equivalentes en portugués para los medios de Brasil). Test de regresión
+específico: confirma que SÍ detecta un titular de devaluación real, y que
+NO se dispara con una nota de rutina sobre inflación, el dólar blue, o
+una licitación del BCRA.
+
+**Bug real encontrado por el propio test de humo agregado**: 4 de los 13
+feeds (Ámbito, La República, El Observador, y uno de los feeds de CNBC)
+devolvían 403 con el User-Agent por defecto de `requests`
+("python-requests/x.x.x", identificable como bot) -- en producción esos
+4 feeds hubieran fallado SIEMPRE, en silencio (el error queda atrapado y
+logueado como warning, sin tirar abajo el proceso), sin que nadie lo
+notara salvo que se probara contra la red real. Corregido agregando un
+User-Agent explícito en `_default_http_get`. Con el fix: 13/13 feeds
+responden con contenido real.
+
+2 tests nuevos (palabras clave locales sin sobre-disparo, feeds
+alcanzables de verdad) más el fix de User-Agent. 142/142 tests pasando.
+Se reiniciarán las 4 sesiones en vivo con la cobertura ampliada.
+
+
 ## Notas importantes (leer antes de avanzar)
 
 1. **Este backtest usa datos sintéticos por defecto.** Los resultados que

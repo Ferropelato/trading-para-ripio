@@ -5,14 +5,31 @@ que podría invalidar la lectura técnica del mercado -- ver README.md,
 sección "Módulo de noticias".
 
 Deliberadamente simple y auditable:
-- Fuentes: feeds RSS públicos de medios de cripto reconocidos (CoinDesk,
-  Cointelegraph). No requieren API key ni registro.
+- Fuentes: feeds RSS públicos (no requieren API key ni registro). Cubren
+  dos capas a propósito: (1) medios de cripto globales (CoinDesk,
+  Cointelegraph) para lo que afecta al mercado cripto en general, y
+  (2) medios económicos LOCALES de los países donde opera Ripio
+  (Argentina, Brasil, México, Colombia, Uruguay) más EEUU y China (las
+  dos economías que más mueven el sentimiento cripto global) -- un
+  anuncio local (ej. un cambio regulatorio o una devaluación en un solo
+  país) puede no aparecer nunca en la prensa cripto global, pero sí
+  importar mucho para un usuario de ESE país. Cada feed se verificó
+  a mano contra la URL real (no se asume que existe -- varios medios
+  tienen un `/rss` que en realidad es una página HTML, no un feed).
 - Clasificación de impacto: coincidencia de palabras clave en el título
   (hackeo, quiebra, regulación, etc.), NO un modelo de sentimiento con IA.
   Un keyword match es fácil de auditar ("se disparó por la palabra X en
   este título") -- un score de sentimiento de una IA es una caja negra
   más, y ya hay bastante superficie de error en este sistema como para
   sumar una decisión no explicable.
+- Las palabras clave para los medios LOCALES son deliberadamente más
+  angostas que las de cripto: términos genuinamente agudos/puntuales
+  (ej. "devaluación", "corralito", "default"), nunca palabras que la
+  prensa económica local menciona todos los días como rutina (ej.
+  "inflación", "dólar", "BCRA" solos) -- si se agregaran esas, la pausa
+  automática terminaría activa casi todo el tiempo en un país con
+  inflación crónica, y una alerta que suena siempre deja de servir de
+  alerta.
 - Nunca coloca ni cierra una orden por sí solo. Lo máximo que hace en modo
   automático es pausar la apertura de posiciones NUEVAS por un tiempo --
   el mismo tipo de freno conservador que ya usan el circuit breaker y el
@@ -31,12 +48,34 @@ from app_logger import get_logger
 log = get_logger(__name__)
 
 DEFAULT_FEEDS = [
+    # --- Cripto global ---
     "https://www.coindesk.com/arc/outboundfeeds/rss/",
     "https://cointelegraph.com/rss",
+    # --- EEUU (economía/mercados en general -- mueve el sentimiento
+    # cripto global más que casi cualquier otro país) ---
+    "https://www.cnbc.com/id/20910258/device/rss/rss.html",  # CNBC Economy
+    "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",  # WSJ Markets
+    # --- China (la otra economía que más mueve el sentimiento cripto
+    # global -- regulación china de cripto en particular tiene historial
+    # de mover el mercado entero) ---
+    "https://www.scmp.com/rss/92/feed",  # South China Morning Post, Business
+    # --- Argentina ---
+    "https://www.ambito.com/rss/pages/economia.xml",  # Ámbito, Economía
+    "https://www.cronista.com/arc/outboundfeeds/news/",  # El Cronista
+    "https://www.infobae.com/arc/outboundfeeds/rss/",  # Infobae (general, incluye economía)
+    # --- Brasil ---
+    "https://g1.globo.com/rss/g1/economia/",  # G1, Economia
+    "https://valor.globo.com/rss/valor",  # Valor Econômico
+    # --- México ---
+    "https://www.jornada.com.mx/rss/economia.xml",  # La Jornada, Economía
+    # --- Colombia ---
+    "https://www.larepublica.co/rss/economia",  # La República, Economía
+    # --- Uruguay ---
+    "https://www.elobservador.com.uy/rss/pages/economia.xml",  # El Observador, Economía
 ]
 
-# Palabras clave de alto impacto (ingles, porque las fuentes son en ingles).
-# Intencionalmente conservador: mejor una alerta de mas que una senal real
+# Palabras clave de alto impacto en inglés (medios cripto/EEUU/China).
+# Intencionalmente conservador: mejor una alerta de más que una señal real
 # de crisis que pase desapercibida.
 HIGH_IMPACT_KEYWORDS = [
     "hack", "hacked", "exploit", "exploited", "breach",
@@ -47,7 +86,32 @@ HIGH_IMPACT_KEYWORDS = [
     "collapse", "collapses", "crashes", "plunge", "plunges",
     "delist", "delisting", "delisted",
     "etf approved", "etf rejected", "etf denied",
+    # Macro EEUU/China -- términos de eventos puntuales (decisión de tasa,
+    # medida arancelaria concreta), no menciones rutinarias de la economía.
+    "rate hike", "rate cut", "interest rate decision", "fed hikes", "fed cuts",
+    "recession", "trade war", "tariffs on", "capital controls", "sanctions on",
+    "china crackdown", "china bans", "pboc",
 ]
+
+# Palabras clave de alto impacto en español/portugués (medios locales de los
+# países donde opera Ripio). Ver nota arriba: a propósito angostas, solo
+# eventos puntuales y agudos -- nunca vocabulario económico de uso diario.
+HIGH_IMPACT_KEYWORDS_LOCAL = [
+    "devaluación", "devalúa", "devaluación del peso",
+    "corralito", "corrida cambiaria", "corrida bancaria",
+    "default", "cesación de pagos", "quiebra", "quiebras",
+    "control de cambios", "control de capitales", "cepo cambiario",
+    "congelamiento de depósitos", "feriado bancario",
+    "suba de tasas", "baja de tasas", "sube la tasa", "baja la tasa",
+    "prohíbe", "prohibición de", "prohibición del",
+    # Portugués (Brasil)
+    "desvalorização", "corrida bancária", "calote", "quebra do banco",
+    "controle de capitais", "congelamento de depósitos",
+]
+
+# Lista combinada -- lo que usa NewsMonitor por defecto si no se le pasa
+# una lista de palabras clave propia.
+ALL_HIGH_IMPACT_KEYWORDS = HIGH_IMPACT_KEYWORDS + HIGH_IMPACT_KEYWORDS_LOCAL
 
 
 @dataclass
@@ -86,13 +150,24 @@ def _parse_rss(xml_text: str, source: str) -> list:
 
 def classify_impact(title: str, keywords=None) -> list:
     """Devuelve las palabras clave de alto impacto encontradas en el titulo (vacio si ninguna)."""
-    keywords = keywords if keywords is not None else HIGH_IMPACT_KEYWORDS
+    keywords = keywords if keywords is not None else ALL_HIGH_IMPACT_KEYWORDS
     title_lower = title.lower()
     return [kw for kw in keywords if kw in title_lower]
 
 
 def _default_http_get(url: str, timeout: float) -> str:
-    response = requests.get(url, timeout=timeout)
+    # User-Agent explícito -- bug real encontrado al agregar los feeds
+    # locales (ver README, ronda de cobertura multi-país): varios medios
+    # (Ámbito, La República, El Observador, uno de los feeds de CNBC)
+    # devuelven 403 al User-Agent por defecto de `requests`
+    # ("python-requests/x.x.x", identificable como bot) -- con eso, esos
+    # feeds fallarían SIEMPRE en producción, en silencio (el error queda
+    # atrapado y logueado como warning, nunca hace caer el proceso), sin
+    # que nadie lo note salvo que se lo pruebe contra la red real.
+    response = requests.get(
+        url, timeout=timeout,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; TradingEngineNewsMonitor/1.0)"},
+    )
     response.raise_for_status()
     return response.text
 
@@ -113,7 +188,7 @@ class NewsMonitor:
         # de este mismo modulo: paso feeds=[] esperando cero red y termino
         # llamando a las URLs reales de CoinDesk/Cointelegraph).
         self.feeds = feeds if feeds is not None else DEFAULT_FEEDS
-        self.keywords = keywords if keywords is not None else HIGH_IMPACT_KEYWORDS
+        self.keywords = keywords if keywords is not None else ALL_HIGH_IMPACT_KEYWORDS
         self.timeout = timeout
         self._http_get = http_get or _default_http_get
         self._seen_links = set()
