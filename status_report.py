@@ -21,10 +21,28 @@ Para una sesión puntual con rutas propias:
 import argparse
 import glob
 import os
+from datetime import datetime
 
 from state_store import StateStore
 from trade_history import TradeHistoryLog
 from risk_manager import concentration_warnings
+
+# Si el estado no se actualizó hace más de esto, la sesión probablemente
+# está muerta (proceso caído, máquina reiniciada) y nadie lo notó. El
+# umbral es generoso a propósito: las sesiones de poll lento persisten
+# cada varios minutos, y una falsa alarma constante entrena a ignorar
+# la alerta (que es peor que no tenerla).
+STALE_SESSION_MINUTES = 30
+
+
+def _session_staleness_minutes(saved_at: str) -> float | None:
+    """Minutos desde la última persistencia (saved_at es UTC naive,
+    formato isoformat de state_store). None si no se puede parsear."""
+    try:
+        saved = datetime.fromisoformat(saved_at)
+    except (TypeError, ValueError):
+        return None
+    return (datetime.utcnow() - saved).total_seconds() / 60.0
 
 
 def build_status_report(symbol: str, state_path: str, trades_path: str = None,
@@ -36,6 +54,11 @@ def build_status_report(symbol: str, state_path: str, trades_path: str = None,
         lines.append(f"Sin estado guardado en {state_path} -- la sesión no llegó a persistir nada todavía.")
     else:
         lines.append(f"Última actualización: {state['saved_at']}")
+        staleness = _session_staleness_minutes(state["saved_at"])
+        if staleness is not None and staleness > STALE_SESSION_MINUTES:
+            lines.append(f"  [!] SESIÓN POSIBLEMENTE MUERTA: el estado no se actualiza hace "
+                          f"{staleness:.0f} minutos (umbral: {STALE_SESSION_MINUTES}). Verificá que el "
+                          f"proceso siga corriendo y reinicialo si hace falta.")
         lines.append(f"Capital: {state['capital']:.2f}" if state["capital"] is not None else "Capital: (desconocido)")
         if state["positions"]:
             lines.append("Posiciones abiertas:")

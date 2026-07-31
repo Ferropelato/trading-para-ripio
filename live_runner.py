@@ -784,6 +784,21 @@ def run_live_polling(price_source, symbol, strategy_name: str, profile_name: str
         dfs[sym] = df_sym
         last_close[sym] = df_sym["close"].iloc[-1]
 
+        # Guardia de frescura del dataset semilla. Bug real (dos veces):
+        # btc_daily.csv estuvo casi DOS AÑOS desactualizado sin que nadie
+        # lo notara -- los indicadores calentaban con historial viejo y
+        # el salto entre la última vela del CSV y el precio en vivo de
+        # hoy entraba como un solo día gigante. Correr refresh_datasets.py
+        # antes de lanzar sesiones es lo que mantiene esto al día.
+        dias_viejo = (pd.Timestamp.now().normalize() - df_sym.index[-1].normalize()).days
+        if dias_viejo > 3:
+            log.warning(
+                "El dataset semilla de %s (%s) está %d días desactualizado (última vela: %s). "
+                "Los indicadores van a calentar con historial viejo -- correr refresh_datasets.py "
+                "y reiniciar esta sesión.",
+                sym, seed_csvs[sym], dias_viejo, df_sym.index[-1].date(),
+            )
+
     broker = PaperBroker(initial_balance=initial_balance)
     trade_history = TradeHistoryLog(trade_history_path) if trade_history_path else None
     profit_lock = ProfitLock(profit_lock_pct, initial_balance) if profit_lock_pct else None

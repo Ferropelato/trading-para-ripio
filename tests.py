@@ -4218,6 +4218,122 @@ def test_status_report_warns_about_concentrated_position():
     print("OK: status_report.py avisa cuando una posición concentra el capital fuera de lo esperado")
 
 
+def test_status_report_flags_dead_session():
+    """
+    Una sesión cuyo proceso murió (crash, reinicio de la máquina) deja un
+    state file congelado -- y sin esta alerta, el reporte lo mostraba
+    igual que una sesión sana, solo que con un timestamp que nadie miraba
+    con atención. Con el estado recién guardado NO debe alertar; con un
+    saved_at de hace horas SÍ.
+    """
+    import json
+    import os
+    import tempfile
+    from datetime import datetime, timedelta
+
+    from state_store import StateStore
+    from status_report import build_status_report, STALE_SESSION_MINUTES
+
+    fd, state_path = tempfile.mkstemp(suffix="_status_report_dead.json")
+    os.close(fd)
+    os.remove(state_path)
+
+    try:
+        StateStore(path=state_path).save({}, capital=1000.0, extra={})
+        report_fresh = build_status_report("TEST_SYM", state_path)
+        assert "POSIBLEMENTE MUERTA" not in report_fresh, (
+            "Con el estado recién guardado no debe alertar sesión muerta"
+        )
+
+        with open(state_path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+        raw["saved_at"] = (datetime.utcnow() - timedelta(minutes=STALE_SESSION_MINUTES * 4)).isoformat()
+        with open(state_path, "w", encoding="utf-8") as fh:
+            json.dump(raw, fh)
+
+        report_stale = build_status_report("TEST_SYM", state_path)
+        assert "POSIBLEMENTE MUERTA" in report_stale, (
+            "Con el estado congelado hace horas debe alertar que la sesión puede estar muerta"
+        )
+    finally:
+        if os.path.exists(state_path):
+            os.remove(state_path)
+    print("OK: status_report.py alerta cuando el estado de una sesión quedó congelado (proceso muerto)")
+
+
+def test_live_polling_warns_on_stale_seed_csv():
+    """
+    Bug real (dos veces): btc_daily.csv estuvo casi dos años
+    desactualizado y ninguna sesión lo avisó al arrancar -- los
+    indicadores calentaban con historial viejo en silencio. Ahora
+    run_live_polling debe loguear una advertencia si el CSV semilla está
+    viejo, y no molestar si está al día.
+    """
+    import logging
+    import os
+    import tempfile
+
+    import pandas as pd
+
+    from live_runner import run_live_polling
+
+    class StubPriceSource:
+        def get_current_price(self, symbol):
+            return 100.0
+
+    class _Captura(logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.mensajes = []
+
+        def emit(self, record):
+            self.mensajes.append(record.getMessage())
+
+    def _csv_temporal(end_date):
+        dates = pd.date_range(end=end_date, periods=40, freq="D")
+        df = pd.DataFrame({
+            "date": dates,
+            "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5, "volume": 1000,
+        })
+        fd, path = tempfile.mkstemp(suffix="_stale_seed.csv")
+        os.close(fd)
+        df.to_csv(path, index=False)
+        return path
+
+    handler = _Captura()
+    logger = logging.getLogger("live_runner")
+    logger.addHandler(handler)
+
+    csv_viejo = _csv_temporal(pd.Timestamp.now().normalize() - pd.Timedelta(days=45))
+    csv_fresco = _csv_temporal(pd.Timestamp.now().normalize())
+    fd, state_path = tempfile.mkstemp(suffix="_stale_seed_state.json")
+    os.close(fd)
+    os.remove(state_path)
+
+    try:
+        run_live_polling(StubPriceSource(), symbol="TEST_STALE", strategy_name="momentum",
+                          profile_name="moderado", seed_csv=csv_viejo, poll_interval_seconds=0,
+                          max_ticks=1, state_path=state_path)
+        avisos = [m for m in handler.mensajes if "desactualizado" in m]
+        assert avisos, "Con un CSV semilla de hace 45 días debe loguear la advertencia de dataset viejo"
+        assert "45 días" in avisos[0] or "45 d" in avisos[0], f"Debe decir cuántos días: {avisos[0]}"
+
+        handler.mensajes.clear()
+        os.remove(state_path)
+        run_live_polling(StubPriceSource(), symbol="TEST_STALE", strategy_name="momentum",
+                          profile_name="moderado", seed_csv=csv_fresco, poll_interval_seconds=0,
+                          max_ticks=1, state_path=state_path)
+        assert not any("desactualizado" in m for m in handler.mensajes), (
+            "Con un CSV semilla al día no debe advertir nada"
+        )
+    finally:
+        logger.removeHandler(handler)
+        for p in (csv_viejo, csv_fresco, state_path):
+            if os.path.exists(p):
+                os.remove(p)
+    print("OK: run_live_polling advierte al arrancar si el dataset semilla está desactualizado")
+
+
 def test_trade_history_log_persists_across_process_restarts():
     """
     A diferencia del estado de posiciones (una FOTO del momento), el
@@ -4975,6 +5091,8 @@ if __name__ == "__main__":
         test_live_engine_records_buy_and_sell_in_trade_history,
         test_status_report_reflects_state_and_history,
         test_status_report_warns_about_concentrated_position,
+        test_status_report_flags_dead_session,
+        test_live_polling_warns_on_stale_seed_csv,
         test_real_results_report_summarizes_sessions_from_directory,
         test_real_results_report_warns_about_concentrated_position,
         test_real_results_report_flags_trades_closed_before_atr_fix,
