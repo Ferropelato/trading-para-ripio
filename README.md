@@ -2257,6 +2257,53 @@ posición que ya estaba abierta de antes. 144/144 tests pasando. Se lanzó
 una quinta sesión en vivo, USDC_ARS en modo solo-monitoreo.
 
 
+## Cuadragésima cuarta ronda: Brasil y Colombia en vivo, y un bug de datos de dos años
+
+Pedido de seguimiento: además de USDC_ARS, activar los pares de Ripio en
+Brasil (BTC_BRL, ETH_BRL, SOL_BRL, USDC_BRL, USDT_BRL) y Colombia
+(USDC_COP), verificados antes contra el ticker público real de Ripio
+(`GET /trade/public/tickers/{pair}`) para confirmar que existen y cotizan
+(SOL_BRL parece un par recién listado -- su ticker trae `first`/`high`/
+`low` en 0 y `price_change_percent_24h: 100.00`, probablemente sin
+historial de 24hs todavía; se dejó igual porque el ticker actual es real).
+
+Al construir los datasets con la misma técnica real ya usada para ARS
+(`build_ars_datasets.py`: tipo de cambio real de Yahoo Finance + BTC/ETH
+reales re-denominados) apareció un bug de datos que venía de antes: **
+`real_data/btc_daily.csv` estaba parado en 2024-09-17** -- casi dos años
+desactualizado -- mientras que `eth_daily.csv` sí se había estado
+refrescando (llega hasta hoy). Como `build_ars_datasets.py` reusa
+`btc_daily.csv` tal cual, **`btc_ars_daily.csv` también venía cortado en
+esa fecha desde que se creó**, sin que ninguna ronda anterior lo hubiera
+notado (el conteo de filas parecía razonable, pero el rango de fechas
+nunca se verificó explícitamente). Se corrigió con un script nuevo,
+`refresh_btc_daily.py`, que baja de Yahoo Finance (BTC-USD) solo las
+velas reales que faltan y las agrega sin tocar el historial 2020-2024 ya
+guardado -- 682 velas nuevas, 2024-09-17 a hoy. Se corrieron de nuevo
+`build_ars_datasets.py` (btc_ars_daily.csv pasó de estar cortado a 1300
+velas reales hasta hoy) y el script nuevo de Brasil/Colombia con el dato
+ya corregido.
+
+A diferencia de USDC_ARS, acá el backtest (momentum/moderado) le gana a
+comprar-y-mantener en los 6 pares -- tiene sentido: BRL y COP se
+apreciaron contra el dólar en el período, así que "mantener dólares"
+fue la peor opción, no la mejor. No hay tensión con el research propio
+esta vez, así que se lanzaron **activos** (sin `--monitor-only`): una
+sesión multi-símbolo para los 5 pares de Brasil y otra para USDC_COP,
+mismo patrón que las sesiones existentes (`--live-prices`,
+`--news-alerts`, `profit-lock-pct 25`). Al arrancar, el monitor de
+noticias multi-país (ronda anterior) ya activó una pausa automática de
+entradas nuevas por una noticia de alto impacto real -- confirma que la
+ampliación de cobertura efectivamente está influyendo en sesiones reales,
+no solo en los tests. 144/144 tests pasando.
+
+Nota pendiente: no se encontró un feed de noticias de Chile que
+funcionara (La Tercera, Diario Financiero, Emol y BioBioChile fallaron
+las verificaciones) -- Ripio opera en Chile pero por ahora ese país no
+tiene cobertura de noticias local, solo la cobertura global/regional que
+ya existe.
+
+
 ## Notas importantes (leer antes de avanzar)
 
 1. **Este backtest usa datos sintéticos por defecto.** Los resultados que
