@@ -2798,6 +2798,7 @@ def test_alpaca_429_is_retried_and_succeeds():
     y devolver el resultado bueno, sin que el llamador vea nada.
     """
     from broker import AlpacaBrokerAdapter
+    import time as time_module
 
     calls = []
 
@@ -2807,11 +2808,161 @@ def test_alpaca_429_is_retried_and_succeeds():
             return _FakeAlpacaResponse(429, {"message": "rate limited"})
         return _FakeAlpacaResponse(200, {"trade": {"p": 100.0}})
 
-    broker = AlpacaBrokerAdapter(api_key_id="k", secret_key="s", transport=fake_transport)
-    price = broker.get_current_price("AAPL")
+    # Capturar el sleep en vez de dormir de verdad: con la escala de espera
+    # específica para rate limit (5s base) este test tardaría segundos reales.
+    slept = []
+    original_sleep = time_module.sleep
+    time_module.sleep = lambda s: slept.append(s)
+    try:
+        broker = AlpacaBrokerAdapter(api_key_id="k", secret_key="s", transport=fake_transport)
+        price = broker.get_current_price("AAPL")
+    finally:
+        time_module.sleep = original_sleep
+
     assert price == 100.0, "Debe reintentar sola y devolver el precio bueno, sin propagar el 429"
     assert len(calls) == 2, "Debe haber reintentado exactamente una vez tras el 429"
-    print("OK: un 429 se reintenta automáticamente en vez de cortar como error permanente")
+    assert len(slept) == 1 and slept[0] >= 5.0 * 0.7, (
+        f"Un 429 debe esperar con la escala de rate limit (5s base, jitter -30% peor caso), no la común de 1s: {slept}"
+    )
+    print("OK: un 429 se reintenta automáticamente, y con la espera larga de rate limit")
+
+
+def test_rate_limit_backoff_waits_longer_and_honors_retry_after():
+    """
+    Hallazgo real de los logs en vivo: con 7 sesiones en paralelo, los 429
+    se reintentaban con el MISMO backoff corto y determinístico que un
+    error de red (1s, 2s exactos) -- todos los procesos que chocaban con
+    el rate limit reintentaban sincronizados y volvían a chocar (500+
+    líneas de 429 en un solo día, algunas terminando en tick perdido).
+    Tres garantías nuevas: (a) un 429 espera con la escala larga
+    específica de rate limit, (b) si el servidor manda Retry-After se
+    respeta como mínimo, (c) el resto de los errores transitorios siguen
+    con la escala corta de siempre.
+    """
+    from resilience import retry_with_backoff, TransientBrokerError, RateLimitBrokerError
+    import time as time_module
+
+    slept = []
+    original_sleep = time_module.sleep
+    time_module.sleep = lambda s: slept.append(s)
+    try:
+        calls = {"n": 0}
+
+        @retry_with_backoff(max_attempts=3, base_delay_seconds=0.01,
+                            rate_limit_base_delay_seconds=5.0, jitter=False)
+        def rate_limited_then_ok():
+            calls["n"] += 1
+            if calls["n"] < 2:
+                raise RateLimitBrokerError("429 simulado")
+            return "ok"
+
+        assert rate_limited_then_ok() == "ok"
+        assert slept == [5.0], f"Un 429 debe usar la escala de rate limit (esperado [5.0], real {slept})"
+
+        slept.clear()
+        calls["n"] = 0
+
+        @retry_with_backoff(max_attempts=3, base_delay_seconds=0.01,
+                            rate_limit_base_delay_seconds=5.0, jitter=False)
+        def retry_after_then_ok():
+            calls["n"] += 1
+            if calls["n"] < 2:
+                raise RateLimitBrokerError("429 con Retry-After", retry_after_seconds=12.5)
+            return "ok"
+
+        assert retry_after_then_ok() == "ok"
+        assert slept == [12.5], f"Retry-After del servidor debe respetarse como espera mínima (esperado [12.5], real {slept})"
+
+        slept.clear()
+        calls["n"] = 0
+
+        @retry_with_backoff(max_attempts=3, base_delay_seconds=0.01,
+                            rate_limit_base_delay_seconds=5.0, jitter=False)
+        def transient_then_ok():
+            calls["n"] += 1
+            if calls["n"] < 2:
+                raise TransientBrokerError("timeout simulado")
+            return "ok"
+
+        assert transient_then_ok() == "ok"
+        assert slept == [0.01], f"Un error de red común debe seguir con la escala corta (esperado [0.01], real {slept})"
+
+        slept.clear()
+        calls["n"] = 0
+
+        @retry_with_backoff(max_attempts=2, base_delay_seconds=1.0, jitter=True)
+        def jittered_then_ok():
+            calls["n"] += 1
+            if calls["n"] < 2:
+                raise TransientBrokerError("falla para medir jitter")
+            return "ok"
+
+        assert jittered_then_ok() == "ok"
+        assert len(slept) == 1 and 0.7 <= slept[0] <= 1.3, (
+            f"Con jitter, la espera debe quedar dentro de +/-30% de la base: {slept}"
+        )
+    finally:
+        time_module.sleep = original_sleep
+
+    print("OK: 429 espera con escala larga, respeta Retry-After, y el jitter descorrelaciona procesos")
+
+
+def test_broker_429_produces_rate_limit_error_with_retry_after():
+    """
+    Nivel bróker del mismo arreglo: el 429 de Ripio/Alpaca ahora lanza
+    RateLimitBrokerError (subclase de TransientBrokerError, así que todo
+    lo que ya trataba a los transitorios sigue igual) con el Retry-After
+    del servidor parseado si vino. También cubre que _parse_retry_after
+    tolere respuestas sin .headers -- los transportes falsos de los tests
+    no siempre lo definen, y eso no debe romper el manejo del 429.
+    """
+    from broker import _parse_retry_after, AlpacaBrokerAdapter
+    from resilience import RateLimitBrokerError
+    import time as time_module
+
+    class _RespConHeaders:
+        def __init__(self, headers):
+            self.headers = headers
+
+    assert _parse_retry_after(_RespConHeaders({"Retry-After": "7"})) == 7.0
+    assert _parse_retry_after(_RespConHeaders({"Retry-After": "texto-no-numerico"})) is None
+    assert _parse_retry_after(_RespConHeaders({})) is None
+    assert _parse_retry_after(_RespConHeaders(None)) is None
+
+    class _RespSinHeaders:
+        pass
+
+    assert _parse_retry_after(_RespSinHeaders()) is None, (
+        "Una respuesta sin atributo .headers (transporte falso de test) no debe romper"
+    )
+
+    # De punta a punta con Alpaca: 429 persistente con Retry-After -> la
+    # excepción que llega al llamador es RateLimitBrokerError y trae el
+    # Retry-After parseado.
+    def always_429(method, url, headers, json_body, timeout):
+        resp = _FakeAlpacaResponse(429, {"message": "rate limited"})
+        resp.headers = {"Retry-After": "9"}
+        return resp
+
+    slept = []
+    original_sleep = time_module.sleep
+    time_module.sleep = lambda s: slept.append(s)
+    try:
+        broker = AlpacaBrokerAdapter(api_key_id="k", secret_key="s", transport=always_429)
+        try:
+            broker.get_current_price("AAPL")
+            assert False, "Debería haber propagado el 429 tras agotar los reintentos"
+        except RateLimitBrokerError as e:
+            assert e.retry_after_seconds == 9.0, (
+                f"El Retry-After del servidor debe venir parseado en la excepción: {e.retry_after_seconds}"
+            )
+    finally:
+        time_module.sleep = original_sleep
+
+    assert all(s >= 9.0 * 0.7 for s in slept), (
+        f"Todas las esperas deben respetar el Retry-After de 9s como mínimo (con jitter -30% peor caso): {slept}"
+    )
+    print("OK: el 429 del bróker viaja como RateLimitBrokerError con el Retry-After del servidor")
 
 
 def test_broker_request_methods_have_retry_decorator_applied():
@@ -4695,6 +4846,8 @@ if __name__ == "__main__":
         test_user_session_manager_uses_one_shared_db_not_one_file_per_user,
         test_alpaca_get_current_price_parses_latest_trade,
         test_alpaca_429_is_retried_and_succeeds,
+        test_rate_limit_backoff_waits_longer_and_honors_retry_after,
+        test_broker_429_produces_rate_limit_error_with_retry_after,
         test_broker_request_methods_have_retry_decorator_applied,
         test_alpaca_get_balance_reads_cash_from_account,
         test_alpaca_get_open_positions_maps_fields,

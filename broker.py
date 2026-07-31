@@ -16,7 +16,22 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 
 from app_logger import get_logger
-from resilience import retry_with_backoff, TransientBrokerError, PermanentBrokerError
+from resilience import (
+    retry_with_backoff, TransientBrokerError, PermanentBrokerError, RateLimitBrokerError,
+)
+
+
+def _parse_retry_after(response) -> float | None:
+    """Header Retry-After de un 429, si vino y es numérico (formato en
+    segundos; el formato alternativo con fecha HTTP no se usa en estas
+    APIs y se ignora sin romper). Tolera respuestas sin .headers -- los
+    transportes inyectados en tests no siempre lo definen."""
+    headers = getattr(response, "headers", None) or {}
+    try:
+        seconds = float(headers.get("Retry-After"))
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds > 0 else None
 
 log = get_logger(__name__)
 
@@ -504,8 +519,9 @@ class RipioBrokerAdapter(BrokerBase):
             # más común de todas las sesiones en vivo de este proyecto
             # (rate limit -- justo el caso de libro de "esperá un poco y
             # reintentá", no "esto nunca va a funcionar").
-            raise TransientBrokerError(
-                f"Ripio rechazó la request (429, rate limit): {response.text[:200]}"
+            raise RateLimitBrokerError(
+                f"Ripio rechazó la request (429, rate limit): {response.text[:200]}",
+                retry_after_seconds=_parse_retry_after(response),
             )
         if response.status_code in (401, 403):
             raise PermanentBrokerError(
@@ -813,7 +829,10 @@ class AlpacaBrokerAdapter(BrokerBase):
             raise TransientBrokerError(f"Alpaca respondió {response.status_code}: {response.text[:200]}")
         if response.status_code == 429:
             # Mismo bug de clasificación que en Ripio -- ver nota ahí.
-            raise TransientBrokerError(f"Alpaca rechazó la request (429, rate limit): {response.text[:200]}")
+            raise RateLimitBrokerError(
+                f"Alpaca rechazó la request (429, rate limit): {response.text[:200]}",
+                retry_after_seconds=_parse_retry_after(response),
+            )
         if response.status_code in (401, 403):
             raise PermanentBrokerError(f"Auth Alpaca falló ({response.status_code}): {response.text[:300]}")
         if response.status_code >= 400:
