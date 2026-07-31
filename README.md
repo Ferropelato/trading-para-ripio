@@ -2340,6 +2340,31 @@ espera use la escala larga, capturando el sleep en vez de dormir de
 verdad). 146/146 tests pasando.
 
 
+## Cuadragésima sexta ronda: refresco unificado de datasets -- el problema de BTC no era solo de BTC
+
+La ronda 44 encontró `btc_daily.csv` parado hacía dos años, pero al
+revisar el resto: `eth_daily.csv` estaba 6 días viejo y los 6 pares
+nuevos 2 días. Refrescar "a mano un archivo cuando se nota" no escala, y
+un dataset base viejo corta silenciosamente a los derivados que se
+construyen encima (btc_ars, btc_brl, eth_brl -- eth_brl terminaba el
+07-23 solo porque eth_daily estaba viejo).
+
+`refresh_datasets.py` reemplaza al `refresh_btc_daily.py` puntual de la
+ronda 44: refresca TODAS las bases de Yahoo (BTC, ETH y los 6 pares
+nuevos, reusando el mapa de tickers ya verificado de
+`build_new_pairs_datasets.py`) agregando solo las velas reales que
+falten sin pisar historial, y después corre los dos scripts de derivados
+para que ARS/BRL/COP queden consistentes. Una sola puerta de entrada
+para mantener todo real_data/ al día.
+
+Tras el refresco (18 velas nuevas entre las 8 bases, eth_brl ahora hasta
+hoy) se reiniciaron solo las sesiones afectadas Y sin posiciones
+(eth_usdc y multi); la sesión BRL no se tocó porque ya había abierto su
+primera posición real de paper trading (ETH_BRL) minutos después de
+arrancar -- tomará el dataset al día en su próximo reinicio natural.
+146/146 tests pasando.
+
+
 ## Notas importantes (leer antes de avanzar)
 
 1. **Este backtest usa datos sintéticos por defecto.** Los resultados que
