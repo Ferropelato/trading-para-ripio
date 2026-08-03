@@ -2080,6 +2080,142 @@ def test_ripio_public_ticker_live():
     print(f"OK: ticker público Ripio BTC_USDC = {price}")
 
 
+def test_celo_onchain_contract_is_deployed_reads_bytecode_presence():
+    """
+    contract_is_deployed debe interpretar correctamente la respuesta real
+    de eth_getCode: "0x" (o vacío) significa que NO hay contrato en esa
+    dirección, cualquier otra cosa significa que sí -- probado con una
+    respuesta simulada del RPC (determinístico, sin red)."""
+    import requests
+    import celo_onchain
+
+    class _RespVacio:
+        status_code = 200
+
+        def json(self):
+            return {"jsonrpc": "2.0", "id": 1, "result": "0x"}
+
+    class _RespConCodigo:
+        status_code = 200
+
+        def json(self):
+            return {"jsonrpc": "2.0", "id": 1, "result": "0x6080604052"}
+
+    original_post = requests.post
+    try:
+        requests.post = lambda *a, **k: _RespVacio()
+        assert celo_onchain.contract_is_deployed("0x000...vacio") is False
+
+        requests.post = lambda *a, **k: _RespConCodigo()
+        assert celo_onchain.contract_is_deployed("0x000...con_codigo") is True
+    finally:
+        requests.post = original_post
+    print("OK: contract_is_deployed distingue una dirección vacía de un contrato real")
+
+
+def test_celo_onchain_count_recent_events_paginates_across_max_block_range():
+    """
+    El RPC público de Celo limita eth_getLogs a un máximo de
+    MAX_LOG_BLOCK_RANGE bloques por consulta -- count_recent_events debe
+    partir una ventana más grande en varias consultas y sumar los
+    resultados, no simplemente pedir todo de una (eso el RPC real lo
+    rechaza con un error). Se prueba con 3 ventanas distintas devolviendo
+    cantidades de eventos distintas, para confirmar que se suman todas y
+    que los límites de bloque de cada ventana no se solapan ni dejan huecos.
+    """
+    import requests
+    import celo_onchain
+
+    calls = []
+
+    class _RespLogs:
+        def __init__(self, n):
+            self._n = n
+
+        def json(self):
+            return {"jsonrpc": "2.0", "id": 1, "result": [{"blockNumber": "0x1"} for _ in range(self._n)]}
+
+    counts = iter([2, 5, 1])  # una cantidad de eventos distinta por ventana
+
+    def _fake_post(url, json, timeout):
+        params = json["params"][0]
+        calls.append((int(params["fromBlock"], 16), int(params["toBlock"], 16)))
+        return _RespLogs(next(counts))
+
+    original_post = requests.post
+    try:
+        requests.post = _fake_post
+        # 12000 bloques con ventanas de 5000 -> 3 llamadas (5000 + 5000 + 2000)
+        result = celo_onchain.count_recent_events(
+            "0xpool", lookback_blocks=12000, latest_block=100_000,
+        )
+    finally:
+        requests.post = original_post
+
+    assert result["events_seen"] == 8, f"Debe sumar 2+5+1=8 eventos de las 3 ventanas, dio {result['events_seen']}"
+    assert len(calls) == 3, f"12000 bloques con ventana de 5000 debe pedir 3 páginas, pidió {len(calls)}"
+    # las ventanas deben cubrir el rango completo sin solaparse ni dejar huecos
+    all_blocks = set()
+    for frm, to in calls:
+        assert to - frm + 1 <= celo_onchain.MAX_LOG_BLOCK_RANGE, "Ninguna ventana debe superar el límite del RPC"
+        rng = set(range(frm, to + 1))
+        assert not (rng & all_blocks), f"Las ventanas {calls} no deben solaparse"
+        all_blocks |= rng
+    assert min(f for f, _ in calls) == 100_000 - 12000 + 1
+    assert max(t for _, t in calls) == 100_000
+    print("OK: count_recent_events pagina correctamente sobre el límite de bloques del RPC de Celo")
+
+
+def test_celo_onchain_rpc_error_is_not_retried():
+    """
+    Un error JSON-RPC (ej. rango de bloques inválido) es un pedido mal
+    formado, no un problema de red transitorio -- debe propagarse de
+    inmediato como ValueError, sin gastar los 3 reintentos del backoff
+    (eso solo tiene sentido para timeouts/errores de conexión)."""
+    import requests
+    import celo_onchain
+
+    call_count = {"n": 0}
+
+    class _RespError:
+        def json(self):
+            call_count["n"] += 1
+            return {"jsonrpc": "2.0", "id": 1, "error": {"code": -32602, "message": "query exceeds range"}}
+
+    original_post = requests.post
+    try:
+        requests.post = lambda *a, **k: _RespError()
+        raised = False
+        try:
+            celo_onchain.get_latest_block()
+        except ValueError:
+            raised = True
+    finally:
+        requests.post = original_post
+
+    assert raised, "Un error JSON-RPC debe propagarse como ValueError"
+    assert call_count["n"] == 1, f"No debe reintentar un error de RPC (pedido mal formado): se llamó {call_count['n']} veces"
+    print("OK: un error de RPC de Celo se propaga de inmediato, sin gastar reintentos de red")
+
+
+def test_celo_rpc_reachable_live():
+    """
+    Humo real contra el RPC público de Celo (forno.celo.org, sin API
+    key) y contra las dos pools reales de Textile FX (wARS/wBRL) que
+    Ripio activó -- confirma que la infraestructura on-chain que se
+    monitorea sigue existiendo de verdad, no solo en el anuncio original."""
+    import celo_onchain
+
+    latest = celo_onchain.get_latest_block()
+    assert latest > 70_000_000, f"El último bloque de Celo debería ser un número grande y creciente, llegó {latest}"
+
+    for name, address in celo_onchain.KNOWN_POOLS.items():
+        assert celo_onchain.contract_is_deployed(address), (
+            f"La pool {name} ({address}) debería seguir teniendo bytecode desplegado en Celo"
+        )
+    print(f"OK: RPC de Celo responde (bloque {latest}) y las {len(celo_onchain.KNOWN_POOLS)} pools conocidas siguen desplegadas")
+
+
 def test_news_feeds_are_reachable_live():
     """
     Humo real contra CADA feed configurado por defecto -- cada URL se
@@ -5038,6 +5174,10 @@ if __name__ == "__main__":
         test_ripio_place_order_blocked_without_allow_trading,
         test_ripio_private_requires_credentials,
         test_ripio_public_ticker_live,
+        test_celo_onchain_contract_is_deployed_reads_bytecode_presence,
+        test_celo_onchain_count_recent_events_paginates_across_max_block_range,
+        test_celo_onchain_rpc_error_is_not_retried,
+        test_celo_rpc_reachable_live,
         test_news_feeds_are_reachable_live,
         test_classify_impact_matches_keywords,
         test_classify_impact_detects_local_crisis_terms_without_over_triggering,

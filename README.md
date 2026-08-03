@@ -2460,6 +2460,50 @@ reconciliación OK -- exactamente lo que el test de restauración de
 monitor_only ya cubría en frío.
 
 
+## Quincuagésima ronda: monitoreo on-chain real de la infraestructura de Ripio en Celo
+
+Ripio lanzó wFIAT (sus 6 stablecoins locales) sobre Celo el 2026-07-31, y
+al día siguiente Textile FX abrió pools de liquidez wARS↔USDT y
+wBRL↔USDT -- direcciones reales, tomadas del propio post de @ripiohq en
+X, no de documentación de terceros. Se investigó si el motor podía
+sumar una fuente de precio adicional leyendo esas pools directo de la
+blockchain (independiente de la API de Ripio).
+
+**Investigación honesta que cambió el alcance**: se bajó el bytecode
+real de la pool wARS↔USDT desde el RPC público de Celo
+(`forno.celo.org`, gratis, sin API key) y se extrajeron sus selectores
+de función reales del dispatcher de Solidity. Resultado: NO es un par
+Uniswap V2 (sin `getReserves`/`token0`/`token1`), sino que expone la
+interfaz de un vault ERC-4626 (`asset()`, `totalAssets()`,
+`deposit(uint256,address)`) -- un mecanismo de pricing propio y no
+documentado públicamente. Calcular un precio implícito a partir de eso
+sería adivinar, no medir -- y mostrarle un número inventado al propio
+equipo que construyó el contrato sería peor que no tener el dato. Se
+descartó esa idea explícitamente en vez de forzarla.
+
+En cambio se construyó algo más angosto pero 100% verificable
+(`celo_onchain.py` + `onchain_activity_report.py`): para las pools
+conocidas, confirma que el contrato sigue realmente desplegado
+(`eth_getCode`) y cuenta eventos on-chain en una ventana reciente
+(`eth_getLogs`, paginado en ventanas de 5000 bloques -- el límite real
+del RPC público, no documentado de antemano, encontrado probando
+directo contra la red). Corrido contra las pools reales: ambas siguen
+desplegadas, 0 eventos vistos en las últimas ~55hs bajo esa dirección
+-- resultado que se reporta tal cual, con la aclaración honesta de que
+0 puede ser "sin actividad todavía" o "esta dirección es un
+intermediario que no emite logs bajo su propio nombre" (no se puede
+distinguir con esto solo, y el campo se llama `events_seen`, no
+`actividad_total`, a propósito).
+
+Pieza completamente aislada: no toca `live_runner.py` ni `broker.py`,
+no corre en el loop crítico de ninguna sesión en vivo -- es un reporte
+puntual, pensado para correr a demanda. 4 tests nuevos (interpretación
+de `eth_getCode`, paginación exacta sobre el límite de bloques, un
+error de RPC no gasta reintentos de red, y un humo real contra
+`forno.celo.org` + las dos pools reales). Confirmado que ninguna de las
+7 sesiones en vivo se vio afectada. 154/154 tests pasando.
+
+
 ## Notas importantes (leer antes de avanzar)
 
 1. **Este backtest usa datos sintéticos por defecto.** Los resultados que
